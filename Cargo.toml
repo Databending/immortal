@@ -1,0 +1,52 @@
+[package]
+name = "immortal"
+version = "0.1.0"
+edition = "2021"
+
+
+[dependencies]
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-stream = {version = "0.1",features=["sync"]}
+prost-wkt = "0.6"
+prost-wkt-types = "0.6"
+async-stream = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rand = "0.8"
+anyhow = "1.0.88"
+thiserror = "1.0.63"
+futures = "0.3.30"
+tokio-util = "0.7.12"
+tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
+derive_builder = "0.20.1"
+tonic-health = "0.12.2"
+uuid = { version = "1.10.0", features = ["v4", "serde"] }
+prost-types = "0.13.2"
+axum = "0.7.5"
+socketioxide = { version = "0.14.1", features = ["state"] }
+tower-http = { version = "0.6.0", features = ["cors"] }
+bb8-redis = "0.17.0"
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "streams", "aio"] }
+chrono = {version = "0.4.38", features=["serde"]}
+schemars = "0.8.21"
+immortal-macros = { path = "immortal-macros" }
+itertools = "0.13.0"
+[build-dependencies]
+tonic-build = "0.12"
+prost-wkt-build = "0.6"
+
+[[bin]]
+name = "server"
+path = "src/server.rs"
+
+
+[[bin]]
+name = "worker"
+path = "src/worker.rs"
+
+[[bin]]
+name = "client"
+path = "src/client.rs"
