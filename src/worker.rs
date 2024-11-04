@@ -1,9 +1,8 @@
 use ::immortal::immortal;
 use ::immortal::failure;
 use ::immortal::common;
-use serde::{Serialize, Deserialize};
-use schemars::JsonSchema;
-// use immortal::
+use crate::models::worker::WorkerConfigBuilder;
+use ::immortal::register_workflow;
 pub mod activities;
 pub mod models;
 pub mod workflows;
@@ -15,33 +14,6 @@ use anyhow::Result;
 
 use models::worker::Worker;
 
-#[derive(JsonSchema, Serialize, Deserialize)]
-struct FunctionSignature {
-    input: String,  // Representing function input type
-    output: String, // Representing function output type
-}
-
-macro_rules! function_signature_schema {
-    ($func_name:ident($($arg_name:ident : $arg_type:ty),*) -> $ret_type:ty) => {
-        #[derive(JsonSchema, Serialize, Deserialize)]
-        struct FunctionSignature {
-            inputs: Vec<String>, // Parameters of the function
-            output: String,      // Return type of the function
-        }
-
-        fn $func_name($($arg_name: $arg_type),*) -> $ret_type {
-            unimplemented!(); // Placeholder implementation
-        }
-
-        fn get_schema() -> RootSchema {
-            let signature = FunctionSignature {
-                inputs: vec![$(stringify!($arg_type).to_string()),*],
-                output: stringify!($ret_type).to_string(),
-            };
-            schemars::schema_for!(FunctionSignature)
-        }
-    };
-}
 
 
 #[tokio::main]
@@ -54,7 +26,14 @@ pub async fn main() -> Result<()> {
 
     println!("Connected to Temporal");
 
-    let (mut worker, srx) = Worker::new().await?;
+
+    let config = WorkerConfigBuilder::default()
+        .namespace("default".to_string())
+        .task_queue("test".to_string())
+        .worker_build_id("rust-worker".to_string())
+        .build()?; 
+
+    let (mut worker, srx) = Worker::new(config).await?;
 
     worker.insert_app_data(ActivityData {
         data: "Hi".to_string(),
@@ -65,9 +44,11 @@ pub async fn main() -> Result<()> {
         .await;
 
     // worker
-    //     .register_wf("new_validate_repair_wf", workflows::test::main)
+    //     .register_wf("new_validate_repair_wf", workflows::test::main_wf, workflows::test::main_wf_schema())
     //     .await;
+    register_workflow!(worker, "new_validate_repair_wf", workflows::test);
 
+    // println!("{:#?}", serde_json::to_string_pretty(&workflows::test::main_wf_schema()));
     println!("Starting worker...");
 
 

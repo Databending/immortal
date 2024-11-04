@@ -1,3 +1,6 @@
+use schemars::schema::RootSchema;
+use serde::Serialize;
+
 
 pub mod history;
 pub mod activity;
@@ -5,6 +8,17 @@ pub mod worker;
 // mod worker;
 pub mod workflow;
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct WfSchema {
+    pub args: Vec<RootSchema>,
+    pub output: RootSchema,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ActivitySchema {
+    pub args: RootSchema,
+    pub output: RootSchema,
+}
 //
 // #[derive(Debug, Clone, Default)]
 // pub struct RetryPolicy {

@@ -1,12 +1,8 @@
-// use futures::{FutureExt};
 use anyhow::{anyhow, Error};
-// pub mod immortal {
-//     tonic::include_proto!("immortal");
-// }
-
 use async_stream::stream;
-use serde::Serialize;
-use serde_json::Value;
+use schemars::schema::RootSchema;
+use schemars::schema_for;
+use serde_json::{json, Value};
 use std::fmt::{Debug, Write};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::broadcast::Receiver;
@@ -37,9 +33,7 @@ use crate::immortal::{
     RegisterImmortalWorkerV1, StartWorkflowOptionsV1,
 };
 use crate::immortal::{
-    workflow_result_v1, workflow_result_version, Failure as ImmortalFailure,
-    RequestStartActivityOptionsV1, RequestStartActivityOptionsVersion, Success as ImmortalSuccess,
-    WorkflowResultV1, WorkflowResultVersion,
+    self, workflow_result_v1, workflow_result_version, Failure as ImmortalFailure, RegisteredActivity, RegisteredWorkflow, RequestStartActivityOptionsV1, RequestStartActivityOptionsVersion, Success as ImmortalSuccess, WorkflowResultV1, WorkflowResultVersion
 };
 
 use super::{
@@ -48,10 +42,10 @@ use super::{
     },
     workflow::{WfExitValue, WorkflowFunction},
 };
+use super::{ActivitySchema, WfSchema};
 
 pub struct RunningWorkflow {
     pub workflow_id: String,
-    pub run_id: String,
     pub join_handle: JoinHandle<()>,
 }
 
@@ -74,17 +68,23 @@ pub struct Worker {
     pub client: ImmortalClient<Channel>,
     pub config: WorkerConfig,
     pub server_channel: tokio::sync::broadcast::Sender<ImmortalServerActionV1>,
-    pub workflow_sender: UnboundedSender<(String, String, Result<WfExitValue<Value>, Error>)>,
-    pub activity_sender:
-        UnboundedSender<(String, String, Result<ActExitValue<Value>, ActivityError>)>,
+    pub workflow_sender: UnboundedSender<(String, Result<WfExitValue<Value>, Error>)>,
+    pub activity_sender: UnboundedSender<(
+        String,
+        String,
+        String,
+        Result<ActExitValue<Value>, ActivityError>,
+    )>,
     // pub client: Arc<dyn WorkerClient>,
     pub workery_key: String,
-    pub registered_workflows: Arc<Mutex<HashMap<String, WorkflowFunction>>>,
+    pub registered_workflows: Arc<Mutex<HashMap<String, (WorkflowFunction, WfSchema)>>>,
     pub running_workflows: Arc<Mutex<HashMap<String, RunningWorkflow>>>,
     pub running_activities: Arc<Mutex<HashMap<String, RunningActivity>>>,
     // active_workflows: WorkflowHalf,
-    pub registered_activities: Arc<Mutex<HashMap<String, ActivityFunction>>>,
+    pub registered_activities: Arc<Mutex<HashMap<String, (ActivityFunction, ActivitySchema)>>>,
     pub app_data: Option<AppData>,
+    pub workflow_capacity: i32,
+    pub activity_capacity: i32,
 }
 
 struct ChannelLayer {
@@ -121,29 +121,47 @@ struct ChannelLayer {
 #[derive(Debug)]
 struct SpanData {
     workflow_id: String,
-    workflow_run_id: String,
     activity_id: Option<String>,
     activity_run_id: Option<String>,
+    // message: String,
 }
 #[derive(Default)]
 struct StrVisitor {
     activity_id: Option<String>,
     activity_run_id: Option<String>,
     workflow_id: Option<String>,
-    workflow_run_id: Option<String>,
+    // message: Option<String>,
 }
+
+#[derive(Default, Debug)]
+struct EventVisitor {
+    message: Option<String>,
+}
+
+struct MessageLog {}
 
 impl Visit for StrVisitor {
     fn record_debug(&mut self, _field: &Field, _value: &dyn Debug) {}
     fn record_str(&mut self, field: &Field, value: &str) {
         if field.name() == "workflow_id" {
             self.workflow_id = Some(value.to_string());
-        } else if field.name() == "workflow_run_id" {
-            self.workflow_run_id = Some(value.to_string());
         } else if field.name() == "activity_id" {
             self.activity_id = Some(value.to_string());
         } else if field.name() == "activity_run_id" {
             self.activity_run_id = Some(value.to_string());
+        }
+    }
+}
+
+impl Visit for EventVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+        if field.name() == "message" {
+            self.message = Some(format!("{:?}", value));
+        }
+    }
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.message = Some(value.to_string());
         }
     }
 }
@@ -160,9 +178,9 @@ where
             values.record(&mut visitor);
             ctx.span(id).unwrap().extensions_mut().insert(SpanData {
                 workflow_id: visitor.workflow_id.unwrap(),
-                workflow_run_id: visitor.workflow_run_id.unwrap(),
                 activity_id: visitor.activity_id,
                 activity_run_id: visitor.activity_run_id,
+                // message: visitor.message.unwrap(),
             });
         }
 
@@ -186,16 +204,30 @@ where
         let mut event_str = String::new();
 
         let _ = writeln!(&mut event_str, "{:?}", event);
-
-        println!("Event: {:?}", event_str);
+        let mut visitor = EventVisitor::default();
+        event.record(&mut visitor);
         if let Some(scope) = ctx.event_scope(&event) {
             for span in scope.from_root() {
                 if let Some(data) = span.extensions().get::<SpanData>() {
                     let _ = self.sender.send(ImmortalServerActionV1 {
                         action: Some(immortal_server_action_v1::Action::LogEvent(Log {
-                            workflow_run_id: data.workflow_run_id.clone(),
                             activity_run_id: data.activity_run_id.clone(),
-                            message: event_str.clone(),
+                            message: visitor.message.unwrap(),
+                            metadata: Some(
+                                serde_json::to_vec(&json!({
+                                    "target": event.metadata().target().to_string(),
+                                    "module_path": event.metadata().module_path().unwrap_or_default(),
+                                    "line": event.metadata().line().unwrap_or_default(),
+                                    "file": event.metadata().file().unwrap_or_default(),
+                                })).unwrap_or_default(),
+                            ),
+                            level: match event.metadata().level() {
+                                &tracing::Level::ERROR => immortal::Level::Error,
+                                &tracing::Level::WARN => immortal::Level::Warn,
+                                &tracing::Level::INFO => immortal::Level::Info,
+                                &tracing::Level::DEBUG => immortal::Level::Debug,
+                                &tracing::Level::TRACE => immortal::Level::Trace,
+                            }.into(),
                             when: chrono::Utc::now().to_utc().timestamp(),
                             workflow_id: data.workflow_id.clone(),
                             activity_id: data.activity_id.clone(),
@@ -211,13 +243,9 @@ where
 }
 
 impl Worker {
-    pub async fn new() -> anyhow::Result<(Self, Receiver<ImmortalServerActionV1>)> {
-        let config = WorkerConfigBuilder::default()
-            .namespace("default".to_string())
-            .task_queue("test-worker".to_string())
-            .worker_build_id("test-worker".to_string())
-            .build()?;
-
+    pub async fn new(
+        config: WorkerConfig,
+    ) -> anyhow::Result<(Self, Receiver<ImmortalServerActionV1>)> {
         let (tx, rx) = mpsc::unbounded_channel();
         let (atx, arx) = mpsc::unbounded_channel();
 
@@ -229,6 +257,7 @@ impl Worker {
         };
         let subscriber = Registry::default()
             .with(channel_layer)
+            .with(tracing_subscriber::fmt::Layer::default())
             .with(LevelFilter::INFO);
         tracing::subscriber::set_global_default(subscriber)
             .expect("Failed to set global subscriber");
@@ -236,15 +265,17 @@ impl Worker {
         let mut worker = Worker {
             server_channel: stx,
             client,
-            config,
+            config: config.clone(),
             workflow_sender: tx,
             activity_sender: atx,
-            task_queue: "test-worker".to_string(),
-            workery_key: "test-worker".to_string(),
+            task_queue: config.task_queue.clone(),
+            workery_key: config.worker_build_id.clone(),
             running_workflows: Arc::new(Mutex::new(HashMap::new())),
             running_activities: Arc::new(Mutex::new(HashMap::new())),
             registered_workflows: Arc::new(Mutex::new(HashMap::new())),
             registered_activities: Arc::new(Mutex::new(HashMap::new())),
+            workflow_capacity: config.workflow_capacity,
+            activity_capacity: config.activity_capacity,
             // previous_workflows: Arc::new(Mutex::new(HashMap::new())),
             app_data: Some(AppData::default()),
         };
@@ -257,24 +288,54 @@ impl Worker {
         &mut self,
         workflow_type: impl Into<String>,
         wf_function: impl Into<WorkflowFunction>,
+        schema: (Vec<RootSchema>, RootSchema),
     ) {
         let mut registered_workflows = self.registered_workflows.lock().await;
-        registered_workflows.insert(workflow_type.into(), wf_function.into());
+        registered_workflows.insert(
+            workflow_type.into(),
+            (
+                wf_function.into(),
+                WfSchema {
+                    args: schema.0,
+                    output: schema.1,
+                },
+            ),
+        );
         // .workflow_fns
         // .get_mut()
         // .insert(workflow_type.into(), wf_function.into());
     }
-    pub async fn register_activity<A, R, O>(
+
+    // pub async fn register_wf(
+    //     &mut self,
+    //     workflow_type: impl Into<String>,
+    //     wf_function: impl Into<WorkflowFunction>,
+    // ) {
+    //     let mut registered_workflows = self.registered_workflows.lock().await;
+    //     registered_workflows.insert(workflow_type.into(), wf_function.into());
+    // .workflow_fns
+    // .get_mut()
+    // .insert(workflow_type.into(), wf_function.into());
+    // }
+    pub async fn register_activity<A: schemars::JsonSchema, R, O: schemars::JsonSchema>(
         &mut self,
         activity_type: impl Into<String>,
         act_function: impl IntoActivityFunc<A, R, O>,
     ) {
+        let arg_schema = schema_for!(A);
+        let out_schema = schema_for!(O);
         let mut registered_activities = self.registered_activities.lock().await;
         registered_activities.insert(
             activity_type.into(),
-            ActivityFunction {
-                act_func: act_function.into_activity_fn(),
-            },
+            (
+                ActivityFunction {
+                    act_func: act_function.into_activity_fn(),
+                },
+                ActivitySchema {
+                    args: arg_schema,
+                    output: out_schema,
+                },
+            ),
         );
     }
 
@@ -322,13 +383,11 @@ impl Worker {
             match feature.version {
                 Some(immortal_worker_action_version::Version::V1(x)) => match x.action {
                     Some(Action::StartWorkflow(workflow)) => {
-                        println!("Starting workflow: {:?}", workflow);
                         self.start_workflow_v1(&workflow).await;
                     }
                     Some(Action::StartActivity(activity)) => {
                         self.start_activity(
                             &activity.workflow_id,
-                            &activity.workflow_run_id,
                             &activity.activity_type,
                             &activity.activity_id,
                             &activity.activity_run_id,
@@ -353,21 +412,32 @@ impl Worker {
         let rx = rx.resubscribe();
 
         let register_immortal_worker = RegisterImmortalWorkerV1 {
+            workflow_capacity: self.workflow_capacity,
+            activity_capacity: self.activity_capacity,
+            task_queue: self.task_queue.clone(),
             worker_id: self.workery_key.clone(),
             worker_type: self.task_queue.clone(),
             registered_activities: self
                 .registered_activities
                 .lock()
                 .await
-                .keys()
-                .map(|x| x.clone())
+                .iter()
+                .map(|x| RegisteredActivity {
+                    activity_type: x.0.clone(),
+                    args: serde_json::to_vec(&x.1 .1.args.clone()).unwrap(),
+                    output: serde_json::to_vec(&x.1 .1.output.clone()).unwrap(),
+                })
                 .collect(),
             registered_workflows: self
                 .registered_workflows
                 .lock()
                 .await
-                .keys()
-                .map(|x| x.clone())
+                .iter()
+                .map(|x| RegisteredWorkflow {
+                    workflow_type: x.0.clone(),
+                    args: serde_json::to_vec(&x.1 .1.args.clone()).unwrap(),
+                    output: serde_json::to_vec(&x.1 .1.output.clone()).unwrap(),
+                })
                 .collect(),
         };
 
@@ -404,15 +474,13 @@ impl Worker {
         let sender = self.workflow_sender.clone();
         let client = self.client.clone();
         // let args = serde_json::from_slice(&workflow_options.input).unwrap();
-        println!("waiting for lock");
         let workflow_id = workflow_options.workflow_id.clone();
-        let workflow_run_id = workflow_options.workflow_run_id.clone();
         let wf_handle;
         {
             let mut wf2 = registered_workflows.lock().await;
             let wf = wf2.get_mut(&workflow_type).unwrap();
 
-            wf_handle = wf.start_workflow(
+            wf_handle = wf.0.start_workflow(
                 client,
                 workflow_options
                     .input
@@ -420,24 +488,21 @@ impl Worker {
                     .unwrap_or(Payloads::default()),
                 workflow_type.clone(),
                 workflow_id.clone(),
-                workflow_run_id.clone(),
+                self.config.namespace.clone(),
+                self.config.task_queue.clone(),
             );
         }
         let handle;
         {
             let workflow_id = workflow_id.clone();
-            let workflow_run_id = workflow_run_id.clone();
             handle = tokio::spawn(async move {
                 let res = wf_handle.await;
-                sender
-                    .send((workflow_id.clone(), workflow_run_id.clone(), res))
-                    .unwrap();
+                sender.send((workflow_id.clone(), res)).unwrap();
             });
         }
 
         let running_workflow = RunningWorkflow {
             workflow_id,
-            run_id: workflow_run_id,
             join_handle: handle,
         };
         self.running_workflows
@@ -448,20 +513,21 @@ impl Worker {
 
     pub fn workflow_thread(
         &mut self,
-        mut rx: UnboundedReceiver<(String, String, Result<WfExitValue<Value>, Error>)>,
+        mut rx: UnboundedReceiver<(String, Result<WfExitValue<Value>, Error>)>,
     ) {
         let mut client = self.client.clone();
         let running_workflows_arc = Arc::clone(&self.running_workflows);
+        let worker_key = self.workery_key.clone();
         tokio::spawn(async move {
             while let Some(result) = rx.recv().await {
-                match result.2 {
+                match result.1 {
                     Ok(res) => {
                         client
                             .completed_workflow(WorkflowResultVersion {
                                 version: Some(workflow_result_version::Version::V1(
                                     WorkflowResultV1 {
+                                        worker_id: worker_key.clone(),
                                         workflow_id: result.0,
-                                        workflow_run_id: result.1,
                                         status: Some(workflow_result_v1::Status::Completed(
                                             ImmortalSuccess {
                                                 result: Some(Payload::new(&res)),
@@ -478,8 +544,8 @@ impl Worker {
                             .completed_workflow(WorkflowResultVersion {
                                 version: Some(workflow_result_version::Version::V1(
                                     WorkflowResultV1 {
+                                        worker_id: worker_key.clone(),
                                         workflow_id: result.0,
-                                        workflow_run_id: result.1,
                                         status: Some(workflow_result_v1::Status::Failed(
                                             ImmortalFailure {
                                                 failure: Some(Failure {
@@ -509,14 +575,19 @@ impl Worker {
 
     pub fn activity_thread(
         &mut self,
-        mut rx: UnboundedReceiver<(String, String, Result<ActExitValue<Value>, ActivityError>)>,
+        mut rx: UnboundedReceiver<(
+            String,
+            String,
+            String,
+            Result<ActExitValue<Value>, ActivityError>,
+        )>,
     ) {
         let running_activities_arc = Arc::clone(&self.running_activities);
 
         let mut client = self.client.clone();
         tokio::spawn(async move {
             while let Some(result) = rx.recv().await {
-                let res = match result.2 {
+                let res = match result.3 {
                     // Err(e) => ActivityExecutionResult::fail(Failure::application_failure(
                     //     format!("Activity function panicked: {}", panic_formatter(e)),
                     //     true,
@@ -524,6 +595,7 @@ impl Worker {
                     Ok(ActExitValue::Normal(p)) => ActivityResultV1::ok(
                         result.0.clone(),
                         result.1.clone(),
+                        result.2.clone(),
                         Some(Payload::new(&p)),
                     ),
 
@@ -531,22 +603,28 @@ impl Worker {
                         ActivityError::Retryable {
                             source,
                             explicit_delay,
-                        } => ActivityResultV1::fail(result.0.clone(), result.1.clone(), {
-                            println!("source: {:?}", source);
-                            let mut f = Failure::application_failure_from_error(source, false);
-                            if let Some(d) = explicit_delay {
-                                if let Some(FailureInfo::ApplicationFailureInfo(fi)) =
-                                    f.failure_info.as_mut()
-                                {
-                                    fi.next_retry_delay = d.try_into().ok();
+                        } => ActivityResultV1::fail(
+                            result.0.clone(),
+                            result.1.clone(),
+                            result.2.clone(),
+                            {
+                                println!("source: {:?}", source);
+                                let mut f = Failure::application_failure_from_error(source, false);
+                                if let Some(d) = explicit_delay {
+                                    if let Some(FailureInfo::ApplicationFailureInfo(fi)) =
+                                        f.failure_info.as_mut()
+                                    {
+                                        fi.next_retry_delay = d.try_into().ok();
+                                    }
                                 }
-                            }
-                            f
-                        }),
+                                f
+                            },
+                        ),
                         ActivityError::Cancelled { details } => {
                             ActivityResultV1::cancel_from_details(
                                 result.0.clone(),
                                 result.1.clone(),
+                                result.2.clone(),
                                 match details {
                                     Some(d) => Some(vec![serde_json::to_vec(&d).unwrap()]),
                                     None => None,
@@ -556,6 +634,7 @@ impl Worker {
                         ActivityError::NonRetryable(nre) => ActivityResultV1::fail(
                             result.0.clone(),
                             result.1.clone(),
+                            result.2.clone(),
                             Failure::application_failure_from_error(nre, true),
                         ),
                     },
@@ -578,7 +657,6 @@ impl Worker {
     pub async fn activity(
         &mut self,
         workflow_id: String,
-        workflow_run_id: String,
         activity_options: ActivityOptions,
     ) -> anyhow::Result<Value> {
         let mut temp = RequestStartActivityOptionsV1 {
@@ -601,7 +679,9 @@ impl Worker {
                 .map(|x| x.try_into().unwrap()),
             retry_policy: activity_options.retry_policy.map(|x| x.try_into().unwrap()),
             workflow_id,
-            workflow_run_id,
+            task_queue: activity_options
+                .task_queue
+                .unwrap_or(self.task_queue.clone()),
             ..Default::default()
         };
         temp.set_cancellation_type(activity_options.cancellation_type);
@@ -636,7 +716,6 @@ impl Worker {
     pub async fn start_activity(
         &mut self,
         workflow_id: &str,
-        workflow_run_id: &str,
         activity_type: &str,
         activity_id: &str,
         activity_run_id: &str,
@@ -652,20 +731,20 @@ impl Worker {
 
         let aid = activity_id.to_string();
         let aid_run = activity_run_id.to_string();
+        let wid = workflow_id.to_string();
 
-        let act_handle = act.start_activity(
+        let act_handle = act.0.start_activity(
             payload,
             safe_app_data.clone(),
             activity_type,
             workflow_id.to_string(),
-            workflow_run_id.to_string(),
             activity_id.to_string(),
             activity_run_id.to_string(),
         );
         let handle = tokio::spawn(async move {
             let res = act_handle.await;
 
-            sender.send((aid, aid_run, res)).unwrap();
+            sender.send((wid.to_string(), aid, aid_run, res)).unwrap();
         });
         let running_workflow = RunningActivity {
             activity_id: activity_id.to_string(),
@@ -697,6 +776,13 @@ pub struct WorkerConfig {
     /// A string that should be unique to the set of code this worker uses. IE: All the workflow,
     /// activity, interceptor, and data converter code.
     pub worker_build_id: String,
+
+    // custom
+    #[builder(default = "1")]
+    pub workflow_capacity: i32,
+
+    #[builder(default = "1")]
+    pub activity_capacity: i32,
     /// A human-readable string that can identify this worker. Using something like sdk version
     /// and host name is a good default. If set, overrides the identity set (if any) on the client
     /// used by this worker.

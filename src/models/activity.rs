@@ -110,7 +110,6 @@ impl ActivityFunction {
         app_data: Arc<AppData>,
         activity_type: String,
         workflow_id: String,
-        workflow_run_id: String,
         activity_id: String,
         activity_run_id: String,
     ) -> Pin<Box<dyn Future<Output = Result<ActExitValue<Value>, ActivityError>> + Send>> {
@@ -120,7 +119,6 @@ impl ActivityFunction {
             "otel.name" = activity_type,
             "otel.kind" = "server",
             "workflow_id" = workflow_id,
-            "workflow_run_id" = workflow_run_id,
             "activity_id" = activity_id,
             "activity_run_id" = activity_run_id,
         );

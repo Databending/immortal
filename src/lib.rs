@@ -1,3 +1,20 @@
+#[macro_export]
+macro_rules! register_workflow {
+    ($worker:expr, $expression:expr, $func_name:path) => {
+        paste::paste! {
+            // Create the schema function name as a local variable
+
+            $worker
+                .register_wf(
+                    $expression,
+                    $func_name::wf,
+                    $func_name::wf_schema()
+                )
+                .await;
+        }
+    };
+}
+
 pub mod immortal {
     tonic::include_proto!("immortal");
     use serde::{de::DeserializeOwned, Serialize};
@@ -46,11 +63,13 @@ pub mod immortal {
 
     impl ActivityResultV1 {
         pub const fn ok(
+            workflow_id: String,
             activity_id: String,
             activity_run_id: String,
             result: Option<Payload>,
         ) -> Self {
             Self {
+                workflow_id,
                 activity_id,
                 activity_run_id,
                 status: Some(Status::Completed(Success { result })),
@@ -58,11 +77,13 @@ pub mod immortal {
         }
 
         pub fn fail(
+            workflow_id: String,
             activity_id: String,
             activity_run_id: String,
             fail: super::failure::Failure,
         ) -> Self {
             Self {
+                workflow_id,
                 activity_id,
                 activity_run_id,
                 status: Some(Status::Failed(Failure {
@@ -72,11 +93,13 @@ pub mod immortal {
         }
 
         pub fn cancel_from_details(
+            workflow_id: String,
             activity_id: String,
             activity_run_id: String,
             payload: Option<Vec<Vec<u8>>>,
         ) -> Self {
             Self {
+                workflow_id,
                 activity_id,
                 activity_run_id,
                 status: Some(Status::Cancelled(Cancellation::from_details(payload))),

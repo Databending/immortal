@@ -136,6 +136,8 @@ message ActivityResultV1 {
     Cancellation cancelled = 5;
     // WillCompleteAsync will_complete_async = 6;
   }
+
+  string workflow_id = 6;
 }
 
 message ActivityResultVersion {
@@ -144,7 +146,7 @@ message ActivityResultVersion {
 
 message WorkflowResultV1 {
   string workflow_id = 1;
-  string workflow_run_id = 2;
+  string worker_id = 2;
   oneof status {
     Success completed = 3;
     Failure failed = 4;
@@ -162,7 +164,6 @@ message StartWorkflowOptionsV1 {
   common.Payloads input = 3;
   string task_queue = 4;
   string workflow_id = 5;
-  string workflow_run_id = 6;
 }
 
 message ClientStartWorkflowOptionsVersion {
@@ -186,7 +187,7 @@ message RequestStartActivityOptionsV1 {
   string activity_type = 2;
   common.Payload activity_input = 3;
   string workflow_id = 4;
-  string workflow_run_id = 5;
+  string task_queue = 5;
   optional google.protobuf.Duration schedule_to_start_timeout = 6;
   optional google.protobuf.Duration start_to_close_timeout = 7;
   optional google.protobuf.Duration schedule_to_close_timeout = 8;
@@ -200,8 +201,7 @@ message StartActivityOptionsV1 {
   string activity_type = 2;
   common.Payload activity_input = 3;
   string workflow_id = 4;
-  string workflow_run_id = 5;
-  string activity_run_id = 6;
+  string activity_run_id = 5;
 }
 
 message StartActivityOptionsVersion {
@@ -215,9 +215,25 @@ message RequestStartActivityOptionsVersion {
 message RegisterImmortalWorkerV1 {
   string worker_id = 1;
   string worker_type = 2;
-  repeated string registered_workflows = 3;
-  repeated string registered_activities = 4;
+  repeated RegisteredWorkflow registered_workflows = 3;
+  repeated RegisteredActivity registered_activities = 4;
+  int32 workflow_capacity = 5;
+  int32 activity_capacity = 6;
+  string task_queue = 7;
 }
+
+message RegisteredWorkflow {
+  string workflow_type = 1;
+  bytes args = 2;
+  bytes output = 3;
+}
+
+message RegisteredActivity {
+  string activity_type = 1;
+  bytes args = 2;
+  bytes output = 3;
+}
+
 //
 // message RegisterImmortalWorkerVersion {
 //   oneof version {
@@ -232,16 +248,40 @@ message ImmortalWorkerActionV1 {
     int32 heartbeat = 3;
   }
 }
-
+enum Level {
+    /// The "trace" level.
+    ///
+    /// Designates very low priority, often extremely verbose, information.
+    Trace = 0;
+    /// The "debug" level.
+    ///
+    /// Designates lower priority information.
+    Debug = 1;
+    /// The "info" level.
+    ///
+    /// Designates useful information.
+    Info = 2;
+    /// The "warn" level.
+    ///
+    /// Designates hazardous situations.
+    Warn = 3;
+    /// The "error" level.
+    ///
+    /// Designates very serious errors.
+    Error = 4;
+}
 message Log {
   int64 when = 1;
   string message = 2;
   string workflow_id = 3;
-  string workflow_run_id = 4;
-  optional string activity_id = 5;
-  optional string activity_run_id = 6;
+  optional string activity_id = 4;
+  optional string activity_run_id = 5;
+  optional bytes metadata = 6;
+  Level level = 7;
+
 }
 
+// the naming might be backwards lol
 message ImmortalServerActionV1 {
   oneof action {
     RegisterImmortalWorkerV1 register_worker = 1;
@@ -251,6 +291,24 @@ message ImmortalServerActionV1 {
     int32 heartbeat = 5;
   }
 }
+
+// message WorkflowStartStatus {
+//   oneof status {
+//     int32 started = 1;
+//     Failure failed = 2;
+//     Cancellation cancelled = 3;
+//   }
+//   int32 capacity = 4;
+// }
+//
+// message ActivityStartStatus {
+//   oneof status {
+//     int32 started = 1;
+//     Failure failed = 2;
+//     Cancellation cancelled = 3;
+//   }
+//   int32 capacity = 4;
+// }
 
 message ImmortalServerActionVersion {
   oneof version { ImmortalServerActionV1 v1 = 1; }
@@ -262,7 +320,6 @@ message ImmortalWorkerActionVersion {
 
 message ClientStartWorkflowResponse {
   string workflow_id = 1;
-  string workflow_run_id = 2;
 }
 
 service Immortal {
@@ -272,8 +329,8 @@ service Immortal {
       returns (ClientStartWorkflowResponse) {}
   rpc StartActivity(RequestStartActivityOptionsVersion)
       returns (ActivityResultVersion) {}
-  rpc CompletedActivity(ActivityResultVersion)
-      returns (google.protobuf.Empty) {}
+  rpc CompletedActivity(ActivityResultVersion) returns (google.protobuf.Empty) {
+  }
   rpc CompletedWorkflow(WorkflowResultVersion) returns (google.protobuf.Empty) {
   }
 }

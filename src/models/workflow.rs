@@ -39,7 +39,6 @@ pub struct WfContext {
     pub client: ImmortalClient<Channel>,
     pub args: Arc<Payloads>,
     pub id: String,
-    pub run_id: String,
     // pub app_data: Option<AppData>,
     // chan: Sender<RustWfCmd>,
     // am_cancelled: watch::Receiver<bool>,
@@ -58,12 +57,12 @@ impl WfContext {
             activity_type: options.activity_type.to_string(),
             activity_input: Some(options.input),
             workflow_id: self.id.clone(),
-            workflow_run_id: self.run_id.clone(),
             schedule_to_close_timeout: options.schedule_to_close_timeout.map(|x| x.try_into().unwrap()),
             schedule_to_start_timeout: options.schedule_to_start_timeout.map(|x| x.try_into().unwrap()),
             start_to_close_timeout: options.start_to_close_timeout.map(|x| x.try_into().unwrap()),
             heartbeat_timeout: options.heartbeat_timeout.map(|x| x.try_into().unwrap()),
             retry_policy: options.retry_policy.map(|x| x.try_into().unwrap()),
+            task_queue: options.task_queue.unwrap_or(self.task_queue.clone()),
             ..Default::default()
         };
         request.set_cancellation_type(options.cancellation_type.into());
@@ -216,22 +215,21 @@ impl WorkflowFunction {
         args: Payloads,
         workflow_type: String,
         workflow_id: String,
-        workflow_run_id: String,
+        namespace: String,
+        task_queue: String,
     ) -> Instrumented<Pin<Box<dyn Future<Output = Result<WfExitValue<Value>, Error>> + Send>>> {
         let span = info_span!(
             "RunWorkflow",
             "otel.name" = workflow_type,
             "otel.kind" = "server",
             "workflow_id" = workflow_id.clone(),
-            "workflow_run_id" = workflow_run_id.clone(),
         );
         let handle = (self.wf_func)(WfContext {
-            namespace: "default".to_string(),
-            task_queue: "default".to_string(),
+            namespace,
+            task_queue,
             client,
             args: Arc::new(args),
             id: workflow_id,
-            run_id: workflow_run_id,
         })
         .instrument(span);
         handle

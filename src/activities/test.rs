@@ -1,24 +1,34 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
+use tracing::info;
+use schemars::JsonSchema;
 use immortal_macros::function_schema;
+use uuid::Uuid;
 use crate::models::activity::{ActContext, ActivityError};
 pub struct ActivityData {
     pub data: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct TempPayload {
     pub data: String
 }
 
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ActivityOutput {
     pub data: String,
 }
 
 #[function_schema]
-pub async fn hs_tariff_sync(ctx: ActContext, _payload: TempPayload) -> Result<ActivityOutput, ActivityError> {
-    println!("Hello from the test activity!");
+pub async fn hs_tariff_sync(ctx: ActContext, _payload: Uuid) -> Result<ActivityOutput, ActivityError> {
+    
+
+    for x in 0..10 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        info!("Hello from the test activity!");
+    }
     // let activity_data: &ActivityData = ctx.app_data().unwrap();
     Ok(ActivityOutput {
         data: "Hello from the test activity!".to_string(),

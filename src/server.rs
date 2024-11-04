@@ -4,19 +4,21 @@
 use ::immortal::common;
 use ::immortal::failure;
 use ::immortal::immortal;
+use ::immortal::immortal::ClientStartWorkflowOptionsV1;
+use ::immortal::immortal::RequestStartActivityOptionsV1;
 use ::immortal::models::history::Status as HistoryStatus;
-use ::immortal::models::history::{
-    ActivityHistory, ActivityRun, History, WorkflowHistory, WorkflowRun,
-};
+use ::immortal::models::history::{ActivityHistory, ActivityRun, History, WorkflowHistory};
+use ::immortal::models::ActivitySchema;
+use ::immortal::models::WfSchema;
 use axum;
-use axum::http::Method;
 use bb8_redis::bb8::Pool;
 use chrono::NaiveDateTime;
+
+use rand::Rng;
 use redis::streams::{StreamId, StreamKey, StreamMaxlen, StreamReadOptions, StreamReadReply};
 use redis::AsyncCommands;
 // use bb8_redis::redis::AsyncCommands;
 use bb8_redis::{bb8, RedisConnectionManager};
-use redis::Client;
 
 use immortal::immortal_server::{Immortal, ImmortalServer};
 use immortal::immortal_worker_action_v1::Action as WorkerAction;
@@ -37,14 +39,17 @@ use socketioxide::{
     SocketIo,
 };
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tonic::transport::Server;
 use tonic_health::server::HealthReporter;
+use tower::ServiceBuilder;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::FmtSubscriber;
 use uuid::Uuid;
 // use immortal::immortal_s
@@ -53,20 +58,41 @@ use uuid::Uuid;
 // use routeguide::worker_action::Action;
 // use routeguide::{Feature, Point, Rectangle, RouteNote, RouteSummary};
 
+use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 pub mod api;
 pub mod models;
 
+#[derive(Clone, Debug, Serialize)]
+pub enum Notification {
+    // ActivityStarted(Uuid, ActivityHistory),
+    // ActivityCompleted(Uuid, ActivityHistory),
+    // ActivityFailed(Uuid, ActivityHistory),
+    // ActivityCancelled,
+    WorkflowStarted(Uuid, WorkflowHistory),
+    WorkflowCompleted(Uuid, WorkflowHistory),
+    WorkflowFailed(Uuid, WorkflowHistory),
+    // WorkflowCancelled,
+    ActivityRunStarted(Uuid, ActivityHistory),
+    ActivityRunCompleted(Uuid, ActivityHistory),
+    ActivityRunFailed(Uuid, ActivityHistory),
+    // ActivityRunCancelled,
+}
 #[derive(Debug)]
 struct RegisteredWorker {
     worker_id: String,
 
+    task_queue: String,
     incoming: JoinHandle<()>,
     tx: Sender<Result<ImmortalWorkerActionVersion, Status>>,
-    registered_workflows: Vec<String>,
-    registered_activities: Vec<String>,
+    registered_workflows: HashMap<String, WfSchema>,
+    registered_activities: HashMap<String, ActivitySchema>,
+    activity_capacity: i32,
+    max_activity_capacity: i32,
+    workflow_capacity: i32,
+    max_workflow_capacity: i32,
 }
 
 // #[derive(Debug, Clone)]
@@ -95,67 +121,279 @@ pub struct ImmortalService {
     //     broadcast::Sender<LogStreamUpdate>,
     //     Arc<Mutex<HashMap<String, LogStream>>>,
     // ),
-    history: Arc<Mutex<History>>,
-    running_activities: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ActivityResultV1>>>>,
+    history: History,
+
+    notification_tx: Arc<tokio::sync::broadcast::Sender<Notification>>,
+    running_activities: Arc<
+        Mutex<
+            HashMap<
+                String,
+                (
+                    Option<String>,
+                    tokio::sync::oneshot::Sender<ActivityResultV1>,
+                ),
+            >,
+        >,
+    >,
+    workflow_queue: Arc<Mutex<HashMap<String, VecDeque<(String, ClientStartWorkflowOptionsV1)>>>>,
+    activity_queue: Arc<Mutex<HashMap<String, VecDeque<(String, RequestStartActivityOptionsV1)>>>>,
 }
 
 impl ImmortalService {
+    pub fn activity_queue_thread(&self) {
+        let activity_queue = Arc::clone(&self.activity_queue);
+        let running_activities = Arc::clone(&self.running_activities);
+        let notification_tx = Arc::clone(&self.notification_tx);
+        let workers = Arc::clone(&self.workers);
+        let history = self.history.clone();
+        tokio::spawn(async move {
+            loop {
+                let queues;
+                // let activity_queues;
+                {
+                    let activity_queues = (activity_queue.lock().await).clone();
+                    queues = activity_queues
+                        .iter()
+                        .filter(|(_, v)| v.len() > 0)
+                        .map(|(f, c)| (f.to_string(), c.clone()))
+                        .collect::<HashMap<_, _>>()
+                        .clone();
+                }
+
+                for (queue_name, queue) in queues {
+                    let mut workers = workers.lock().await;
+                    for (i, x) in queue.iter().enumerate() {
+                        let mut workers_filtered = workers
+                            .iter_mut()
+                            .filter(|(_, worker)| worker.task_queue == *queue_name)
+                            .filter(|(_, worker)| worker.activity_capacity > 0)
+                            .filter(|(_, worker)| {
+                                worker
+                                    .registered_activities
+                                    .contains_key(&x.1.activity_type)
+                            })
+                            .map(|(_, worker)| worker)
+                            .collect::<Vec<_>>();
+                        if workers_filtered.len() == 0 {
+                            continue;
+                        }
+                        let random = {
+                            let mut rng = rand::thread_rng();
+                            rng.gen_range(0..workers_filtered.len())
+                        };
+                        match workers_filtered.get_mut(random) {
+                            Some(worker) => {
+                                let (activity_run_id, activity_options) = {
+                                    let mut queues = activity_queue.lock().await;
+                                    let q = queues.get_mut(&queue_name).unwrap();
+                                    q.remove(i).unwrap()
+                                };
+
+                                {
+                                    let mut running_activities = running_activities.lock().await;
+                                    running_activities
+                                        .get_mut(&activity_options.activity_id)
+                                        .unwrap()
+                                        .0 = Some(worker.worker_id.clone());
+                                }
+                                // let workers = self.workers.lock().await;
+                                // let worker = workers.get(worker_id).unwrap().clone();
+
+                                worker
+                                    .tx
+                                    .send(Ok(ImmortalWorkerActionVersion {
+                                        version: Some(immortal_worker_action_version::Version::V1(
+                                            ImmortalWorkerActionV1 {
+                                                action: Some(WorkerAction::StartActivity(
+                                                    immortal::StartActivityOptionsV1 {
+                                                        activity_id: activity_options
+                                                            .activity_id
+                                                            .clone(),
+                                                        activity_type: activity_options
+                                                            .activity_type
+                                                            .clone(),
+                                                        activity_input: activity_options
+                                                            .activity_input
+                                                            .clone(),
+                                                        workflow_id: activity_options
+                                                            .workflow_id
+                                                            .clone(),
+
+                                                        activity_run_id,
+                                                    },
+                                                )),
+                                            },
+                                        )),
+                                    }))
+                                    .await
+                                    .unwrap();
+                                worker.activity_capacity -= 1;
+
+                                let mut activity_history = ActivityHistory::new(
+                                    activity_options.activity_type.clone(),
+                                    activity_options.activity_id.clone(),
+                                );
+                                activity_history
+                                    .runs
+                                    .push(ActivityRun::new("0".to_string()));
+                                history
+                                    .add_activity(
+                                        &activity_options.workflow_id,
+                                        activity_history.clone(),
+                                    )
+                                    .await
+                                    .unwrap();
+                                notification_tx
+                                    .send(Notification::ActivityRunStarted(
+                                        Uuid::parse_str(&activity_options.workflow_id).unwrap(),
+                                        activity_history,
+                                    ))
+                                    .unwrap();
+                            }
+                            None => {}
+                        }
+                        break;
+                    }
+                }
+                // wait 500ms
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        });
+    }
+    pub fn workflow_queue_thread(&self) {
+        let workflow_queue = Arc::clone(&self.workflow_queue);
+        let workers = Arc::clone(&self.workers);
+        let notification_tx = Arc::clone(&self.notification_tx);
+        let history = self.history.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let queues;
+                {
+                    let workflow_queues = (workflow_queue.lock().await).clone();
+
+                    queues = workflow_queues
+                        .iter()
+                        .filter(|(_, v)| v.len() > 0)
+                        .map(|(f, c)| (f.to_string(), c.clone()))
+                        .collect::<HashMap<_, _>>()
+                        .clone();
+                }
+
+                for (queue_name, queue) in queues {
+                    let mut workers = workers.lock().await;
+                    for (i, x) in queue.iter().enumerate() {
+                        let mut workers_filtered = workers
+                            .iter_mut()
+                            .filter(|(_, worker)| worker.task_queue == *queue_name)
+                            .filter(|(_, worker)| worker.workflow_capacity > 0)
+                            .filter(|(_, worker)| {
+                                worker.registered_workflows.contains_key(&x.1.workflow_type)
+                            })
+                            .map(|(_, worker)| worker)
+                            .collect::<Vec<_>>();
+                        if workers_filtered.len() == 0 {
+                            continue;
+                        }
+                        let random = {
+                            let mut rng = rand::thread_rng();
+                            rng.gen_range(0..workers_filtered.len())
+                        };
+                        match workers_filtered.get_mut(random) {
+                            Some(worker) => {
+                                let (workflow_id, workflow_options) = {
+                                    let mut queues = workflow_queue.lock().await;
+                                    let q = queues.get_mut(&queue_name).unwrap();
+
+                                    q.remove(i).unwrap()
+                                };
+                                // let workers = self.workers.lock().await;
+                                // let worker = workers.get(worker_id).unwrap().clone();
+
+                                worker
+                                    .tx
+                                    .send(Ok(ImmortalWorkerActionVersion {
+                                        version: Some(immortal_worker_action_version::Version::V1(
+                                            ImmortalWorkerActionV1 {
+                                                action: Some(WorkerAction::StartWorkflow(
+                                                    StartWorkflowOptionsV1 {
+                                                        workflow_id: workflow_id.clone(),
+                                                        workflow_type: workflow_options
+                                                            .workflow_type
+                                                            .clone(),
+                                                        workflow_version: workflow_options
+                                                            .workflow_version
+                                                            .clone(),
+                                                        task_queue: workflow_options
+                                                            .task_queue
+                                                            .clone(),
+
+                                                        input: workflow_options.input.clone(),
+                                                    },
+                                                )),
+                                            },
+                                        )),
+                                    }))
+                                    .await
+                                    .unwrap();
+                                worker.workflow_capacity -= 1;
+
+                                let workflow_history = WorkflowHistory::new(
+                                    workflow_options.workflow_type.clone(),
+                                    workflow_id.clone(),
+                                    workflow_options
+                                        .input
+                                        .as_ref()
+                                        .unwrap()
+                                        .payloads
+                                        .iter()
+                                        .map(|f| serde_json::from_slice(&f.data).unwrap())
+                                        .collect::<Vec<_>>(),
+                                );
+                                history
+                                    .add_workflow(workflow_history.clone())
+                                    .await
+                                    .unwrap();
+
+                                notification_tx
+                                    .send(Notification::WorkflowStarted(
+                                        Uuid::parse_str(&workflow_history.workflow_id).unwrap(),
+                                        workflow_history,
+                                    ))
+                                    .unwrap();
+                            }
+                            None => {}
+                        }
+                    }
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        });
+    }
+
     pub async fn start_workflow_internal(
         &self,
         workflow_options: ClientStartWorkflowOptionsVersion,
-    ) -> Result<(String, String), Status> {
+    ) -> Result<String, Status> {
         Ok(match workflow_options.version {
             Some(client_start_workflow_options_version::Version::V1(workflow_options)) => {
-                let workers = self.workers.lock().await;
-                let worker = match workers.iter().find(|(_, worker)| {
-                    worker
-                        .registered_workflows
-                        .contains(&workflow_options.workflow_type)
-                }) {
-                    Some((_, worker)) => worker,
-                    None => {
-                        return Err(Status::not_found("Worker not found"));
-                    }
-                };
-                let mut history = self.history.lock().await;
                 let workflow_id = workflow_options
                     .workflow_id
                     .clone()
                     .unwrap_or(Uuid::new_v4().to_string());
-
-                let mut workflow_history = WorkflowHistory::new(
-                    workflow_id.clone(),
-                    workflow_options
-                        .input
-                        .as_ref()
-                        .unwrap()
-                        .payloads
-                        .iter()
-                        .map(|f| serde_json::from_slice(&f.data).unwrap())
-                        .collect::<Vec<_>>(),
-                );
-                workflow_history.add_run(WorkflowRun::new("0".to_string()));
-                history.add_workflow(workflow_history);
-                worker
-                    .tx
-                    .send(Ok(ImmortalWorkerActionVersion {
-                        version: Some(immortal_worker_action_version::Version::V1(
-                            ImmortalWorkerActionV1 {
-                                action: Some(WorkerAction::StartWorkflow(StartWorkflowOptionsV1 {
-                                    workflow_id: workflow_id.clone(),
-                                    workflow_type: workflow_options.workflow_type.clone(),
-                                    workflow_version: workflow_options.workflow_version.clone(),
-                                    task_queue: workflow_options.task_queue.clone(),
-
-                                    input: workflow_options.input.clone(),
-                                    workflow_run_id: "0".to_string(),
-                                })),
-                            },
-                        )),
-                    }))
-                    .await
-                    .unwrap();
-                (workflow_id, "0".to_string())
+                let mut wq = self.workflow_queue.lock().await;
+                match wq.get_mut(&workflow_options.task_queue) {
+                    Some(queue) => {
+                        queue.push_back((workflow_id.clone(), workflow_options.clone()));
+                    }
+                    None => {
+                        let mut queue = VecDeque::new();
+                        queue.push_back((workflow_id.clone(), workflow_options.clone()));
+                        wq.insert(workflow_options.task_queue.clone(), queue);
+                    }
+                }
+                workflow_id
             }
             _ => {
                 return Err(Status::internal("unsupported version"));
@@ -192,12 +430,28 @@ impl Immortal for ImmortalService {
                     Some(immortal_server_action_version::Version::V1(x)) => match x.action {
                         Some(immortal_server_action_v1::Action::LogEvent(log)) => {
                             let when = NaiveDateTime::from_timestamp(log.when, 0).to_string();
+                            let level = match log.level() {
+                                immortal::Level::Info => "info",
+                                immortal::Level::Warn => "warn",
+                                immortal::Level::Error => "error",
+                                immortal::Level::Debug => "debug",
+                                immortal::Level::Trace => "trace",
+                            }
+                            .to_string();
                             let mut items = vec![
-                                ("workflow_id", &log.workflow_id),
-                                ("workflow_run_id", &log.workflow_run_id),
                                 ("message", &log.message),
                                 ("when", &when),
+                                ("level", &level),
                             ];
+                            let metadata;
+                            match log.metadata.as_ref() {
+                                Some(x) => {
+                                    let json_data: Value = serde_json::from_slice(&x).unwrap();
+                                    metadata = serde_json::to_string(&json_data).unwrap();
+                                    items.push(("metadata", &metadata));
+                                }
+                                None => {}
+                            }
                             match log.activity_id.as_ref() {
                                 Some(activity_id) => {
                                     items.push(("activity_id", activity_id));
@@ -220,7 +474,6 @@ impl Immortal for ImmortalService {
                                 )
                                 .await
                                 .unwrap();
-                            println!("Log = {:?}", log);
                         }
                         _ => {}
                     },
@@ -235,14 +488,45 @@ impl Immortal for ImmortalService {
         let (tx, rx) = mpsc::channel(4);
         let worker_details = worker_details.unwrap();
 
+        let registered_workflows = worker_details
+            .registered_workflows
+            .iter()
+            .map(|x| {
+                (
+                    x.workflow_type.clone(),
+                    WfSchema {
+                        args: serde_json::from_slice(&x.args).unwrap(),
+                        output: serde_json::from_slice(&x.output).unwrap(),
+                    },
+                )
+            })
+            .collect();
+        let registered_activities = worker_details
+            .registered_activities
+            .iter()
+            .map(|x| {
+                (
+                    x.activity_type.clone(),
+                    ActivitySchema {
+                        args: serde_json::from_slice(&x.args).unwrap(),
+                        output: serde_json::from_slice(&x.output).unwrap(),
+                    },
+                )
+            })
+            .collect();
         workers.insert(
             worker_details.worker_id.clone(),
             RegisteredWorker {
+                activity_capacity: worker_details.activity_capacity,
+                task_queue: worker_details.task_queue,
+                workflow_capacity: worker_details.workflow_capacity,
                 incoming: handle,
                 tx: tx.clone(),
                 worker_id: worker_details.worker_id.clone(),
-                registered_workflows: worker_details.registered_workflows.clone(),
-                registered_activities: worker_details.registered_activities.clone(),
+                registered_workflows,
+                registered_activities,
+                max_activity_capacity: worker_details.activity_capacity,
+                max_workflow_capacity: worker_details.workflow_capacity,
             },
         );
         let workers = Arc::clone(&self.workers);
@@ -284,12 +568,9 @@ impl Immortal for ImmortalService {
         request: Request<ClientStartWorkflowOptionsVersion>,
     ) -> Result<Response<ClientStartWorkflowResponse>, Status> {
         let workflow_options = request.into_inner();
-        let (workflow_id, workflow_run_id) = self.start_workflow_internal(workflow_options).await?;
+        let workflow_id = self.start_workflow_internal(workflow_options).await?;
 
-        Ok(Response::new(ClientStartWorkflowResponse {
-            workflow_id,
-            workflow_run_id,
-        }))
+        Ok(Response::new(ClientStartWorkflowResponse { workflow_id }))
     }
     async fn completed_activity(
         &self,
@@ -301,18 +582,29 @@ impl Immortal for ImmortalService {
                 let mut running_activities = self.running_activities.lock().await;
                 // let tx = running_activities.get(&activity_result.activity_id).unwrap();
                 match running_activities.remove(&activity_result.activity_id) {
-                    Some(tx) => {
+                    Some((worker_id, tx)) => {
+                        let mut workers = self.workers.lock().await;
+                        let worker = workers.get_mut(&worker_id.unwrap()).unwrap();
+                        // need to watch out for this as it can increase past max
+                        if worker.activity_capacity < worker.max_activity_capacity {
+                            worker.activity_capacity += 1;
+                        }
                         tx.send(activity_result.clone()).unwrap();
                     }
                     None => {
                         return Err(Status::not_found("Activity not found"));
                     }
                 }
-                let mut history = self.history.lock().await;
-                let run = history
-                    .get_activity_mut(&activity_result.activity_id)
+                let mut activity = self
+                    .history
+                    .get_activity(&activity_result.workflow_id, &activity_result.activity_id)
+                    .await
                     .unwrap()
-                    .get_run_mut(&activity_result.activity_run_id)
+                    .unwrap();
+                let run = activity
+                    .runs
+                    .iter_mut()
+                    .find(|f| f.run_id == activity_result.activity_run_id)
                     .unwrap();
                 run.end_time = Some(NaiveDateTime::from_timestamp(
                     chrono::Utc::now().timestamp(),
@@ -323,14 +615,35 @@ impl Immortal for ImmortalService {
                         run.status = HistoryStatus::Completed(
                             serde_json::from_slice(&x.result.unwrap().data).unwrap(),
                         );
+
+                        match self
+                            .notification_tx
+                            .send(Notification::ActivityRunCompleted(
+                                Uuid::parse_str(&activity_result.workflow_id).unwrap(),
+                                activity.clone(),
+                            )) {
+                            Ok(_) => {}
+                            Err(e) => error!("Error sending notification {:#?}", e),
+                        }
                     }
                     immortal::activity_result_v1::Status::Failed(x) => {
                         run.status = HistoryStatus::Failed(format!("{:#?}", x));
+                        match self.notification_tx.send(Notification::ActivityRunFailed(
+                            Uuid::parse_str(&activity_result.workflow_id).unwrap(),
+                            activity.clone(),
+                        )) {
+                            Ok(_) => {}
+                            Err(e) => error!("Error sending notification {:#?}", e),
+                        }
                     }
                     immortal::activity_result_v1::Status::Cancelled(x) => {
                         run.status = HistoryStatus::Failed(format!("{:#?}", x));
                     }
                 }
+                self.history
+                    .update_activity(&activity_result.workflow_id, activity)
+                    .await
+                    .unwrap();
             }
             _ => {}
         }
@@ -344,31 +657,56 @@ impl Immortal for ImmortalService {
         let workflow_version = request.into_inner();
         match workflow_version.version {
             Some(workflow_result_version::Version::V1(workflow_result)) => {
-                let mut history = self.history.lock().await;
-                let run = history
-                    .get_workflow_mut(&workflow_result.workflow_id)
+                let mut workflow = self
+                    .history
+                    .get_workflow(&workflow_result.workflow_id)
+                    .await
                     .unwrap()
-                    .get_run_mut(&workflow_result.workflow_run_id)
                     .unwrap();
-                run.end_time = Some(NaiveDateTime::from_timestamp(
+
+                workflow.end_time = Some(NaiveDateTime::from_timestamp(
                     chrono::Utc::now().timestamp(),
                     0,
                 ));
 
-                println!("workflow_result = {:?}", workflow_result);
                 match workflow_result.status.unwrap() {
                     workflow_result_v1::Status::Completed(x) => {
-                        run.status = HistoryStatus::Completed(
+                        workflow.status = HistoryStatus::Completed(
                             serde_json::from_slice(&x.result.unwrap().data).unwrap(),
                         );
+                        self.notification_tx
+                            .send(Notification::WorkflowCompleted(
+                                Uuid::parse_str(&workflow_result.workflow_id).unwrap(),
+                                workflow.clone(),
+                            ))
+                            .unwrap();
                     }
                     workflow_result_v1::Status::Failed(x) => {
-                        run.status = HistoryStatus::Failed(format!("{:#?}", x));
+                        workflow.status = HistoryStatus::Failed(format!("{:#?}", x));
+                        self.notification_tx
+                            .send(Notification::WorkflowFailed(
+                                Uuid::parse_str(&workflow_result.workflow_id).unwrap(),
+                                workflow.clone(),
+                            ))
+                            .unwrap();
                     }
                     workflow_result_v1::Status::Cancelled(x) => {
-                        run.status = HistoryStatus::Failed(format!("{:#?}", x));
+                        workflow.status = HistoryStatus::Failed(format!("{:#?}", x));
                     }
                 }
+
+                {
+                    let mut workers = self.workers.lock().await;
+                    let worker = workers.get_mut(&workflow_result.worker_id).unwrap();
+                    if worker.workflow_capacity < worker.max_workflow_capacity {
+                        worker.workflow_capacity += 1;
+                    }
+                }
+
+                self.history
+                    .update_workflow(&workflow_result.workflow_id, workflow)
+                    .await
+                    .unwrap();
             }
             _ => {}
         }
@@ -383,67 +721,30 @@ impl Immortal for ImmortalService {
         match &activity_version.version {
             Some(request_start_activity_options_version::Version::V1(activity_options)) => {
                 {
-                    let workers = self.workers.lock().await;
-                    println!("workers = {:?}", workers);
-                    let worker = match workers.iter().find(|(_, worker)| {
-                        worker
-                            .registered_activities
-                            .contains(&activity_options.activity_type)
-                    }) {
-                        Some((_, worker)) => worker,
-                        None => {
-                            return Err(Status::not_found("Worker not found"));
+                    let mut activity_queues = self.activity_queue.lock().await;
+                    match activity_queues.get_mut(&activity_options.task_queue) {
+                        Some(queue) => {
+                            queue.push_back(("0".to_string(), activity_options.clone()));
                         }
-                    };
-                    worker
-                        .tx
-                        .send(Ok(ImmortalWorkerActionVersion {
-                            version: Some(immortal_worker_action_version::Version::V1(
-                                ImmortalWorkerActionV1 {
-                                    action: Some(WorkerAction::StartActivity(
-                                        immortal::StartActivityOptionsV1 {
-                                            activity_id: activity_options.activity_id.clone(),
-                                            activity_type: activity_options.activity_type.clone(),
-                                            activity_input: activity_options.activity_input.clone(),
-                                            workflow_id: activity_options.workflow_id.clone(),
-                                            workflow_run_id: activity_options
-                                                .workflow_run_id
-                                                .clone(),
-                                            activity_run_id: "0".to_string(),
-                                        },
-                                    )),
-                                },
-                            )),
-                        }))
-                        .await
-                        .unwrap();
+                        None => {
+                            let mut queue = VecDeque::new();
+                            queue.push_back(("0".to_string(), activity_options.clone()));
+                            activity_queues.insert(activity_options.task_queue.clone(), queue);
+                        }
+                    }
                 }
 
                 let (tx, rx) = oneshot::channel::<ActivityResultV1>();
                 {
                     let mut running_activities = self.running_activities.lock().await;
-                    running_activities.insert(activity_options.activity_id.clone(), tx);
+
+                    running_activities.insert(activity_options.activity_id.clone(), (None, tx));
                 }
 
-                let mut history = self.history.lock().await;
-                let workflow = history
-                    .get_workflow_mut(&activity_options.workflow_id)
-                    .unwrap();
-                let workflow_run = workflow
-                    .get_run_mut(&activity_options.workflow_run_id)
-                    .unwrap();
-                let mut activity_history =
-                    ActivityHistory::new(activity_options.activity_id.clone());
-                activity_history
-                    .runs
-                    .push(ActivityRun::new("0".to_string()));
-                workflow_run.activities.push(activity_history);
                 match rx.await {
-                    Ok(payload) => {
-                        Ok(Response::new(ActivityResultVersion {
-                            version: Some(activity_result_version::Version::V1(payload)),
-                        }))
-                    }
+                    Ok(payload) => Ok(Response::new(ActivityResultVersion {
+                        version: Some(activity_result_version::Version::V1(payload)),
+                    })),
                     Err(_) => Err(Status::internal("Activity failed")),
                 }
             }
@@ -462,9 +763,11 @@ async fn on_connect(
     socket: SocketRef,
     Data(data): Data<Value>,
     pool: State<Pool<RedisConnectionManager>>,
+    notification_tx: State<broadcast::Sender<Notification>>,
 ) {
     info!("Socket.IO connected: {:?} {:?}", socket.ns(), socket.id);
-    socket.emit("auth", data).ok();
+    // println!("Data = {:?}", data);
+    // socket.emit("auth", data).ok();
     // let pool = pool.clone();
     let mut con = pool.get().await.unwrap().clone();
     // con.
@@ -489,41 +792,101 @@ async fn on_connect(
             ack.bin(bin).send(data).ok();
         },
     );
-    let s2 = socket.clone();
-    let handle = tokio::spawn(async move {
-        let mut last_id = "0-0".to_string();
-        loop {
-            let opts = StreamReadOptions::default().block(500);
 
-            let srr: StreamReadReply = con
-                .xread_options(&["immortal:logs"], &[last_id.as_str()], &opts)
-                .await
-                .expect("read");
-            for StreamKey { key, ids } in srr.keys {
-                println!("Stream {key}");
-                for StreamId { id, map } in ids {
-                    println!("\tID {id}");
-                    last_id = id;
-                    for (n, s) in map {
-                        if let redis::Value::BulkString(bytes) = s {
-                            println!("\t\t{}", n);
+    {
+        let tx = notification_tx.clone();
 
-                            s2.emit("message-back", String::from_utf8(bytes).expect("utf8"))
-                                .ok();
-                        } else {
-                            panic!("Weird data")
+        socket.on(
+            "history-notifications",
+            |socket: SocketRef, Data::<Value>(data), ack: AckSender, Bin(bin)| async move {
+                info!("Received event: {:?} {:?}", data, bin);
+                ack.bin(bin).send(data).ok();
+                let s2 = socket.clone();
+                let mut rx = tx.clone().subscribe();
+                let handle = tokio::spawn(async move {
+                    while let Ok(z) = rx.recv().await {
+                        s2.emit("history-update", serde_json::to_value(z).unwrap())
+                            .ok();
+                    }
+
+                    // info!("Stream ended");
+                });
+
+                info!("Stream ended");
+                let abort = handle.abort_handle();
+                socket.on_disconnect(|_socket: SocketRef, _reason: DisconnectReason| async move {
+                    // sink.unsubscribe("immortal::logs").await.unwrap();
+                    abort.abort();
+                    println!("aborting stream");
+                    // handle.abort();
+                })
+            },
+        );
+    }
+
+    socket.on(
+        "fetch-logs",
+        |socket: SocketRef, Data::<Value>(data), ack: AckSender, Bin(bin)| {
+            info!("Received event: {:?} {:?}", data, bin);
+            let temp: String = serde_json::from_value(data.clone()).unwrap();
+            ack.bin(bin);
+            let s2 = socket.clone();
+            let handle = tokio::spawn(async move {
+                let mut last_id = "0-0".to_string();
+                loop {
+                    let opts = StreamReadOptions::default().block(500);
+
+                    let srr: StreamReadReply = con
+                        .xread_options(
+                            &[format!("immortal:logs:{temp}")],
+                            &[last_id.as_str()],
+                            &opts,
+                        )
+                        .await
+                        .expect("read");
+                    for StreamKey { key, ids } in srr.keys {
+                        for StreamId { id, map } in ids {
+                            last_id = id.clone();
+                            let mut parsed_map = serde_json::json!({
+                                "id": id.clone()
+                            });
+                            for (n, s) in map {
+                                if let redis::Value::BulkString(bytes) = s {
+                                    if n == "metadata" {
+                                        parsed_map[n] =
+                                            serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                                    } else {
+                                        parsed_map[n] =
+                                            Value::String(String::from_utf8(bytes).unwrap());
+                                    }
+                                } else {
+                                    panic!("Weird data")
+                                }
+                            }
+                            s2.emit("message-back", parsed_map).ok();
                         }
                     }
                 }
-            }
-        }
 
-        // info!("Stream ended");
-    });
-    let abort = handle.abort_handle();
+                // info!("Stream ended");
+            });
+
+            info!("Stream ended");
+            let abort = handle.abort_handle();
+            socket.on_disconnect(|_socket: SocketRef, _reason: DisconnectReason| async move {
+                // sink.unsubscribe("immortal::logs").await.unwrap();
+                abort.abort();
+                println!("aborting stream");
+                // handle.abort();
+            })
+        },
+    );
+    // let s2 = socket.clone();
+
+    // let abort = handle.abort_handle();
     socket.on_disconnect(|socket: SocketRef, reason: DisconnectReason| async move {
         // sink.unsubscribe("immortal::logs").await.unwrap();
-        abort.abort();
+        // abort.abort();
         println!(
             "Socket {} on ns {} disconnected, reason: {:?}",
             socket.id,
@@ -539,19 +902,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::subscriber::set_global_default(FmtSubscriber::default())?;
     let addr = "[::1]:10000".parse().unwrap();
 
+    let redis_username = std::env::var("REDIS_USERNAME").unwrap_or("".to_string());
+    let redis_password = std::env::var("REDIS_PASSWORD").unwrap_or("pine5apple".to_string());
+    let redis_host = std::env::var("REDIS_HOST").unwrap_or("127.0.0.1".to_string());
+    let redis_port = std::env::var("REDIS_PORT").unwrap_or("30379".to_string());
+    let redis_url = format!("redis://{redis_username}:{redis_password}@{redis_host}:{redis_port}/");
     // let (tx, _rx) = broadcast::channel(100);
 
     // let log_streams = Arc::new(Mutex::new(HashMap::new()));
-    let manager = RedisConnectionManager::new("redis://:pine5apple@172.24.10.200:30379").unwrap();
+    let manager = RedisConnectionManager::new(redis_url).unwrap();
     let pool = bb8::Pool::builder().build(manager).await.unwrap();
+
+    let (notification_tx, _notification_rx) = broadcast::channel(100);
     let immortal_service = ImmortalService {
+        notification_tx: Arc::new(notification_tx.clone()),
+        workflow_queue: Arc::new(Mutex::new(HashMap::new())),
+        activity_queue: Arc::new(Mutex::new(HashMap::new())),
         redis_pool: pool.clone(),
-        history: Arc::new(Mutex::new(History::new())),
+        history: History::new(&pool),
         // log_streams: (tx.clone(), Arc::clone(&log_streams)),
         workers: Arc::new(Mutex::new(HashMap::new())),
         running_activities: Arc::new(Mutex::new(HashMap::new())),
     };
 
+    immortal_service.workflow_queue_thread();
+    immortal_service.activity_queue_thread();
     let svc = ImmortalServer::new(immortal_service.clone());
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
@@ -560,25 +935,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::spawn(service_status(health_reporter.clone()));
 
-    let client = Client::open("redis://:pine5apple@172.24.10.200:30379?protocol=resp3").unwrap();
     {
-        let cors = CorsLayer::new()
-            // allow `GET` and `POST` when accessing the resource
-            .allow_methods([Method::GET, Method::POST])
-            // allow requests from any origin
-            .allow_origin(Any);
+        let cors = CorsLayer::very_permissive();
 
         let (layer, io) = SocketIo::builder()
             // .with_state(tx.clone())
             // .with_state(log_streams)
             .with_state(pool)
-            .with_state(client)
+            .with_state(notification_tx)
             .build_layer();
         io.ns("/", on_connect);
         let app = axum::Router::new()
             .nest("/api", api::router())
             .layer(cors)
-            .layer(layer)
+            .layer(
+                ServiceBuilder::new()
+                    .layer(CorsLayer::permissive())
+                    .layer(layer),
+            )
             .with_state(immortal_service);
 
         let listener = tokio::net::TcpListener::bind("0.0.0.0:3001").await.unwrap();
