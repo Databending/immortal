@@ -261,7 +261,7 @@ impl Worker {
             .with(LevelFilter::INFO);
         tracing::subscriber::set_global_default(subscriber)
             .expect("Failed to set global subscriber");
-        let client = ImmortalClient::connect("http://[::1]:10000").await?;
+        let client = ImmortalClient::connect(config.url.clone()).await?;
         let mut worker = Worker {
             server_channel: stx,
             client,
@@ -776,6 +776,7 @@ pub struct WorkerConfig {
     /// A string that should be unique to the set of code this worker uses. IE: All the workflow,
     /// activity, interceptor, and data converter code.
     pub worker_build_id: String,
+    pub url: String,
 
     // custom
     #[builder(default = "1")]
