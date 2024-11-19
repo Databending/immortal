@@ -1,10 +1,11 @@
 use schemars::schema::RootSchema;
 use serde::Serialize;
 
-
-pub mod history;
 pub mod activity;
+pub mod call;
+pub mod history;
 pub mod worker;
+pub mod notification;
 // mod worker;
 pub mod workflow;
 
@@ -18,6 +19,17 @@ pub struct WfSchema {
 pub struct ActivitySchema {
     pub args: RootSchema,
     pub output: RootSchema,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CallSchema {
+    pub args: RootSchema,
+    pub output: RootSchema,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct NotificationSchema {
+    pub args: RootSchema,
 }
 //
 // #[derive(Debug, Clone, Default)]

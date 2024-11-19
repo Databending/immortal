@@ -43,6 +43,7 @@ pub async fn main() -> Result<()> {
         .register_activity("get_avs_request_id", activities::test::hs_tariff_sync)
         .await;
 
+
     // worker
     //     .register_wf("new_validate_repair_wf", workflows::test::main_wf, workflows::test::main_wf_schema())
     //     .await;

@@ -144,6 +144,20 @@ message ActivityResultVersion {
   oneof version { ActivityResultV1 v1 = 1; }
 }
 
+message CallResultV1 {
+  string call_id = 1;
+  string call_run_id = 2;
+  oneof status {
+    Success completed = 3;
+    Failure failed = 4;
+    Cancellation cancelled = 5;
+  }
+}
+
+message CallResultVersion {
+  oneof version { CallResultV1 v1 = 1; }
+}
+
 message WorkflowResultV1 {
   string workflow_id = 1;
   string worker_id = 2;
@@ -204,6 +218,21 @@ message StartActivityOptionsV1 {
   string activity_run_id = 5;
 }
 
+
+message StartCallOptionsV1 {
+  string call_id = 1;
+  string call_type = 2;
+  common.Payload call_input = 3;
+  string call_run_id = 4;
+}
+
+
+message StartNotificationOptionsV1 {
+  string notification_id = 1;
+  string notification_type = 2;
+  common.Payload notification_input = 3;
+}
+
 message StartActivityOptionsVersion {
   oneof version { StartActivityOptionsV1 V1 = 1; }
 }
@@ -217,9 +246,11 @@ message RegisterImmortalWorkerV1 {
   string worker_type = 2;
   repeated RegisteredWorkflow registered_workflows = 3;
   repeated RegisteredActivity registered_activities = 4;
-  int32 workflow_capacity = 5;
-  int32 activity_capacity = 6;
-  string task_queue = 7;
+  repeated RegisteredCall registered_calls = 5;
+  repeated RegisteredNotification registered_notifications = 6;
+  int32 workflow_capacity = 7;
+  int32 activity_capacity = 8;
+  string task_queue = 9;
 }
 
 message RegisteredWorkflow {
@@ -234,6 +265,16 @@ message RegisteredActivity {
   bytes output = 3;
 }
 
+message RegisteredCall {
+  string call_type = 1;
+  bytes args = 2;
+  bytes output = 3;
+}
+
+message RegisteredNotification {
+  string notification_type = 1;
+  bytes args = 2;
+}
 //
 // message RegisterImmortalWorkerVersion {
 //   oneof version {
@@ -246,29 +287,31 @@ message ImmortalWorkerActionV1 {
     StartWorkflowOptionsV1 start_workflow = 1;
     StartActivityOptionsV1 start_activity = 2;
     int32 heartbeat = 3;
+    StartCallOptionsV1 start_call = 4;
+    StartNotificationOptionsV1 notify = 5;
   }
 }
 enum Level {
-    /// The "trace" level.
-    ///
-    /// Designates very low priority, often extremely verbose, information.
-    Trace = 0;
-    /// The "debug" level.
-    ///
-    /// Designates lower priority information.
-    Debug = 1;
-    /// The "info" level.
-    ///
-    /// Designates useful information.
-    Info = 2;
-    /// The "warn" level.
-    ///
-    /// Designates hazardous situations.
-    Warn = 3;
-    /// The "error" level.
-    ///
-    /// Designates very serious errors.
-    Error = 4;
+  /// The "trace" level.
+  ///
+  /// Designates very low priority, often extremely verbose, information.
+  Trace = 0;
+  /// The "debug" level.
+  ///
+  /// Designates lower priority information.
+  Debug = 1;
+  /// The "info" level.
+  ///
+  /// Designates useful information.
+  Info = 2;
+  /// The "warn" level.
+  ///
+  /// Designates hazardous situations.
+  Warn = 3;
+  /// The "error" level.
+  ///
+  /// Designates very serious errors.
+  Error = 4;
 }
 message Log {
   int64 when = 1;
@@ -278,7 +321,6 @@ message Log {
   optional string activity_run_id = 5;
   optional bytes metadata = 6;
   Level level = 7;
-
 }
 
 // the naming might be backwards lol
@@ -318,8 +360,39 @@ message ImmortalWorkerActionVersion {
   oneof version { ImmortalWorkerActionV1 v1 = 1; }
 }
 
-message ClientStartWorkflowResponse {
-  string workflow_id = 1;
+message ClientStartWorkflowResponse { string workflow_id = 1; }
+
+message NotifyVersion {
+  oneof version { NotifyV1 v1 = 1; }
+}
+
+message NotifyV1 {
+  string notify_type = 1;
+  string notify_version = 2;
+  common.Payload input = 3;
+  repeated string task_queues = 4;
+}
+
+message CallVersion {
+  oneof version { CallV1 v1 = 1; }
+}
+message CallV1 {
+  string call_type = 1;
+  string call_version = 2;
+  common.Payload input = 3;
+  string task_queue = 4;
+}
+
+
+message WorkerCallVersion {
+  oneof version { WorkerCallV1 v1 = 1; }
+}
+message WorkerCallV1 {
+  string call_type = 1;
+  string call_version = 2;
+  common.Payloads input = 3;
+  string task_queue = 4;
+  string call_id = 5;
 }
 
 service Immortal {
@@ -333,4 +406,9 @@ service Immortal {
   }
   rpc CompletedWorkflow(WorkflowResultVersion) returns (google.protobuf.Empty) {
   }
+  rpc CompletedCall(CallResultVersion) returns (google.protobuf.Empty) {
+  }
+
+  rpc Notify(NotifyVersion) returns (google.protobuf.Empty) {}
+  rpc Call(CallVersion) returns (CallResultVersion) {}
 }

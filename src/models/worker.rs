@@ -26,23 +26,29 @@ use crate::common::{Payload, Payloads};
 use crate::failure::failure::FailureInfo;
 use crate::failure::Failure;
 use crate::immortal::{
+    self, call_result_version, workflow_result_v1, workflow_result_version, CallResultV1,
+    CallResultVersion, Failure as ImmortalFailure, RegisteredActivity, RegisteredCall,
+    RegisteredNotification, RegisteredWorkflow, RequestStartActivityOptionsV1,
+    RequestStartActivityOptionsVersion, Success as ImmortalSuccess, WorkflowResultV1,
+    WorkflowResultVersion,
+};
+use crate::immortal::{
     activity_result_v1, activity_result_version, immortal_client::ImmortalClient,
     immortal_server_action_v1, immortal_server_action_version, immortal_worker_action_v1::Action,
     immortal_worker_action_version, request_start_activity_options_version, ActivityResultV1,
     ActivityResultVersion, ImmortalServerActionV1, ImmortalServerActionVersion, Log,
     RegisterImmortalWorkerV1, StartWorkflowOptionsV1,
 };
-use crate::immortal::{
-    self, workflow_result_v1, workflow_result_version, Failure as ImmortalFailure, RegisteredActivity, RegisteredWorkflow, RequestStartActivityOptionsV1, RequestStartActivityOptionsVersion, Success as ImmortalSuccess, WorkflowResultV1, WorkflowResultVersion
-};
 
+use super::call::{CallError, CallExitValue, CallFunction, IntoCallFunc};
+use super::notification::{IntoNotificationFunc, NotificationFunction};
 use super::{
     activity::{
         ActExitValue, ActivityError, ActivityFunction, ActivityOptions, AppData, IntoActivityFunc,
     },
     workflow::{WfExitValue, WorkflowFunction},
 };
-use super::{ActivitySchema, WfSchema};
+use super::{ActivitySchema, CallSchema, NotificationSchema, WfSchema};
 
 pub struct RunningWorkflow {
     pub workflow_id: String,
@@ -63,6 +69,12 @@ pub struct RunningActivity {
     pub join_handle: JoinHandle<()>,
 }
 
+pub struct RunningCall {
+    pub call_id: String,
+    pub call_run_id: String,
+    pub join_handle: JoinHandle<()>,
+}
+
 pub struct Worker {
     pub task_queue: String,
     pub client: ImmortalClient<Channel>,
@@ -75,13 +87,19 @@ pub struct Worker {
         String,
         Result<ActExitValue<Value>, ActivityError>,
     )>,
+
+    pub call_sender: UnboundedSender<(String, String, Result<CallExitValue<Value>, CallError>)>,
     // pub client: Arc<dyn WorkerClient>,
     pub workery_key: String,
     pub registered_workflows: Arc<Mutex<HashMap<String, (WorkflowFunction, WfSchema)>>>,
     pub running_workflows: Arc<Mutex<HashMap<String, RunningWorkflow>>>,
     pub running_activities: Arc<Mutex<HashMap<String, RunningActivity>>>,
+    pub running_calls: Arc<Mutex<HashMap<String, RunningCall>>>,
     // active_workflows: WorkflowHalf,
     pub registered_activities: Arc<Mutex<HashMap<String, (ActivityFunction, ActivitySchema)>>>,
+    pub registered_calls: Arc<Mutex<HashMap<String, (CallFunction, CallSchema)>>>,
+    pub registered_notifications:
+        Arc<Mutex<HashMap<String, (NotificationFunction, NotificationSchema)>>>,
     pub app_data: Option<AppData>,
     pub workflow_capacity: i32,
     pub activity_capacity: i32,
@@ -248,6 +266,7 @@ impl Worker {
     ) -> anyhow::Result<(Self, Receiver<ImmortalServerActionV1>)> {
         let (tx, rx) = mpsc::unbounded_channel();
         let (atx, arx) = mpsc::unbounded_channel();
+        let (ctx, crx) = mpsc::unbounded_channel();
 
         let (stx, srx) = broadcast::channel(100);
         let stx2 = stx.clone();
@@ -268,12 +287,16 @@ impl Worker {
             config: config.clone(),
             workflow_sender: tx,
             activity_sender: atx,
+            call_sender: ctx,
             task_queue: config.task_queue.clone(),
             workery_key: config.worker_build_id.clone(),
             running_workflows: Arc::new(Mutex::new(HashMap::new())),
             running_activities: Arc::new(Mutex::new(HashMap::new())),
+            running_calls: Arc::new(Mutex::new(HashMap::new())),
             registered_workflows: Arc::new(Mutex::new(HashMap::new())),
             registered_activities: Arc::new(Mutex::new(HashMap::new())),
+            registered_calls: Arc::new(Mutex::new(HashMap::new())),
+            registered_notifications: Arc::new(Mutex::new(HashMap::new())),
             workflow_capacity: config.workflow_capacity,
             activity_capacity: config.activity_capacity,
             // previous_workflows: Arc::new(Mutex::new(HashMap::new())),
@@ -339,6 +362,46 @@ impl Worker {
         );
     }
 
+    pub async fn register_call<A: schemars::JsonSchema, R, O: schemars::JsonSchema>(
+        &mut self,
+        call_type: impl Into<String>,
+        call_function: impl IntoCallFunc<A, R, O>,
+    ) {
+        let arg_schema = schema_for!(A);
+        let out_schema = schema_for!(O);
+        let mut registered_calls = self.registered_calls.lock().await;
+        registered_calls.insert(
+            call_type.into(),
+            (
+                CallFunction {
+                    call_func: call_function.into_call_fn(),
+                },
+                CallSchema {
+                    args: arg_schema,
+                    output: out_schema,
+                },
+            ),
+        );
+    }
+
+    pub async fn register_notification<A: schemars::JsonSchema, R>(
+        &mut self,
+        notification_type: impl Into<String>,
+        notification_function: impl IntoNotificationFunc<A, R>,
+    ) {
+        let arg_schema = schema_for!(A);
+        let mut registered_notifications = self.registered_notifications.lock().await;
+        registered_notifications.insert(
+            notification_type.into(),
+            (
+                NotificationFunction {
+                    notification_func: notification_function.into_notification_fn(),
+                },
+                NotificationSchema { args: arg_schema },
+            ),
+        );
+    }
+
     /// Insert Custom App Context for Workflows and Activities
     pub fn insert_app_data<T: Send + Sync + 'static>(&mut self, data: T) {
         self.app_data.as_mut().map(|a| a.insert(data));
@@ -396,6 +459,25 @@ impl Worker {
                         )
                         .await;
                     }
+                    Some(Action::StartCall(call)) => {
+                        self.start_call(
+                            &call.call_type,
+                            &call.call_id,
+                            &call.call_run_id,
+                            call.call_input.unwrap(),
+                            safe_app_data,
+                        )
+                        .await;
+                    }
+                    Some(Action::Notify(notification)) => {
+                        self.start_notification(
+                            &notification.notification_id,
+                            &notification.notification_type,
+                            notification.notification_input.unwrap(),
+                            safe_app_data,
+                        )
+                        .await;
+                    }
                     _ => {}
                 },
                 _ => {}
@@ -417,6 +499,27 @@ impl Worker {
             task_queue: self.task_queue.clone(),
             worker_id: self.workery_key.clone(),
             worker_type: self.task_queue.clone(),
+            registered_notifications: self
+                .registered_notifications
+                .lock()
+                .await
+                .iter()
+                .map(|x| RegisteredNotification {
+                    notification_type: x.0.clone(),
+                    args: serde_json::to_vec(&x.1 .1.args.clone()).unwrap(),
+                })
+                .collect(),
+            registered_calls: self
+                .registered_calls
+                .lock()
+                .await
+                .iter()
+                .map(|x| RegisteredCall {
+                    call_type: x.0.clone(),
+                    args: serde_json::to_vec(&x.1 .1.args.clone()).unwrap(),
+                    output: serde_json::to_vec(&x.1 .1.output.clone()).unwrap(),
+                })
+                .collect(),
             registered_activities: self
                 .registered_activities
                 .lock()
@@ -654,6 +757,70 @@ impl Worker {
         });
     }
 
+    pub fn call_thread(
+        &mut self,
+        mut rx: UnboundedReceiver<(String, String, Result<CallExitValue<Value>, CallError>)>,
+    ) {
+        let running_calls_arc = Arc::clone(&self.running_calls);
+
+        let mut client = self.client.clone();
+        tokio::spawn(async move {
+            while let Some(result) = rx.recv().await {
+                let res = match result.2 {
+                    // Err(e) => ActivityExecutionResult::fail(Failure::application_failure(
+                    //     format!("Activity function panicked: {}", panic_formatter(e)),
+                    //     true,
+                    // )),
+                    Ok(CallExitValue::Normal(p)) => {
+                        CallResultV1::ok(result.0.clone(), result.1.clone(), Some(Payload::new(&p)))
+                    }
+
+                    Err(err) => match err {
+                        CallError::Retryable {
+                            source,
+                            explicit_delay,
+                        } => CallResultV1::fail(result.0.clone(), result.1.clone(), {
+                            println!("source: {:?}", source);
+                            let mut f = Failure::application_failure_from_error(source, false);
+                            if let Some(d) = explicit_delay {
+                                if let Some(FailureInfo::ApplicationFailureInfo(fi)) =
+                                    f.failure_info.as_mut()
+                                {
+                                    fi.next_retry_delay = d.try_into().ok();
+                                }
+                            }
+                            f
+                        }),
+                        CallError::Cancelled { details } => CallResultV1::cancel_from_details(
+                            result.0.clone(),
+                            result.1.clone(),
+                            match details {
+                                Some(d) => Some(vec![serde_json::to_vec(&d).unwrap()]),
+                                None => None,
+                            },
+                        ),
+                        CallError::NonRetryable(nre) => CallResultV1::fail(
+                            result.0.clone(),
+                            result.1.clone(),
+                            Failure::application_failure_from_error(nre, true),
+                        ),
+                    },
+                };
+                client
+                    .completed_call(CallResultVersion {
+                        version: Some(call_result_version::Version::V1(res)),
+                    })
+                    .await
+                    .unwrap();
+
+                let mut running_activities = running_calls_arc.lock().await;
+                // let running_activity = running_activities.get("test").unwrap();
+                // running_activity.join_handle.abort();
+                running_activities.remove(&result.0);
+            }
+        });
+    }
+
     pub async fn activity(
         &mut self,
         workflow_id: String,
@@ -755,6 +922,91 @@ impl Worker {
             .lock()
             .await
             .insert(activity_id.to_string(), running_workflow);
+        // self.app_data = Some(
+        //     Arc::try_unwrap(safe_app_data)
+        //         .map_err(|_| anyhow!("some references of AppData exist on worker shutdown"))
+        //         .unwrap(),
+        // );
+    }
+
+    pub async fn start_call(
+        &mut self,
+        call_type: &str,
+        call_id: &str,
+        call_run_id: &str,
+        payload: Payload,
+        safe_app_data: &Arc<AppData>,
+    ) {
+        let registered_calls = Arc::clone(&self.registered_calls);
+        let call_type = call_type.to_string();
+
+        let sender = self.call_sender.clone();
+        let mut act2 = registered_calls.lock().await;
+        let act = act2.get_mut(&call_type).unwrap();
+
+        let cid = call_id.to_string();
+        let crid = call_run_id.to_string();
+
+        let act_handle = act.0.start_call(
+            payload,
+            safe_app_data.clone(),
+            call_type.to_string(),
+            call_id.to_string(),
+        );
+        let handle = tokio::spawn(async move {
+            let res = act_handle.await;
+
+            sender
+                .send((cid.to_string(), crid.to_string(), res))
+                .unwrap();
+        });
+        let running_workflow = RunningCall {
+            call_id: call_id.to_string(),
+            call_run_id: call_run_id.to_string(),
+            join_handle: handle,
+        };
+        self.running_calls
+            .lock()
+            .await
+            .insert(call_id.to_string(), running_workflow);
+        // self.app_data = Some(
+        //     Arc::try_unwrap(safe_app_data)
+        //         .map_err(|_| anyhow!("some references of AppData exist on worker shutdown"))
+        //         .unwrap(),
+        // );
+    }
+
+    pub async fn start_notification(
+        &mut self,
+        notification_id: &str,
+        notification_type: &str,
+        payload: Payload,
+        safe_app_data: &Arc<AppData>,
+    ) {
+        let registered_notifications = Arc::clone(&self.registered_notifications);
+        let notification_type = notification_type.to_string();
+
+        let mut act2 = registered_notifications.lock().await;
+        let act = act2.get_mut(&notification_type).unwrap();
+
+        // let nid = notification_id.to_string();
+
+        let act_handle = act.0.start_notification(
+            payload,
+            safe_app_data.clone(),
+            notification_type,
+            notification_id.to_string(),
+        );
+        tokio::spawn(async move {
+            let res = act_handle.await;
+            match res {
+                Err(e) => {
+                    println!("ERROR IN NOTIFICATION: {}", e.to_string());
+                }
+                _ => {}
+            }
+        });
+
         // self.app_data = Some(
         //     Arc::try_unwrap(safe_app_data)
         //         .map_err(|_| anyhow!("some references of AppData exist on worker shutdown"))

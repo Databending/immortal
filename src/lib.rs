@@ -61,6 +61,61 @@ pub mod immortal {
         }
     }
 
+    impl CallResultV1 {
+        pub const fn ok(
+            call_id: String,
+            call_run_id: String,
+            result: Option<Payload>,
+        ) -> Self {
+            Self {
+                call_id,
+                call_run_id,
+                status: Some(call_result_v1::Status::Completed(Success { result })),
+            }
+        }
+
+        pub fn fail(
+            call_id: String,
+            call_run_id: String,
+            fail: super::failure::Failure,
+        ) -> Self {
+            Self {
+                call_id,
+                call_run_id,
+                status: Some(call_result_v1::Status::Failed(Failure {
+                    failure: Some(fail),
+                })),
+            }
+        }
+
+        pub fn cancel_from_details(
+            call_id: String,
+            call_run_id: String,
+
+            payload: Option<Vec<Vec<u8>>>,
+        ) -> Self {
+            Self {
+                call_id,
+                call_run_id,
+
+                status: Some(call_result_v1::Status::Cancelled(Cancellation::from_details(payload))),
+            }
+        }
+
+        // pub const fn will_complete_async(activity_id: String, activity_run_id: String) -> Self {
+        //     Self {
+        //         activity_id,
+        //         activity_run_id,
+        //         status: Some(Status::WillCompleteAsync(WillCompleteAsync {})),
+        //     }
+        // }
+
+        pub fn is_cancelled(&self) -> bool {
+            matches!(self.status, Some(call_result_v1::Status::Cancelled(_)))
+        }
+    }
+
+
     impl ActivityResultV1 {
         pub const fn ok(
             workflow_id: String,

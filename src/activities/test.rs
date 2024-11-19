@@ -3,7 +3,6 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use schemars::JsonSchema;
-use immortal_macros::function_schema;
 use uuid::Uuid;
 use crate::models::activity::{ActContext, ActivityError};
 pub struct ActivityData {
@@ -21,7 +20,6 @@ pub struct ActivityOutput {
     pub data: String,
 }
 
-#[function_schema]
 pub async fn hs_tariff_sync(ctx: ActContext, _payload: Uuid) -> Result<ActivityOutput, ActivityError> {
     
 

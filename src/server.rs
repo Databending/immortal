@@ -4,11 +4,21 @@
 use ::immortal::common;
 use ::immortal::failure;
 use ::immortal::immortal;
+use ::immortal::immortal::call_result_version;
+use ::immortal::immortal::call_version;
+use ::immortal::immortal::notify_version;
+use ::immortal::immortal::CallResultV1;
+use ::immortal::immortal::CallResultVersion;
+use ::immortal::immortal::CallV1;
+use ::immortal::immortal::CallVersion;
 use ::immortal::immortal::ClientStartWorkflowOptionsV1;
+use ::immortal::immortal::NotifyVersion;
 use ::immortal::immortal::RequestStartActivityOptionsV1;
+use ::immortal::immortal::StartNotificationOptionsV1;
 use ::immortal::models::history::Status as HistoryStatus;
 use ::immortal::models::history::{ActivityHistory, ActivityRun, History, WorkflowHistory};
 use ::immortal::models::ActivitySchema;
+use ::immortal::models::CallSchema;
 use ::immortal::models::WfSchema;
 use axum;
 use bb8_redis::bb8::Pool;
@@ -31,6 +41,7 @@ use immortal::{
     ImmortalWorkerActionVersion, RequestStartActivityOptionsVersion, StartWorkflowOptionsV1,
     WorkflowResultVersion,
 };
+use regex::Regex;
 use serde_json::Value;
 use socketioxide::extract::{AckSender, Bin, State};
 use socketioxide::socket::DisconnectReason;
@@ -89,6 +100,7 @@ struct RegisteredWorker {
     tx: Sender<Result<ImmortalWorkerActionVersion, Status>>,
     registered_workflows: HashMap<String, WfSchema>,
     registered_activities: HashMap<String, ActivitySchema>,
+    registered_calls: HashMap<String, CallSchema>,
     activity_capacity: i32,
     max_activity_capacity: i32,
     workflow_capacity: i32,
@@ -124,6 +136,8 @@ pub struct ImmortalService {
     history: History,
 
     notification_tx: Arc<tokio::sync::broadcast::Sender<Notification>>,
+
+    running_calls: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<CallResultV1>>>>,
     running_activities: Arc<
         Mutex<
             HashMap<
@@ -135,11 +149,99 @@ pub struct ImmortalService {
             >,
         >,
     >,
+    call_queue: Arc<
+        Mutex<
+            HashMap<String, VecDeque<(String, CallV1, tokio::sync::oneshot::Sender<CallResultV1>)>>,
+        >,
+    >,
     workflow_queue: Arc<Mutex<HashMap<String, VecDeque<(String, ClientStartWorkflowOptionsV1)>>>>,
     activity_queue: Arc<Mutex<HashMap<String, VecDeque<(String, RequestStartActivityOptionsV1)>>>>,
 }
 
 impl ImmortalService {
+    pub fn call_queue_thread(&self) {
+        let call_queue = Arc::clone(&self.call_queue);
+        let running_calls = Arc::clone(&self.running_calls);
+        let workers = Arc::clone(&self.workers);
+        tokio::spawn(async move {
+            loop {
+                let queues;
+                // let activity_queues;
+                // {
+                let call_queues = call_queue.lock().await;
+
+                queues = call_queues
+                    .iter()
+                    .map(|(f, c)| (f.to_string(), c))
+                    .collect::<HashMap<_, _>>()
+                    .clone();
+                // }
+
+                for (queue_name, queue) in queues {
+                    let mut workers = workers.lock().await;
+                    for (i, x) in queue.iter().enumerate() {
+                        let mut workers_filtered = workers
+                            .iter_mut()
+                            .filter(|(_, worker)| worker.task_queue == *queue_name)
+                            // .filter(|(_, worker)| {
+                            //     worker
+                            //         .registered_activities
+                            //         .contains_key(&x.1.call_type)
+                            // })
+                            .map(|(_, worker)| worker)
+                            .collect::<Vec<_>>();
+                        if workers_filtered.len() == 0 {
+                            continue;
+                        }
+                        let random = {
+                            let mut rng = rand::thread_rng();
+                            rng.gen_range(0..workers_filtered.len())
+                        };
+                        match workers_filtered.get_mut(random) {
+                            Some(worker) => {
+                                let (call_id, call_options, sender) = {
+                                    let mut queues = call_queue.lock().await;
+                                    let q = queues.get_mut(&queue_name).unwrap();
+                                    q.remove(i).unwrap()
+                                };
+
+                                {
+                                    let mut running_calls = running_calls.lock().await;
+                                    running_calls.insert(call_id.clone(), sender);
+                                }
+                                // let workers = self.workers.lock().await;
+                                // let worker = workers.get(worker_id).unwrap().clone();
+
+                                worker
+                                    .tx
+                                    .send(Ok(ImmortalWorkerActionVersion {
+                                        version: Some(immortal_worker_action_version::Version::V1(
+                                            ImmortalWorkerActionV1 {
+                                                action: Some(WorkerAction::StartCall(
+                                                    immortal::StartCallOptionsV1 {
+                                                        call_run_id: "0".to_string(),
+                                                        call_id: call_id.clone(),
+                                                        call_type: call_options.call_type.clone(),
+                                                        call_input: call_options.input.clone(),
+
+                                                    },
+                                                )),
+                                            },
+                                        )),
+                                    }))
+                                    .await
+                                    .unwrap();
+                            }
+                            None => {}
+                        }
+                        break;
+                    }
+                }
+                // wait 500ms
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        });
+    }
     pub fn activity_queue_thread(&self) {
         let activity_queue = Arc::clone(&self.activity_queue);
         let running_activities = Arc::clone(&self.running_activities);
@@ -402,9 +504,77 @@ impl ImmortalService {
     }
 }
 
+fn matches_any(patterns: &[String], input: &str) -> bool {
+    for pattern in patterns {
+        let re = Regex::new(pattern).expect("Invalid regex pattern");
+        if re.is_match(input) {
+            return true;
+        }
+    }
+    false
+}
+
 #[tonic::async_trait]
 impl Immortal for ImmortalService {
     type RegisterWorkerStream = ReceiverStream<Result<ImmortalWorkerActionVersion, Status>>;
+    async fn call(
+        &self,
+        request: Request<CallVersion>,
+    ) -> Result<Response<CallResultVersion>, Status> {
+        {
+            let mut queue = self.call_queue.lock().await;
+            match request.into_inner().version {
+                Some(call_version::Version::V1(call)) => {
+                    let (tx, rx) = oneshot::channel::<CallResultV1>();
+                    queue.get_mut(&call.call_type).unwrap().push_back((
+                        Uuid::new_v4().to_string(),
+                        call.clone(),
+                        tx,
+                    ));
+                    match rx.await {
+                        Ok(payload) => Ok(Response::new(CallResultVersion {
+                            version: Some(call_result_version::Version::V1(payload)),
+                        })),
+                        Err(_) => Err(Status::internal("Call failed")),
+                    }
+                }
+                _ => Err(Status::internal("unsupported version")),
+            }
+        }
+    }
+    async fn notify(&self, request: Request<NotifyVersion>) -> Result<Response<()>, Status> {
+        {
+            match request.into_inner().version.unwrap() {
+                notify_version::Version::V1(v1) => {
+                    let workers = self.workers.lock().await;
+                    let workers_to_notify = workers
+                        .iter()
+                        .filter(|(_, worker)| matches_any(&v1.task_queues, &worker.task_queue))
+                        .map(|(_, worker)| worker)
+                        .collect::<Vec<_>>();
+                    for worker in workers_to_notify {
+                        worker
+                            .tx
+                            .send(Ok(ImmortalWorkerActionVersion {
+                                version: Some(immortal_worker_action_version::Version::V1(
+                                    ImmortalWorkerActionV1 {
+                                        action: Some(WorkerAction::Notify(StartNotificationOptionsV1 {
+                                            notification_id: Uuid::new_v4().to_string(),
+                                            notification_type: v1.notify_type.clone(),
+                                            notification_input: v1.input.clone(),
+                                            
+                                        })),
+                                    },
+                                )),
+                            }))
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+        }
+        Ok(Response::new(()))
+    }
     async fn register_worker(
         &self,
         request: Request<Streaming<ImmortalServerActionVersion>>,
@@ -514,6 +684,19 @@ impl Immortal for ImmortalService {
                 )
             })
             .collect();
+        let registered_calls = worker_details.
+            registered_calls
+            .iter()
+            .map(|x| {
+                (
+                    x.call_type.clone(),
+                    CallSchema {
+                        args: serde_json::from_slice(&x.args).unwrap(),
+                        output: serde_json::from_slice(&x.output).unwrap(),
+                    },
+                )
+            })
+            .collect();
         workers.insert(
             worker_details.worker_id.clone(),
             RegisteredWorker {
@@ -525,6 +708,7 @@ impl Immortal for ImmortalService {
                 worker_id: worker_details.worker_id.clone(),
                 registered_workflows,
                 registered_activities,
+                registered_calls,
                 max_activity_capacity: worker_details.activity_capacity,
                 max_workflow_capacity: worker_details.workflow_capacity,
             },
@@ -644,6 +828,31 @@ impl Immortal for ImmortalService {
                     .update_activity(&activity_result.workflow_id, activity)
                     .await
                     .unwrap();
+            }
+            _ => {}
+        }
+
+        Ok(Response::new(()))
+    }
+    async fn completed_call(
+        &self,
+        request: Request<CallResultVersion>,
+    ) -> Result<Response<()>, Status> {
+        let call_version = request.into_inner();
+        match call_version.version {
+            Some(call_result_version::Version::V1(call_result)) => {
+                let mut running_calls = self.running_calls.lock().await;
+                // let tx = running_activities.get(&activity_result.activity_id).unwrap();
+                match running_calls.remove(&call_result.call_id) {
+                    Some(tx) => {
+                        // need to watch out for this as it can increase past max
+
+                        tx.send(call_result.clone()).unwrap();
+                    }
+                    None => {
+                        return Err(Status::not_found("Activity not found"));
+                    }
+                }
             }
             _ => {}
         }
@@ -918,11 +1127,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         notification_tx: Arc::new(notification_tx.clone()),
         workflow_queue: Arc::new(Mutex::new(HashMap::new())),
         activity_queue: Arc::new(Mutex::new(HashMap::new())),
+        call_queue: Arc::new(Mutex::new(HashMap::new())),
         redis_pool: pool.clone(),
         history: History::new(&pool),
         // log_streams: (tx.clone(), Arc::clone(&log_streams)),
         workers: Arc::new(Mutex::new(HashMap::new())),
         running_activities: Arc::new(Mutex::new(HashMap::new())),
+        running_calls: Arc::new(Mutex::new(HashMap::new())),
     };
 
     immortal_service.workflow_queue_thread();
