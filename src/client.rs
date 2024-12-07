@@ -24,36 +24,36 @@ pub struct GeneratePreview {
 }
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = ImmortalClient::connect("http://[::1]:10000").await?;
-    // client
-    //     .start_workflow(ClientStartWorkflowOptionsVersion {
-    //         version: Some(client_start_workflow_options_version::Version::V1(
-    //             ClientStartWorkflowOptionsV1 {
-    //                 workflow_type: "generate_preview_wf".to_string(),
-    //                 task_queue: "attachamizer".to_string(),
-    //                 input: Some(Payloads::new(vec![&GeneratePreview {
-    //                     file_storage_id: Uuid::from_str("40628d2f-901f-471a-8b86-3bbcfd3ac7b1")?,
-    //                     file_mimetype: "image/png".to_string(),
-    //                 }])),
-    //                 ..Default::default()
-    //             },
-    //         )),
-    //     })
-    //     .await
-    //     .unwrap();
+    let mut client = ImmortalClient::connect("http://localhost:10000").await?;
     client
         .start_workflow(ClientStartWorkflowOptionsVersion {
             version: Some(client_start_workflow_options_version::Version::V1(
                 ClientStartWorkflowOptionsV1 {
-                    task_queue: "test".to_string(),
-                    workflow_type: "new_validate_repair_wf".to_string(),
-                    input: Some(Payloads::new(vec![&Uuid::new_v4()])),
-                    workflow_version: "v1".to_string(),
+                    workflow_type: "generate_preview_wf".to_string(),
+                    task_queue: "attachamizer".to_string(),
+                    input: Some(Payloads::new(vec![&GeneratePreview {
+                        file_storage_id: Uuid::from_str("a402841b-dbf9-4a47-a237-560c5f072fa7")?,
+                        file_mimetype: "video/mp4".to_string(),
+                    }])),
                     ..Default::default()
                 },
             )),
         })
-        .await?;
+        .await
+        .unwrap();
+    // client
+    //     .start_workflow(ClientStartWorkflowOptionsVersion {
+    //         version: Some(client_start_workflow_options_version::Version::V1(
+    //             ClientStartWorkflowOptionsV1 {
+    //                 task_queue: "test".to_string(),
+    //                 workflow_type: "new_validate_repair_wf".to_string(),
+    //                 input: Some(Payloads::new(vec![&Uuid::new_v4()])),
+    //                 workflow_version: "v1".to_string(),
+    //                 ..Default::default()
+    //             },
+    //         )),
+    //     })
+    //     .await?;
 
     Ok(())
 }

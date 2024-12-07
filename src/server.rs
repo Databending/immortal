@@ -2,6 +2,7 @@
 //     tonic::include_proto!("immortal");
 // }
 use ::immortal::common;
+use ::immortal::common::Payload;
 use ::immortal::failure;
 use ::immortal::immortal;
 use ::immortal::immortal::call_result_version;
@@ -23,6 +24,7 @@ use ::immortal::models::WfSchema;
 use axum;
 use bb8_redis::bb8::Pool;
 use chrono::NaiveDateTime;
+use dotenvy::dotenv;
 
 use rand::Rng;
 use redis::streams::{StreamId, StreamKey, StreamMaxlen, StreamReadOptions, StreamReadReply};
@@ -126,6 +128,13 @@ pub enum WorkflowStatus {
 }
 
 #[derive(Debug, Clone)]
+struct CallOptions {
+    call_type: String,
+    input: Option<Payload>,
+    task_queue: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ImmortalService {
     redis_pool: bb8::Pool<RedisConnectionManager>,
     workers: Arc<Mutex<HashMap<String, RegisteredWorker>>>,
@@ -137,7 +146,7 @@ pub struct ImmortalService {
 
     notification_tx: Arc<tokio::sync::broadcast::Sender<Notification>>,
 
-    running_calls: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<CallResultV1>>>>,
+    running_calls: Arc<Mutex<HashMap<String, tokio::sync::broadcast::Sender<CallResultV1>>>>,
     running_activities: Arc<
         Mutex<
             HashMap<
@@ -151,7 +160,14 @@ pub struct ImmortalService {
     >,
     call_queue: Arc<
         Mutex<
-            HashMap<String, VecDeque<(String, CallV1, tokio::sync::oneshot::Sender<CallResultV1>)>>,
+            HashMap<
+                String,
+                VecDeque<(
+                    String,
+                    CallOptions,
+                    tokio::sync::broadcast::Sender<CallResultV1>,
+                )>,
+            >,
         >,
     >,
     workflow_queue: Arc<Mutex<HashMap<String, VecDeque<(String, ClientStartWorkflowOptionsV1)>>>>,
@@ -168,21 +184,24 @@ impl ImmortalService {
                 let queues;
                 // let activity_queues;
                 // {
-                let call_queues = call_queue.lock().await;
+                {
+                    let call_queues = call_queue.lock().await;
 
-                queues = call_queues
-                    .iter()
-                    .map(|(f, c)| (f.to_string(), c))
-                    .collect::<HashMap<_, _>>()
-                    .clone();
+                    queues = call_queues
+                        .iter()
+                        .map(|(f, c)| (f.to_string(), c.clone()))
+                        .collect::<HashMap<_, _>>()
+                        .clone();
+                }
                 // }
 
                 for (queue_name, queue) in queues {
+                    println!("queue = {:?} {:#?}", queue, queue_name);
                     let mut workers = workers.lock().await;
                     for (i, x) in queue.iter().enumerate() {
                         let mut workers_filtered = workers
                             .iter_mut()
-                            .filter(|(_, worker)| worker.task_queue == *queue_name)
+                            .filter(|(_, worker)| worker.task_queue == *x.1.task_queue)
                             // .filter(|(_, worker)| {
                             //     worker
                             //         .registered_activities
@@ -202,7 +221,11 @@ impl ImmortalService {
                                 let (call_id, call_options, sender) = {
                                     let mut queues = call_queue.lock().await;
                                     let q = queues.get_mut(&queue_name).unwrap();
-                                    q.remove(i).unwrap()
+                                    let y = q.remove(i).unwrap();
+                                    if q.len() == 0 {
+                                        queues.remove(&queue_name);
+                                    }
+                                    y
                                 };
 
                                 {
@@ -223,7 +246,6 @@ impl ImmortalService {
                                                         call_id: call_id.clone(),
                                                         call_type: call_options.call_type.clone(),
                                                         call_input: call_options.input.clone(),
-
                                                     },
                                                 )),
                                             },
@@ -522,16 +544,46 @@ impl Immortal for ImmortalService {
         request: Request<CallVersion>,
     ) -> Result<Response<CallResultVersion>, Status> {
         {
-            let mut queue = self.call_queue.lock().await;
             match request.into_inner().version {
                 Some(call_version::Version::V1(call)) => {
-                    let (tx, rx) = oneshot::channel::<CallResultV1>();
-                    queue.get_mut(&call.call_type).unwrap().push_back((
-                        Uuid::new_v4().to_string(),
-                        call.clone(),
-                        tx,
-                    ));
-                    match rx.await {
+                    let (tx, mut rx) = broadcast::channel::<CallResultV1>(100);
+
+                    {
+                        let mut queue = self.call_queue.lock().await;
+                        match queue.get_mut(&call.call_type) {
+                            Some(queue) => {
+                                queue.push_back((
+                                    Uuid::new_v4().to_string(),
+                                    CallOptions {
+                                        call_type: call.call_type.clone(),
+                                        input: call.input.clone(),
+                                        task_queue: call.task_queue.clone(),
+                                    },
+                                    tx,
+                                ));
+                            }
+                            None => {
+                                let mut queue2 = VecDeque::new();
+                                queue2.push_back((
+                                    Uuid::new_v4().to_string(),
+                                    CallOptions {
+                                        call_type: call.call_type.clone(),
+                                        input: call.input.clone(),
+                                        task_queue: call.task_queue.clone(),
+                                    },
+                                    tx,
+                                ));
+                                queue.insert(call.call_type.clone(), queue2);
+                            }
+                        }
+                    }
+
+                    // queue.get_mut(&call.call_type).unwrap().push_back((
+                    //     Uuid::new_v4().to_string(),
+                    //     call.clone(),
+                    //     tx,
+                    // ));
+                    match rx.recv().await {
                         Ok(payload) => Ok(Response::new(CallResultVersion {
                             version: Some(call_result_version::Version::V1(payload)),
                         })),
@@ -558,12 +610,13 @@ impl Immortal for ImmortalService {
                             .send(Ok(ImmortalWorkerActionVersion {
                                 version: Some(immortal_worker_action_version::Version::V1(
                                     ImmortalWorkerActionV1 {
-                                        action: Some(WorkerAction::Notify(StartNotificationOptionsV1 {
-                                            notification_id: Uuid::new_v4().to_string(),
-                                            notification_type: v1.notify_type.clone(),
-                                            notification_input: v1.input.clone(),
-                                            
-                                        })),
+                                        action: Some(WorkerAction::Notify(
+                                            StartNotificationOptionsV1 {
+                                                notification_id: Uuid::new_v4().to_string(),
+                                                notification_type: v1.notify_type.clone(),
+                                                notification_input: v1.input.clone(),
+                                            },
+                                        )),
                                     },
                                 )),
                             }))
@@ -684,8 +737,8 @@ impl Immortal for ImmortalService {
                 )
             })
             .collect();
-        let registered_calls = worker_details.
-            registered_calls
+        let registered_calls = worker_details
+            .registered_calls
             .iter()
             .map(|x| {
                 (
@@ -1108,6 +1161,7 @@ async fn on_connect(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenv().ok();
     tracing::subscriber::set_global_default(FmtSubscriber::default())?;
     let addr = "0.0.0.0:10000".parse().unwrap();
 
@@ -1116,6 +1170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let redis_host = std::env::var("REDIS_HOST").unwrap_or("127.0.0.1".to_string());
     let redis_port = std::env::var("REDIS_PORT").unwrap_or("30379".to_string());
     let redis_url = format!("redis://{redis_username}:{redis_password}@{redis_host}:{redis_port}/");
+    println!("redis_url = {:?}", redis_url);
     // let (tx, _rx) = broadcast::channel(100);
 
     // let log_streams = Arc::new(Mutex::new(HashMap::new()));
@@ -1138,6 +1193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     immortal_service.workflow_queue_thread();
     immortal_service.activity_queue_thread();
+    immortal_service.call_queue_thread();
     let svc = ImmortalServer::new(immortal_service.clone());
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
@@ -1152,7 +1208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (layer, io) = SocketIo::builder()
             // .with_state(tx.clone())
             // .with_state(log_streams)
-            .with_state(pool)
+            .with_state(pool.clone())
             .with_state(notification_tx)
             .build_layer();
         io.ns("/", on_connect);
@@ -1172,6 +1228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    let con = pool.get().await.unwrap();
     Server::builder()
         .add_service(svc)
         .add_service(health_service)

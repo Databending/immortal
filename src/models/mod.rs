@@ -5,6 +5,8 @@ pub mod activity;
 pub mod call;
 pub mod history;
 pub mod worker;
+
+pub mod serverless;
 pub mod notification;
 // mod worker;
 pub mod workflow;

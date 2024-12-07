@@ -1,7 +1,7 @@
-use ::immortal::immortal;
-use ::immortal::failure;
-use ::immortal::common;
 use crate::models::worker::WorkerConfigBuilder;
+use ::immortal::common;
+use ::immortal::failure;
+use ::immortal::immortal;
 use ::immortal::register_workflow;
 pub mod activities;
 pub mod models;
@@ -14,10 +14,9 @@ use anyhow::Result;
 
 use models::worker::Worker;
 
-
-
 #[tokio::main]
 pub async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
     // let server_options =
     //     sdk_client_options(Url::from_str(&env::var("TEMPORAL_URL").unwrap())?).build()?;
 
@@ -26,12 +25,12 @@ pub async fn main() -> Result<()> {
 
     println!("Connected to Temporal");
 
-
     let config = WorkerConfigBuilder::default()
         .namespace("default".to_string())
         .task_queue("test".to_string())
         .worker_build_id("rust-worker".to_string())
-        .build()?; 
+        .url(std::env::var("IMMORTAL_URL").unwrap())
+        .build()?;
 
     let (mut worker, srx) = Worker::new(config).await?;
 
@@ -43,7 +42,6 @@ pub async fn main() -> Result<()> {
         .register_activity("get_avs_request_id", activities::test::hs_tariff_sync)
         .await;
 
-
     // worker
     //     .register_wf("new_validate_repair_wf", workflows::test::main_wf, workflows::test::main_wf_schema())
     //     .await;
@@ -52,12 +50,10 @@ pub async fn main() -> Result<()> {
     // println!("{:#?}", serde_json::to_string_pretty(&workflows::test::main_wf_schema()));
     println!("Starting worker...");
 
-
     // worker.start_workflow("new_validate_repair_wf").await;
 
-    loop {
-        let _ = worker.main_thread(&srx).await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        println!("Main thread loop. Reconnecting...");
-    }
+    let _ = worker.main_thread(srx).await;
+
+    // worker.main_thread(srx).await;
+    Ok(())
 }

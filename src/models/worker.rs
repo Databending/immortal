@@ -11,7 +11,7 @@ use tokio::sync::{
     mpsc::{self, UnboundedReceiver, UnboundedSender},
     Mutex,
 };
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Server};
 use tracing::field::{Field, Visit};
 use tracing::level_filters::LevelFilter;
 use tracing::span::{Attributes, Id};
@@ -20,11 +20,10 @@ use tracing_subscriber::Registry;
 use tracing_subscriber::{layer::Context, layer::SubscriberExt, Layer};
 use uuid::Uuid;
 
-use tokio::task::JoinHandle;
-
 use crate::common::{Payload, Payloads};
 use crate::failure::failure::FailureInfo;
 use crate::failure::Failure;
+use crate::immortal::immortal_serverless_server::{ImmortalServerless, ImmortalServerlessServer};
 use crate::immortal::{
     self, call_result_version, workflow_result_v1, workflow_result_version, CallResultV1,
     CallResultVersion, Failure as ImmortalFailure, RegisteredActivity, RegisteredCall,
@@ -39,9 +38,11 @@ use crate::immortal::{
     ActivityResultVersion, ImmortalServerActionV1, ImmortalServerActionVersion, Log,
     RegisterImmortalWorkerV1, StartWorkflowOptionsV1,
 };
+use tokio::task::JoinHandle;
 
 use super::call::{CallError, CallExitValue, CallFunction, IntoCallFunc};
 use super::notification::{IntoNotificationFunc, NotificationFunction};
+use super::serverless::{self, ImmortalServerlessService};
 use super::{
     activity::{
         ActExitValue, ActivityError, ActivityFunction, ActivityOptions, AppData, IntoActivityFunc,
@@ -75,6 +76,7 @@ pub struct RunningCall {
     pub join_handle: JoinHandle<()>,
 }
 
+// #[derive(Debug)]
 pub struct Worker {
     pub task_queue: String,
     pub client: ImmortalClient<Channel>,
@@ -224,13 +226,14 @@ where
         let _ = writeln!(&mut event_str, "{:?}", event);
         let mut visitor = EventVisitor::default();
         event.record(&mut visitor);
+        println!("Event: {:?}", event);
         if let Some(scope) = ctx.event_scope(&event) {
             for span in scope.from_root() {
                 if let Some(data) = span.extensions().get::<SpanData>() {
                     let _ = self.sender.send(ImmortalServerActionV1 {
                         action: Some(immortal_server_action_v1::Action::LogEvent(Log {
                             activity_run_id: data.activity_run_id.clone(),
-                            message: visitor.message.unwrap(),
+                            message: visitor.message.unwrap_or("".to_string()),
                             metadata: Some(
                                 serde_json::to_vec(&json!({
                                     "target": event.metadata().target().to_string(),
@@ -304,6 +307,7 @@ impl Worker {
         };
         worker.workflow_thread(rx);
         worker.activity_thread(arx);
+        worker.call_thread(crx);
         Ok((worker, srx))
     }
 
@@ -486,7 +490,7 @@ impl Worker {
         Ok(())
     }
 
-    pub async fn main_thread(
+    async fn main_thread3(
         &mut self,
         rx: &broadcast::Receiver<ImmortalServerActionV1>,
     ) -> anyhow::Result<()> {
@@ -568,6 +572,31 @@ impl Worker {
             Arc::try_unwrap(safe_app_data)
                 .map_err(|_| anyhow!("some references of AppData exist on worker shutdown"))?,
         );
+        Ok(())
+    }
+
+    pub async fn main_thread(
+        mut self,
+        rx: broadcast::Receiver<ImmortalServerActionV1>,
+    ) -> anyhow::Result<()> {
+        let serverless_mode = std::env::var("SERVERLESS_MODE").unwrap_or_default();
+        if serverless_mode == "true" {
+            println!("Starting serverless mode");
+            let safe_app_data = Arc::new(
+                self.app_data
+                    .take()
+                    .ok_or_else(|| anyhow!("app_data should exist on run"))
+                    .unwrap(),
+            );
+            let _ = serverless::main(self, safe_app_data).await;
+        } else {
+            loop {
+                let _ = self.main_thread3(&rx).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                println!("Main thread loop. Reconnecting...");
+            }
+        }
+
         Ok(())
     }
 
@@ -880,6 +909,113 @@ impl Worker {
         }
     }
 
+    pub async fn run_serverless_activity(
+        &mut self,
+        workflow_id: &str,
+        activity_type: &str,
+        activity_id: &str,
+        activity_run_id: &str,
+        payload: Payload,
+        safe_app_data: &Arc<AppData>,
+    ) -> anyhow::Result<ActivityResultV1>{
+        let registered_activities = Arc::clone(&self.registered_activities);
+        let running_activities_arc = Arc::clone(&self.running_activities);
+        let activity_type = activity_type.to_string();
+
+        // let sender = self.activity_sender.clone();
+
+        let (atx, mut arx) = mpsc::unbounded_channel();
+        let mut act2 = registered_activities.lock().await;
+        let act = act2.get_mut(&activity_type).unwrap();
+
+        let aid = activity_id.to_string();
+        let aid_run = activity_run_id.to_string();
+        let wid = workflow_id.to_string();
+
+        let act_handle = act.0.start_activity(
+            payload,
+            safe_app_data.clone(),
+            activity_type,
+            workflow_id.to_string(),
+            activity_id.to_string(),
+            activity_run_id.to_string(),
+        );
+        let handle = tokio::spawn(async move {
+            let res = act_handle.await;
+
+            atx.send((wid.to_string(), aid, aid_run, res)).unwrap();
+        });
+        let running_workflow = RunningActivity {
+            activity_id: activity_id.to_string(),
+            run_id: activity_run_id.to_string(),
+            join_handle: handle,
+        };
+        self.running_activities
+            .lock()
+            .await
+            .insert(activity_id.to_string(), running_workflow);
+        let result = arx.recv().await.unwrap();
+        let res = match result.3 {
+            // Err(e) => ActivityExecutionResult::fail(Failure::application_failure(
+            //     format!("Activity function panicked: {}", panic_formatter(e)),
+            //     true,
+            // )),
+            Ok(ActExitValue::Normal(p)) => ActivityResultV1::ok(
+                result.0.clone(),
+                result.1.clone(),
+                result.2.clone(),
+                Some(Payload::new(&p)),
+            ),
+
+            Err(err) => match err {
+                ActivityError::Retryable {
+                    source,
+                    explicit_delay,
+                } => {
+                    ActivityResultV1::fail(result.0.clone(), result.1.clone(), result.2.clone(), {
+                        println!("source: {:?}", source);
+                        let mut f = Failure::application_failure_from_error(source, false);
+                        if let Some(d) = explicit_delay {
+                            if let Some(FailureInfo::ApplicationFailureInfo(fi)) =
+                                f.failure_info.as_mut()
+                            {
+                                fi.next_retry_delay = d.try_into().ok();
+                            }
+                        }
+                        f
+                    })
+                }
+                ActivityError::Cancelled { details } => ActivityResultV1::cancel_from_details(
+                    result.0.clone(),
+                    result.1.clone(),
+                    result.2.clone(),
+                    match details {
+                        Some(d) => Some(vec![serde_json::to_vec(&d).unwrap()]),
+                        None => None,
+                    },
+                ),
+                ActivityError::NonRetryable(nre) => ActivityResultV1::fail(
+                    result.0.clone(),
+                    result.1.clone(),
+                    result.2.clone(),
+                    Failure::application_failure_from_error(nre, true),
+                ),
+            },
+        };
+
+
+        let mut running_activities = running_activities_arc.lock().await;
+        // let running_activity = running_activities.get("test").unwrap();
+        // running_activity.join_handle.abort();
+        running_activities.remove(&result.0);
+        Ok(res)
+        // self.app_data = Some(
+        //     Arc::try_unwrap(safe_app_data)
+        //         .map_err(|_| anyhow!("some references of AppData exist on worker shutdown"))
+        //         .unwrap(),
+        // );
+    }
+
     pub async fn start_activity(
         &mut self,
         workflow_id: &str,
@@ -912,6 +1048,7 @@ impl Worker {
             let res = act_handle.await;
 
             sender.send((wid.to_string(), aid, aid_run, res)).unwrap();
+            // res
         });
         let running_workflow = RunningActivity {
             activity_id: activity_id.to_string(),

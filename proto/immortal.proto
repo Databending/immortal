@@ -218,14 +218,12 @@ message StartActivityOptionsV1 {
   string activity_run_id = 5;
 }
 
-
 message StartCallOptionsV1 {
   string call_id = 1;
   string call_type = 2;
   common.Payload call_input = 3;
   string call_run_id = 4;
 }
-
 
 message StartNotificationOptionsV1 {
   string notification_id = 1;
@@ -334,24 +332,6 @@ message ImmortalServerActionV1 {
   }
 }
 
-// message WorkflowStartStatus {
-//   oneof status {
-//     int32 started = 1;
-//     Failure failed = 2;
-//     Cancellation cancelled = 3;
-//   }
-//   int32 capacity = 4;
-// }
-//
-// message ActivityStartStatus {
-//   oneof status {
-//     int32 started = 1;
-//     Failure failed = 2;
-//     Cancellation cancelled = 3;
-//   }
-//   int32 capacity = 4;
-// }
-
 message ImmortalServerActionVersion {
   oneof version { ImmortalServerActionV1 v1 = 1; }
 }
@@ -383,7 +363,6 @@ message CallV1 {
   string task_queue = 4;
 }
 
-
 message WorkerCallVersion {
   oneof version { WorkerCallV1 v1 = 1; }
 }
@@ -406,9 +385,27 @@ service Immortal {
   }
   rpc CompletedWorkflow(WorkflowResultVersion) returns (google.protobuf.Empty) {
   }
-  rpc CompletedCall(CallResultVersion) returns (google.protobuf.Empty) {
-  }
+  rpc CompletedCall(CallResultVersion) returns (google.protobuf.Empty) {}
 
   rpc Notify(NotifyVersion) returns (google.protobuf.Empty) {}
   rpc Call(CallVersion) returns (CallResultVersion) {}
+}
+
+service ImmortalServerless {
+  rpc Run(StartActivityOptionsVersion)
+      returns (stream ImmortalServerlessActionVersion) {}
+}
+
+message ImmortalServerlessActionV1 {
+  oneof action {
+    int32 workflow_heartbeat = 1;
+    int32 activity_heartbeat = 2;
+    Log log_event = 3;
+    int32 heartbeat = 4;
+    ActivityResultVersion result = 5;
+  }
+}
+
+message ImmortalServerlessActionVersion {
+  oneof version { ImmortalServerlessActionV1 v1 = 1; }
 }

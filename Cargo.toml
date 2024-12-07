@@ -38,6 +38,7 @@ paste = "1.0.15"
 const_format = "0.2.33"
 tower = "0.5.1"
 regex = "1.11.1"
+dotenvy = "0.15.7"
 [build-dependencies]
 tonic-build = "0.12"
 prost-wkt-build = "0.6"
