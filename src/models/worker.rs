@@ -477,7 +477,7 @@ impl Worker {
                         self.start_notification(
                             &notification.notification_id,
                             &notification.notification_type,
-                            notification.notification_input.unwrap(),
+                            notification.notification_input.unwrap_or(Payload::new(&None::<String>)),
                             safe_app_data,
                         )
                         .await;
