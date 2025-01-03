@@ -709,8 +709,19 @@ impl Immortal for ImmortalService {
         let mut workers = self.workers.lock().await;
 
         let (tx, rx) = mpsc::channel(4);
-        let worker_details = worker_details.unwrap();
+        let mut worker_details = worker_details.unwrap();
 
+        println!("{:#?}", worker_details.worker_id);
+
+        let worker_ids = workers.iter().map(|f| f.0.clone()).collect::<Vec<_>>();
+
+
+        if worker_ids.contains(&worker_details.worker_id) {
+            worker_details.worker_id = format!("{}-{}", worker_details.worker_id, Uuid::new_v4());
+
+        }
+
+        println!("{:#?}", worker_ids);
         let registered_workflows = worker_details
             .registered_workflows
             .iter()
