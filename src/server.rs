@@ -26,6 +26,8 @@ use bb8_redis::bb8::Pool;
 use chrono::NaiveDateTime;
 use dotenvy::dotenv;
 
+use models::notification;
+use models::workflow::WorkflowResult;
 use rand::Rng;
 use redis::streams::{StreamId, StreamKey, StreamMaxlen, StreamReadOptions, StreamReadReply};
 use redis::AsyncCommands;
@@ -44,6 +46,8 @@ use immortal::{
     WorkflowResultVersion,
 };
 use regex::Regex;
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde_json::Value;
 use socketioxide::extract::{AckSender, Bin, State};
 use socketioxide::socket::DisconnectReason;
@@ -53,6 +57,7 @@ use socketioxide::{
 };
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::ops::Deref;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::Sender;
@@ -86,6 +91,7 @@ pub enum Notification {
     // ActivityCancelled,
     WorkflowStarted(Uuid, WorkflowHistory),
     WorkflowCompleted(Uuid, WorkflowHistory),
+    WorkflowResult(Uuid, WorkflowResultVersion),
     WorkflowFailed(Uuid, WorkflowHistory),
     // WorkflowCancelled,
     ActivityRunStarted(Uuid, ActivityHistory),
@@ -145,6 +151,7 @@ pub struct ImmortalService {
     history: History,
 
     notification_tx: Arc<tokio::sync::broadcast::Sender<Notification>>,
+    notification_rx: Arc<tokio::sync::broadcast::Receiver<Notification>>,
 
     running_calls: Arc<Mutex<HashMap<String, tokio::sync::broadcast::Sender<CallResultV1>>>>,
     running_activities: Arc<
@@ -715,10 +722,8 @@ impl Immortal for ImmortalService {
 
         let worker_ids = workers.iter().map(|f| f.0.clone()).collect::<Vec<_>>();
 
-
         if worker_ids.contains(&worker_details.worker_id) {
             worker_details.worker_id = format!("{}-{}", worker_details.worker_id, Uuid::new_v4());
-
         }
 
         println!("{:#?}", worker_ids);
@@ -811,6 +816,27 @@ impl Immortal for ImmortalService {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
+    async fn execute_workflow(
+        &self,
+        request: Request<ClientStartWorkflowOptionsVersion>,
+    ) -> Result<Response<WorkflowResultVersion>, Status> {
+        let workflow_options = request.into_inner();
+        let mut rx = self.notification_rx.resubscribe();
+        let workflow_id = Uuid::parse_str(&self.start_workflow_internal(workflow_options).await?).unwrap();
+        loop {
+            match &rx.recv().await {
+                Ok(x) => match x {
+                    Notification::WorkflowResult(id, result) => {
+                        if *id == workflow_id {
+                            return Ok(Response::new(result.clone()));
+                        }
+                    }
+                    _ => {}
+                },
+                Err(_) => {}
+            }
+        }
+    }
     async fn start_workflow(
         &self,
         request: Request<ClientStartWorkflowOptionsVersion>,
@@ -928,7 +954,7 @@ impl Immortal for ImmortalService {
         request: Request<WorkflowResultVersion>,
     ) -> Result<Response<()>, Status> {
         let workflow_version = request.into_inner();
-        match workflow_version.version {
+        match &workflow_version.version {
             Some(workflow_result_version::Version::V1(workflow_result)) => {
                 let mut workflow = self
                     .history
@@ -941,8 +967,13 @@ impl Immortal for ImmortalService {
                     chrono::Utc::now().timestamp(),
                     0,
                 ));
-
-                match workflow_result.status.unwrap() {
+                self.notification_tx
+                    .send(Notification::WorkflowResult(
+                        Uuid::parse_str(&workflow_result.workflow_id).unwrap(),
+                        workflow_version.clone(),
+                    ))
+                    .unwrap();
+                match workflow_result.status.clone().unwrap() {
                     workflow_result_v1::Status::Completed(x) => {
                         workflow.status = HistoryStatus::Completed(
                             serde_json::from_slice(&x.result.unwrap().data).unwrap(),
@@ -1188,9 +1219,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manager = RedisConnectionManager::new(redis_url).unwrap();
     let pool = bb8::Pool::builder().build(manager).await.unwrap();
 
-    let (notification_tx, _notification_rx) = broadcast::channel(100);
+    let (notification_tx, notification_rx) = broadcast::channel(100);
     let immortal_service = ImmortalService {
         notification_tx: Arc::new(notification_tx.clone()),
+        notification_rx: Arc::new(notification_rx),
         workflow_queue: Arc::new(Mutex::new(HashMap::new())),
         activity_queue: Arc::new(Mutex::new(HashMap::new())),
         call_queue: Arc::new(Mutex::new(HashMap::new())),

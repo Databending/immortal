@@ -23,7 +23,6 @@ use uuid::Uuid;
 use crate::common::{Payload, Payloads};
 use crate::failure::failure::FailureInfo;
 use crate::failure::Failure;
-use crate::immortal::immortal_serverless_server::{ImmortalServerless, ImmortalServerlessServer};
 use crate::immortal::{
     self, call_result_version, workflow_result_v1, workflow_result_version, CallResultV1,
     CallResultVersion, Failure as ImmortalFailure, RegisteredActivity, RegisteredCall,
@@ -477,7 +476,9 @@ impl Worker {
                         self.start_notification(
                             &notification.notification_id,
                             &notification.notification_type,
-                            notification.notification_input.unwrap_or(Payload::new(&None::<String>)),
+                            notification
+                                .notification_input
+                                .unwrap_or(Payload::new(&None::<String>)),
                             safe_app_data,
                         )
                         .await;
@@ -917,7 +918,7 @@ impl Worker {
         activity_run_id: &str,
         payload: Payload,
         safe_app_data: &Arc<AppData>,
-    ) -> anyhow::Result<ActivityResultV1>{
+    ) -> anyhow::Result<ActivityResultV1> {
         let registered_activities = Arc::clone(&self.registered_activities);
         let running_activities_arc = Arc::clone(&self.running_activities);
         let activity_type = activity_type.to_string();
@@ -1002,7 +1003,6 @@ impl Worker {
                 ),
             },
         };
-
 
         let mut running_activities = running_activities_arc.lock().await;
         // let running_activity = running_activities.get("test").unwrap();

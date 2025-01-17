@@ -6,8 +6,6 @@ use immortal::{
 };
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::json;
-
 use immortal::immortal_client::ImmortalClient;
 
 pub mod immortal {

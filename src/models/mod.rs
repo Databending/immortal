@@ -3,6 +3,7 @@ use serde::Serialize;
 
 pub mod activity;
 pub mod call;
+pub mod client;
 pub mod history;
 pub mod worker;
 

@@ -196,6 +196,9 @@ message StartWorkflowOptionsVersion {
   oneof version { StartWorkflowOptionsV1 v1 = 1; }
 }
 
+// execute workflow (synchronous)
+
+
 message RequestStartActivityOptionsV1 {
   string activity_id = 1;
   string activity_type = 2;
@@ -379,6 +382,8 @@ service Immortal {
       returns (stream ImmortalWorkerActionVersion) {}
   rpc StartWorkflow(ClientStartWorkflowOptionsVersion)
       returns (ClientStartWorkflowResponse) {}
+  rpc ExecuteWorkflow(ClientStartWorkflowOptionsVersion)
+      returns (WorkflowResultVersion) {}
   rpc StartActivity(RequestStartActivityOptionsVersion)
       returns (ActivityResultVersion) {}
   rpc CompletedActivity(ActivityResultVersion) returns (google.protobuf.Empty) {
