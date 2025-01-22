@@ -221,7 +221,7 @@ where
 }
 
 #[derive(Default)]
-pub(crate) struct AppData {
+pub struct AppData {
     map: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
 }
 
@@ -261,10 +261,10 @@ pub struct ActContext {
     info: ActivityInfo,
 }
 
-struct ActivityHeartbeat {
-    pub task_token: Vec<u8>,
-    pub details: Vec<Value>,
-}
+//struct ActivityHeartbeat {
+//    pub task_token: Vec<u8>,
+//    pub details: Vec<Value>,
+//}
 
 #[derive(Clone, Default)]
 pub struct ActivityInfo {
@@ -297,7 +297,7 @@ pub struct WorkflowExecution {
 }
 
 #[derive(Clone)]
-struct Start {
+pub struct Start {
     // The namespace the workflow lives in
     pub workflow_namespace: String,
     // The workflow's type name or function identifier

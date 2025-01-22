@@ -1,3 +1,4 @@
+use chrono::DateTime;
 // pub mod immortal {
 //     tonic::include_proto!("immortal");
 // }
@@ -10,7 +11,6 @@ use ::immortal::immortal::call_version;
 use ::immortal::immortal::notify_version;
 use ::immortal::immortal::CallResultV1;
 use ::immortal::immortal::CallResultVersion;
-use ::immortal::immortal::CallV1;
 use ::immortal::immortal::CallVersion;
 use ::immortal::immortal::ClientStartWorkflowOptionsV1;
 use ::immortal::immortal::NotifyVersion;
@@ -23,11 +23,7 @@ use ::immortal::models::CallSchema;
 use ::immortal::models::WfSchema;
 use axum;
 use bb8_redis::bb8::Pool;
-use chrono::NaiveDateTime;
 use dotenvy::dotenv;
-
-use models::notification;
-use models::workflow::WorkflowResult;
 use rand::Rng;
 use redis::streams::{StreamId, StreamKey, StreamMaxlen, StreamReadOptions, StreamReadReply};
 use redis::AsyncCommands;
@@ -46,8 +42,6 @@ use immortal::{
     WorkflowResultVersion,
 };
 use regex::Regex;
-use serde::de::DeserializeOwned;
-use serde::Deserialize;
 use serde_json::Value;
 use socketioxide::extract::{AckSender, Bin, State};
 use socketioxide::socket::DisconnectReason;
@@ -57,7 +51,6 @@ use socketioxide::{
 };
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::ops::Deref;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::Sender;
@@ -66,7 +59,7 @@ use tokio_stream::StreamExt;
 use tonic::transport::Server;
 use tonic_health::server::HealthReporter;
 use tower::ServiceBuilder;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 use tracing_subscriber::FmtSubscriber;
 use uuid::Uuid;
@@ -659,7 +652,7 @@ impl Immortal for ImmortalService {
                 match action.version {
                     Some(immortal_server_action_version::Version::V1(x)) => match x.action {
                         Some(immortal_server_action_v1::Action::LogEvent(log)) => {
-                            let when = NaiveDateTime::from_timestamp(log.when, 0).to_string();
+                            let when = DateTime::from_timestamp(log.when, 0).unwrap().to_string();
                             let level = match log.level() {
                                 immortal::Level::Info => "info",
                                 immortal::Level::Warn => "warn",
@@ -822,7 +815,8 @@ impl Immortal for ImmortalService {
     ) -> Result<Response<WorkflowResultVersion>, Status> {
         let workflow_options = request.into_inner();
         let mut rx = self.notification_rx.resubscribe();
-        let workflow_id = Uuid::parse_str(&self.start_workflow_internal(workflow_options).await?).unwrap();
+        let workflow_id =
+            Uuid::parse_str(&self.start_workflow_internal(workflow_options).await?).unwrap();
         loop {
             match &rx.recv().await {
                 Ok(x) => match x {
@@ -880,10 +874,10 @@ impl Immortal for ImmortalService {
                     .iter_mut()
                     .find(|f| f.run_id == activity_result.activity_run_id)
                     .unwrap();
-                run.end_time = Some(NaiveDateTime::from_timestamp(
+                run.end_time = Some(DateTime::from_timestamp(
                     chrono::Utc::now().timestamp(),
                     0,
-                ));
+                ).unwrap().naive_utc());
                 match activity_result.status.unwrap() {
                     immortal::activity_result_v1::Status::Completed(x) => {
                         run.status = HistoryStatus::Completed(
@@ -937,7 +931,10 @@ impl Immortal for ImmortalService {
                     Some(tx) => {
                         // need to watch out for this as it can increase past max
 
-                        tx.send(call_result.clone()).unwrap();
+                        match tx.send(call_result.clone()) {
+                            Ok(_) => {}
+                            Err(e) => println!("{:#?}", e),
+                        }
                     }
                     None => {
                         return Err(Status::not_found("Activity not found"));
@@ -963,10 +960,10 @@ impl Immortal for ImmortalService {
                     .unwrap()
                     .unwrap();
 
-                workflow.end_time = Some(NaiveDateTime::from_timestamp(
+                workflow.end_time = Some(DateTime::from_timestamp(
                     chrono::Utc::now().timestamp(),
                     0,
-                ));
+                ).unwrap().naive_utc());
                 self.notification_tx
                     .send(Notification::WorkflowResult(
                         Uuid::parse_str(&workflow_result.workflow_id).unwrap(),
@@ -1065,7 +1062,7 @@ async fn service_status(mut reporter: HealthReporter) {
 
 async fn on_connect(
     socket: SocketRef,
-    Data(data): Data<Value>,
+    Data(_data): Data<Value>,
     pool: State<Pool<RedisConnectionManager>>,
     notification_tx: State<broadcast::Sender<Notification>>,
 ) {
@@ -1148,7 +1145,7 @@ async fn on_connect(
                         )
                         .await
                         .expect("read");
-                    for StreamKey { key, ids } in srr.keys {
+                    for StreamKey { key: _, ids } in srr.keys {
                         for StreamId { id, map } in ids {
                             last_id = id.clone();
                             let mut parsed_map = serde_json::json!({

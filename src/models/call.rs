@@ -5,7 +5,6 @@ use futures::future::FutureExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::any::Any;
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::time::SystemTime;
@@ -217,9 +216,9 @@ where
     }
 }
 
-fn downcast_owned<T: Send + Sync + 'static>(boxed: Box<dyn Any + Send + Sync>) -> Option<T> {
-    boxed.downcast().ok().map(|boxed| *boxed)
-}
+//fn downcast_owned<T: Send + Sync + 'static>(boxed: Box<dyn Any + Send + Sync>) -> Option<T> {
+//    boxed.downcast().ok().map(|boxed| *boxed)
+//}
 
 #[derive(Clone)]
 pub struct CallContext {
@@ -261,7 +260,7 @@ pub struct CallInfo {
 
 
 #[derive(Clone)]
-struct Start {
+pub(crate) struct Start {
     // The namespace the workflow lives in
     pub namespace: String,
     // The activity's ID
@@ -385,7 +384,7 @@ impl CallContext {
     }
 
     /// RecordHeartbeat sends heartbeat for the currently executing activity
-    pub fn record_heartbeat(&self, details: Vec<Value>) {
+    pub fn record_heartbeat(&self, _details: Vec<Value>) {
         // self.worker.record_activity_heartbeat(ActivityHeartbeat {
         //     task_token: self.info.task_token.clone(),
         //     details,

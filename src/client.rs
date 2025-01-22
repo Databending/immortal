@@ -1,12 +1,14 @@
 use ::immortal::common::Payloads;
-use std::str::FromStr;
+use ::immortal::models::workflow::WfExitValue;
+use immortal::immortal_client::ImmortalClient;
+use immortal::workflow_result_version;
 use immortal::{
     client_start_workflow_options_version, ClientStartWorkflowOptionsV1,
     ClientStartWorkflowOptionsVersion,
 };
 use serde::Deserialize;
 use serde::Serialize;
-use immortal::immortal_client::ImmortalClient;
+use std::str::FromStr;
 
 pub mod immortal {
     tonic::include_proto!("immortal");
@@ -39,6 +41,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await
         .unwrap();
+
+    let result = client
+        .execute_workflow(ClientStartWorkflowOptionsVersion {
+            version: Some(client_start_workflow_options_version::Version::V1(
+                ClientStartWorkflowOptionsV1 {
+                    workflow_type: "update_schema".to_string(),
+                    input: Some(Payloads::new(vec![&"".to_string()])),
+                    task_queue: "builder.postgres".to_string(),
+                    ..Default::default()
+                },
+            )),
+        })
+        .await
+        .unwrap();
+    if let Some(version) = &result.get_ref().version {
+        match version {
+            workflow_result_version::Version::V1(v1) => {
+                if let Some(status) = &v1.status {
+                    match status {
+                        immortal::workflow_result_v1::Status::Completed(x) => {
+                            if let Some(result) = &x.result {
+                                let x = result.to::<WfExitValue<GeneratePreview>>()?;
+                                match x {
+                                    WfExitValue::Normal(value) => if value.file_mimetype.len() == 0 {},
+                                    _ => {}
+                                }
+                            }
+                        }
+                        immortal::workflow_result_v1::Status::Failed(_failure) => {
+                            //return Err(anyhow::anyhow!("Failed to update schema: {:?}", failure))
+                        }
+                        immortal::workflow_result_v1::Status::Cancelled(_cancelled) => {}
+                    }
+                }
+            }
+        }
+    }
     // client
     //     .start_workflow(ClientStartWorkflowOptionsVersion {
     //         version: Some(client_start_workflow_options_version::Version::V1(

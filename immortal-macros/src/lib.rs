@@ -1,7 +1,7 @@
 extern crate proc_macro;
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, FnArg, Ident, ItemFn, PatType, PathArguments, ReturnType, Type};
+use syn::{parse_macro_input, FnArg, ItemFn, PatType, PathArguments, ReturnType, Type};
 
 
 
@@ -45,10 +45,10 @@ pub fn function_schema_derive(input: TokenStream) -> TokenStream {
 
     TokenStream::from(expanded)
 }
-
-fn get_add_operation_fn_name(route_fn_name: &Ident, suffix: &str) -> Ident {
-    Ident::new(&format!("{}_{suffix}", route_fn_name), route_fn_name.span())
-}
+//
+//fn get_add_operation_fn_name(route_fn_name: &Ident, suffix: &str) -> Ident {
+//    Ident::new(&format!("{}_{suffix}", route_fn_name), route_fn_name.span())
+//}
 
 fn extract_generic_from_return_type(return_type: &ReturnType) -> Option<&Type> {
     // Check if the return type is of the form `-> Type`
@@ -72,7 +72,7 @@ fn extract_generic_from_return_type(return_type: &ReturnType) -> Option<&Type> {
 
 #[proc_macro_attribute]
 pub fn wf(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let mut input = parse_macro_input!(item as ItemFn);
+    let input = parse_macro_input!(item as ItemFn);
 
 
     // Extract the function signature and argument names
@@ -111,7 +111,7 @@ pub fn wf(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     Some((
                         quote! {
-                            let #pat = ctx.args.payloads.get(#index - 1).unwrap().clone().to::<#ty>();
+                            let #pat = ctx.args.payloads.get(#index - 1).unwrap().clone().to::<#ty>()?;
                         },
                         quote! {#pat},
                         quote! { schema_for!(#ty) },

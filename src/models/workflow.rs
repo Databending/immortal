@@ -2,17 +2,17 @@
 //     tonic::include_proto!("immortal");
 // }
 
-use crate::common::{Payload, Payloads};
+use crate::common::Payloads;
 use crate::immortal::{
-    activity_result_v1::Status,
-    activity_result_version, immortal_client::ImmortalClient,
-    request_start_activity_options_version
+    activity_result_v1::Status, activity_result_version, immortal_client::ImmortalClient,
+    request_start_activity_options_version,
 };
 use crate::immortal::{
     RequestStartActivityOptionsV1, RequestStartActivityOptionsVersion, RetryPolicy,
 };
 use anyhow::{anyhow, Error};
 use futures::future::{BoxFuture, FutureExt};
+use serde::Deserialize;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
@@ -22,7 +22,6 @@ use tracing::instrument::Instrumented;
 use tracing::Instrument;
 use uuid::Uuid;
 
-use super::activity::ActExitValue;
 use super::activity::ActivityOptions;
 
 pub struct Workflow {
@@ -48,7 +47,7 @@ pub struct WfContext {
 }
 
 impl WfContext {
-    pub async fn activity<T: DeserializeOwned>(
+    pub async fn activity<T: DeserializeOwned >(
         &mut self,
         options: ActivityOptions,
     ) -> anyhow::Result<T> {
@@ -57,9 +56,15 @@ impl WfContext {
             activity_type: options.activity_type.to_string(),
             activity_input: Some(options.input),
             workflow_id: self.id.clone(),
-            schedule_to_close_timeout: options.schedule_to_close_timeout.map(|x| x.try_into().unwrap()),
-            schedule_to_start_timeout: options.schedule_to_start_timeout.map(|x| x.try_into().unwrap()),
-            start_to_close_timeout: options.start_to_close_timeout.map(|x| x.try_into().unwrap()),
+            schedule_to_close_timeout: options
+                .schedule_to_close_timeout
+                .map(|x| x.try_into().unwrap()),
+            schedule_to_start_timeout: options
+                .schedule_to_start_timeout
+                .map(|x| x.try_into().unwrap()),
+            start_to_close_timeout: options
+                .start_to_close_timeout
+                .map(|x| x.try_into().unwrap()),
             heartbeat_timeout: options.heartbeat_timeout.map(|x| x.try_into().unwrap()),
             retry_policy: options.retry_policy.map(|x| x.try_into().unwrap()),
             task_queue: options.task_queue.unwrap_or(self.task_queue.clone()),
@@ -78,13 +83,13 @@ impl WfContext {
                     Some(Status::Failed(x)) => Err(anyhow!("{:#?}", x)),
                     Some(Status::Cancelled(x)) => Err(anyhow!("{:#?}", x)),
                     Some(Status::Completed(y)) => {
-                        Ok(y.result.unwrap().to())
+                        Ok(y.result.unwrap().to()?)
                         // let result: ActExitValue<T> = serde_json::from_slice(&y.result.unwrap().data)?;
                         // match result {
-                            // ActExitValue::Normal(x) => Ok(x),
-                            // ActExitValue::WillCompleteAsync => {
-                            //     Err(anyhow!("Activity was cancelled"))
-                            // }
+                        // ActExitValue::Normal(x) => Ok(x),
+                        // ActExitValue::WillCompleteAsync => {
+                        //     Err(anyhow!("Activity was cancelled"))
+                        // }
                         // }
                     }
                     None => Err(anyhow!("Activity failed")),
@@ -165,8 +170,8 @@ where
 }
 
 /// Workflow functions may return these values when exiting
-#[derive(Debug, Clone, Serialize)]
-pub enum WfExitValue<T: Serialize + DeserializeOwned> {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WfExitValue<T: Serialize> {
     /// Continue the workflow as a new execution
     // #[from(ignore)]
     // ContinueAsNew(Box<ContinueAsNewWorkflowExecution>),
@@ -187,7 +192,7 @@ impl WorkflowFunction {
         F: Fn(WfContext) -> Fut + Send + Sync + 'static,
 
         Fut: Future<Output = Result<WfExitValue<O>, anyhow::Error>> + Send + 'static,
-        O: Serialize +  DeserializeOwned,
+        O: Serialize,
     {
         Self {
             wf_func: Box::new(move |ctx: WfContext| {

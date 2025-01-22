@@ -56,14 +56,10 @@ impl History {
         let limit = limit.unwrap_or(10) as isize;
         let offset = offset.unwrap_or(0) as isize;
         let mut con = self.get_con().await?;
-        let keys: Vec<String> = con
+        let _keys: Vec<String> = con
             .keys(format!("{WORKFLOW_BASE_REDIS_KEY}::*").as_str())
             .await?;
-        println!("{}", -1 - (offset + limit));
-        println!("{}", -1 - offset);
         let keys2: Vec<String> = con.lrange(format!("{WORKFLOW_BASE_REDIS_KEY}::workflow_index"), (-1 - (offset + limit)).try_into().unwrap(), (-1 - offset).try_into().unwrap()).await?;
-        println!("{:?}", keys2);
-
         let workflows: Vec<WorkflowHistoryVersion> = con.mget(keys2.iter().map(|f| format!("{WORKFLOW_BASE_REDIS_KEY}::{f}")).collect_vec()).await?;
         Ok(workflows)
     }

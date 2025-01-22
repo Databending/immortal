@@ -35,11 +35,16 @@ pub mod immortal {
                 payloads: data.iter().map(|d| Payload::new(d)).collect(),
             }
         }
-        pub fn to<O>(&self) -> Vec<O>
+        pub fn to<O>(&self) -> anyhow::Result<Vec<O>>
         where
-            O: DeserializeOwned,
+            O: DeserializeOwned + Clone + Serialize,
         {
-            self.payloads.iter().map(|p| p.to()).collect()
+            let mut data = vec![];
+            for payload in &self.payloads {
+                let serialized: O = payload.to()?;
+                data.push(serialized);
+            }
+            Ok(data)
         }
     }
 
@@ -53,20 +58,16 @@ pub mod immortal {
                 metadata: Default::default(),
             }
         }
-        pub fn to<O>(&self) -> O
+        pub fn to<O>(&self) -> anyhow::Result<O>
         where
             O: DeserializeOwned,
         {
-            serde_json::from_slice(&self.data).unwrap()
+            Ok(serde_json::from_slice(&self.data)?)
         }
     }
 
     impl CallResultV1 {
-        pub const fn ok(
-            call_id: String,
-            call_run_id: String,
-            result: Option<Payload>,
-        ) -> Self {
+        pub const fn ok(call_id: String, call_run_id: String, result: Option<Payload>) -> Self {
             Self {
                 call_id,
                 call_run_id,
@@ -74,11 +75,7 @@ pub mod immortal {
             }
         }
 
-        pub fn fail(
-            call_id: String,
-            call_run_id: String,
-            fail: super::failure::Failure,
-        ) -> Self {
+        pub fn fail(call_id: String, call_run_id: String, fail: super::failure::Failure) -> Self {
             Self {
                 call_id,
                 call_run_id,
@@ -98,7 +95,9 @@ pub mod immortal {
                 call_id,
                 call_run_id,
 
-                status: Some(call_result_v1::Status::Cancelled(Cancellation::from_details(payload))),
+                status: Some(call_result_v1::Status::Cancelled(
+                    Cancellation::from_details(payload),
+                )),
             }
         }
 
@@ -114,7 +113,6 @@ pub mod immortal {
             matches!(self.status, Some(call_result_v1::Status::Cancelled(_)))
         }
     }
-
 
     impl ActivityResultV1 {
         pub const fn ok(

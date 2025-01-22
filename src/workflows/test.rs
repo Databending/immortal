@@ -11,12 +11,12 @@ use crate::models::{
     workflow::{WfContext, WfExitValue, WorkflowResult},
 };
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ActivityOutput {
     pub data: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
 pub struct WfResult {
     result: u64,
 }

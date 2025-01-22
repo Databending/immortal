@@ -1,5 +1,4 @@
 use crate::common::Payload;
-use crate::immortal;
 use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use serde::de::DeserializeOwned;
@@ -8,8 +7,7 @@ use serde_json::Value;
 use std::any::Any;
 use std::fmt::Debug;
 use std::pin::Pin;
-use std::time::SystemTime;
-use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, sync::Arc};
 use tokio_util::sync::CancellationToken;
 use tracing::info_span;
 use tracing::Instrument;
@@ -47,8 +45,6 @@ pub struct NotificationOptions {
 //     // workflow
 //     Abandon,
 // }
-
-
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 /// Activity functions may return these values when exiting
@@ -109,7 +105,6 @@ impl NotificationFunction {
     }
 }
 
-
 /// Closures / functions which can be turned into activity functions implement this trait
 pub trait IntoNotificationFunc<Args, Res> {
     /// Consume the closure or fn pointer and turned it into a boxed activity function
@@ -121,14 +116,13 @@ where
     F: (Fn(NotificationContext, A) -> Rf) + Sync + Send + 'static,
     A: Serialize + DeserializeOwned,
     Rf: Future<Output = Result<(), anyhow::Error>> + Send + 'static,
-
 {
     fn into_notification_fn(self) -> BoxNotificationFn {
         let wrapper = move |ctx: NotificationContext, input: Payload| {
             self(ctx, serde_json::from_slice(&input.data).unwrap())
                 .map(|r| {
                     r.and_then(|r| {
-                        Ok(r) 
+                        Ok(r)
                         // let exit_val: CallExitValue<O> = r.into();
                         // match exit_val {
                         //     // ActExitValue::WillCompleteAsync => Ok(ActExitValue::WillCompleteAsync),
@@ -237,13 +231,11 @@ impl NotificationContext {
         task: Start,
     ) -> (Self, Value) {
         let Start {
-
             header_fields,
             mut input,
             namespace,
             notification_type,
             notification_id,
-
         } = task;
 
         let first_arg = input.pop().unwrap_or_default();
@@ -292,10 +284,10 @@ impl NotificationContext {
 
     /// RecordHeartbeat sends heartbeat for the currently executing activity
     // pub fn record_heartbeat(&self, details: Vec<Value>) {
-        // self.worker.record_activity_heartbeat(ActivityHeartbeat {
-        //     task_token: self.info.task_token.clone(),
-        //     details,
-        // })
+    // self.worker.record_activity_heartbeat(ActivityHeartbeat {
+    //     task_token: self.info.task_token.clone(),
+    //     details,
+    // })
     // }
 
     /// Get activity info of the executing activity

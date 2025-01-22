@@ -11,7 +11,7 @@ use tokio::sync::{
     mpsc::{self, UnboundedReceiver, UnboundedSender},
     Mutex,
 };
-use tonic::transport::{Channel, Server};
+use tonic::transport::Channel;
 use tracing::field::{Field, Visit};
 use tracing::level_filters::LevelFilter;
 use tracing::span::{Attributes, Id};
@@ -41,7 +41,7 @@ use tokio::task::JoinHandle;
 
 use super::call::{CallError, CallExitValue, CallFunction, IntoCallFunc};
 use super::notification::{IntoNotificationFunc, NotificationFunction};
-use super::serverless::{self, ImmortalServerlessService};
+use super::serverless;
 use super::{
     activity::{
         ActExitValue, ActivityError, ActivityFunction, ActivityOptions, AppData, IntoActivityFunc,
@@ -157,7 +157,7 @@ struct EventVisitor {
     message: Option<String>,
 }
 
-struct MessageLog {}
+//struct MessageLog {}
 
 impl Visit for StrVisitor {
     fn record_debug(&mut self, _field: &Field, _value: &dyn Debug) {}
