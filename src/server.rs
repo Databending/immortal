@@ -196,7 +196,6 @@ impl ImmortalService {
                 // }
 
                 for (queue_name, queue) in queues {
-                    println!("queue = {:?} {:#?}", queue, queue_name);
                     let mut workers = workers.lock().await;
                     for (i, x) in queue.iter().enumerate() {
                         let mut workers_filtered = workers
@@ -434,6 +433,22 @@ impl ImmortalService {
                                 // let workers = self.workers.lock().await;
                                 // let worker = workers.get(worker_id).unwrap().clone();
 
+                                let workflow_history = WorkflowHistory::new(
+                                    workflow_options.workflow_type.clone(),
+                                    workflow_id.clone(),
+                                    workflow_options
+                                        .input
+                                        .as_ref()
+                                        .unwrap()
+                                        .payloads
+                                        .iter()
+                                        .map(|f| serde_json::from_slice(&f.data).unwrap())
+                                        .collect::<Vec<_>>(),
+                                );
+                                history
+                                    .add_workflow(workflow_history.clone())
+                                    .await
+                                    .unwrap();
                                 worker
                                     .tx
                                     .send(Ok(ImmortalWorkerActionVersion {
@@ -462,23 +477,6 @@ impl ImmortalService {
                                     .unwrap();
                                 worker.workflow_capacity -= 1;
 
-                                let workflow_history = WorkflowHistory::new(
-                                    workflow_options.workflow_type.clone(),
-                                    workflow_id.clone(),
-                                    workflow_options
-                                        .input
-                                        .as_ref()
-                                        .unwrap()
-                                        .payloads
-                                        .iter()
-                                        .map(|f| serde_json::from_slice(&f.data).unwrap())
-                                        .collect::<Vec<_>>(),
-                                );
-                                history
-                                    .add_workflow(workflow_history.clone())
-                                    .await
-                                    .unwrap();
-
                                 notification_tx
                                     .send(Notification::WorkflowStarted(
                                         Uuid::parse_str(&workflow_history.workflow_id).unwrap(),
@@ -500,13 +498,17 @@ impl ImmortalService {
         &self,
         workflow_options: ClientStartWorkflowOptionsVersion,
     ) -> Result<String, Status> {
+        println!("starting workflow");
         Ok(match workflow_options.version {
             Some(client_start_workflow_options_version::Version::V1(workflow_options)) => {
                 let workflow_id = workflow_options
                     .workflow_id
                     .clone()
                     .unwrap_or(Uuid::new_v4().to_string());
+                println!("waiting for queue lock");
                 let mut wq = self.workflow_queue.lock().await;
+
+                println!("obtained queue lock");
                 match wq.get_mut(&workflow_options.task_queue) {
                     Some(queue) => {
                         queue.push_back((workflow_id.clone(), workflow_options.clone()));
@@ -817,16 +819,20 @@ impl Immortal for ImmortalService {
         let mut rx = self.notification_rx.resubscribe();
         let workflow_id =
             Uuid::parse_str(&self.start_workflow_internal(workflow_options).await?).unwrap();
+        println!("started workflow {workflow_id}");
         loop {
             match &rx.recv().await {
-                Ok(x) => match x {
-                    Notification::WorkflowResult(id, result) => {
-                        if *id == workflow_id {
-                            return Ok(Response::new(result.clone()));
+                Ok(x) => {
+                    println!("workflow completed");
+                    match x {
+                        Notification::WorkflowResult(id, result) => {
+                            if *id == workflow_id {
+                                return Ok(Response::new(result.clone()));
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
-                },
+                }
                 Err(_) => {}
             }
         }
@@ -838,6 +844,7 @@ impl Immortal for ImmortalService {
         let workflow_options = request.into_inner();
         let workflow_id = self.start_workflow_internal(workflow_options).await?;
 
+        println!("started workflow: {workflow_id}");
         Ok(Response::new(ClientStartWorkflowResponse { workflow_id }))
     }
     async fn completed_activity(
@@ -874,10 +881,11 @@ impl Immortal for ImmortalService {
                     .iter_mut()
                     .find(|f| f.run_id == activity_result.activity_run_id)
                     .unwrap();
-                run.end_time = Some(DateTime::from_timestamp(
-                    chrono::Utc::now().timestamp(),
-                    0,
-                ).unwrap().naive_utc());
+                run.end_time = Some(
+                    DateTime::from_timestamp(chrono::Utc::now().timestamp(), 0)
+                        .unwrap()
+                        .naive_utc(),
+                );
                 match activity_result.status.unwrap() {
                     immortal::activity_result_v1::Status::Completed(x) => {
                         run.status = HistoryStatus::Completed(
@@ -960,10 +968,11 @@ impl Immortal for ImmortalService {
                     .unwrap()
                     .unwrap();
 
-                workflow.end_time = Some(DateTime::from_timestamp(
-                    chrono::Utc::now().timestamp(),
-                    0,
-                ).unwrap().naive_utc());
+                workflow.end_time = Some(
+                    DateTime::from_timestamp(chrono::Utc::now().timestamp(), 0)
+                        .unwrap()
+                        .naive_utc(),
+                );
                 self.notification_tx
                     .send(Notification::WorkflowResult(
                         Uuid::parse_str(&workflow_result.workflow_id).unwrap(),

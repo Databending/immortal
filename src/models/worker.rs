@@ -630,7 +630,10 @@ impl Worker {
             let workflow_id = workflow_id.clone();
             handle = tokio::spawn(async move {
                 let res = wf_handle.await;
-                sender.send((workflow_id.clone(), res)).unwrap();
+                match sender.send((workflow_id.clone(), res)) {
+                    Ok(_) => {},
+                    Err(e) => println!("ERROR: {:?}", e)
+                }
             });
         }
 
