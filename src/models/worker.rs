@@ -629,12 +629,28 @@ impl Worker {
         {
             let workflow_id = workflow_id.clone();
             handle = tokio::spawn(async move {
-                let res = wf_handle.await;
-                match sender.send((workflow_id.clone(), res)) {
-                    Ok(_) => {},
-                    Err(e) => println!("ERROR: {:?}", e)
+                let res = tokio::spawn(wf_handle);
+                match res.await {
+                    Ok(res) => {
+                        sender.send((workflow_id.to_string(),  res)).unwrap();
+                    }
+                    Err(e) => {
+                        sender
+                            .send((
+                                workflow_id.to_string(),
+                                Err(e.into()),
+                            ))
+                            .unwrap();
+                    }
                 }
             });
+            //handle = tokio::spawn(async move {
+            //    let res = wf_handle.await;
+            //    match sender.send((workflow_id.clone(), res)) {
+            //        Ok(_) => {}
+            //        Err(e) => println!("ERROR: {:?}", e),
+            //    }
+            //});
         }
 
         let running_workflow = RunningWorkflow {
@@ -1048,10 +1064,22 @@ impl Worker {
             activity_run_id.to_string(),
         );
         let handle = tokio::spawn(async move {
-            let res = act_handle.await;
-
-            sender.send((wid.to_string(), aid, aid_run, res)).unwrap();
-            // res
+            let res = tokio::spawn(act_handle);
+            match res.await {
+                Ok(res) => {
+                    sender.send((wid.to_string(), aid, aid_run, res)).unwrap();
+                }
+                Err(e) => {
+                    sender
+                        .send((
+                            wid.to_string(),
+                            aid,
+                            aid_run,
+                            Err(ActivityError::NonRetryable(e.into())),
+                        ))
+                        .unwrap();
+                }
+            }
         });
         let running_workflow = RunningActivity {
             activity_id: activity_id.to_string(),
@@ -1093,12 +1121,21 @@ impl Worker {
             call_type.to_string(),
             call_id.to_string(),
         );
-        let handle = tokio::spawn(async move {
-            let res = act_handle.await;
 
-            sender
-                .send((cid.to_string(), crid.to_string(), res))
-                .unwrap();
+        let handle = tokio::spawn(async move {
+            let res = tokio::spawn(act_handle);
+            match res.await {
+                Ok(res) => {
+                    sender
+                        .send((cid.to_string(), crid.to_string(), res))
+                        .unwrap();
+                }
+                Err(e) => {
+                    sender
+                        .send((cid, crid, Err(CallError::NonRetryable(e.into()))))
+                        .unwrap();
+                }
+            }
         });
         let running_workflow = RunningCall {
             call_id: call_id.to_string(),
@@ -1138,20 +1175,15 @@ impl Worker {
             notification_id.to_string(),
         );
         tokio::spawn(async move {
-            let res = act_handle.await;
-            match res {
+            let res = tokio::spawn(act_handle);
+            match res.await {
                 Err(e) => {
                     println!("ERROR IN NOTIFICATION: {}", e.to_string());
                 }
+
                 _ => {}
             }
         });
-
-        // self.app_data = Some(
-        //     Arc::try_unwrap(safe_app_data)
-        //         .map_err(|_| anyhow!("some references of AppData exist on worker shutdown"))
-        //         .unwrap(),
-        // );
     }
 }
 
