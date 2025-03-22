@@ -289,7 +289,7 @@ impl ImmortalService {
                         let mut workers_filtered = workers
                             .iter_mut()
                             .filter(|(_, worker)| worker.task_queue == *queue_name)
-                            .filter(|(_, worker)| worker.activity_capacity > 0)
+                            //.filter(|(_, worker)| worker.activity_capacity > 0)
                             .filter(|(_, worker)| {
                                 worker
                                     .registered_activities
@@ -409,13 +409,14 @@ impl ImmortalService {
                         let mut workers_filtered = workers
                             .iter_mut()
                             .filter(|(_, worker)| worker.task_queue == *queue_name)
-                            .filter(|(_, worker)| worker.workflow_capacity > 0)
+                            //.filter(|(_, worker)| worker.workflow_capacity > 0)
                             .filter(|(_, worker)| {
                                 worker.registered_workflows.contains_key(&x.1.workflow_type)
                             })
                             .map(|(_, worker)| worker)
                             .collect::<Vec<_>>();
                         if workers_filtered.len() == 0 {
+                            println!("no available workers");
                             continue;
                         }
                         let random = {
@@ -819,7 +820,7 @@ impl Immortal for ImmortalService {
         let mut rx = self.notification_rx.resubscribe();
         let workflow_id =
             Uuid::parse_str(&self.start_workflow_internal(workflow_options).await?).unwrap();
-        println!("started workflow {workflow_id}");
+        println!("executed workflow {workflow_id}");
         loop {
             match &rx.recv().await {
                 Ok(x) => {
