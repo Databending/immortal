@@ -290,6 +290,9 @@ message ImmortalWorkerActionV1 {
     int32 heartbeat = 3;
     StartCallOptionsV1 start_call = 4;
     StartNotificationOptionsV1 notify = 5;
+    string kill_workflow = 6;
+    string kill_activity = 7;
+    string kill_call = 8;
   }
 }
 enum Level {

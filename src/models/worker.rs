@@ -448,6 +448,15 @@ impl Worker {
             // println!("NOTE = {:?}", feature);
             match feature.version {
                 Some(immortal_worker_action_version::Version::V1(x)) => match x.action {
+                    Some(Action::KillWorkflow(workflow_id)) => {
+                        self.kill_workflow(&workflow_id).await;
+                    }
+                    Some(Action::KillActivity(activity_id)) => {
+                        self.kill_activity(&activity_id).await;
+                    }
+                    Some(Action::KillCall(call_id)) => {
+                        self.kill_call(&call_id).await;
+                    }
                     Some(Action::StartWorkflow(workflow)) => {
                         self.start_workflow_v1(&workflow).await;
                     }
@@ -632,14 +641,11 @@ impl Worker {
                 let res = tokio::spawn(wf_handle);
                 match res.await {
                     Ok(res) => {
-                        sender.send((workflow_id.to_string(),  res)).unwrap();
+                        sender.send((workflow_id.to_string(), res)).unwrap();
                     }
                     Err(e) => {
                         sender
-                            .send((
-                                workflow_id.to_string(),
-                                Err(e.into()),
-                            ))
+                            .send((workflow_id.to_string(), Err(e.into())))
                             .unwrap();
                     }
                 }
@@ -1067,7 +1073,9 @@ impl Worker {
             let res = tokio::spawn(act_handle);
             match res.await {
                 Ok(res) => {
-                    sender.send((wid.to_string(), aid, aid_run, res)).unwrap();
+                    if let Err(e) = sender.send((wid.to_string(), aid, aid_run, res)) {
+                        println!("{:#?}", e);
+                    }
                 }
                 Err(e) => {
                     sender
@@ -1095,6 +1103,30 @@ impl Worker {
         //         .map_err(|_| anyhow!("some references of AppData exist on worker shutdown"))
         //         .unwrap(),
         // );
+    }
+
+    pub async fn kill_workflow(&mut self, workflow_id: &str) {
+        let mut running_workflows = self.running_workflows.lock().await;
+        if let Some(running_workflow) = running_workflows.get(workflow_id) {
+            let _ = running_workflow.join_handle.abort();
+            running_workflows.remove(workflow_id);
+        }
+    }
+
+    pub async fn kill_activity(&mut self, activity_id: &str) {
+        let mut running_activities = self.running_activities.lock().await;
+        if let Some(running_activity) = running_activities.get(activity_id) {
+            let _ = running_activity.join_handle.abort();
+            running_activities.remove(activity_id);
+        }
+    }
+
+    pub async fn kill_call(&mut self, call_id: &str) {
+        let mut running_calls = self.running_calls.lock().await;
+        if let Some(running_call) = running_calls.get(call_id) {
+            let _ = running_call.join_handle.abort();
+            running_calls.remove(call_id);
+        }
     }
 
     pub async fn start_call(
