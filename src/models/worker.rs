@@ -466,7 +466,9 @@ impl Worker {
                             &activity.activity_type,
                             &activity.activity_id,
                             &activity.activity_run_id,
-                            activity.activity_input.unwrap(),
+                            activity
+                                .activity_input
+                                .unwrap_or(Payload::new(&None::<String>)),
                             safe_app_data,
                         )
                         .await;
@@ -476,7 +478,7 @@ impl Worker {
                             &call.call_type,
                             &call.call_id,
                             &call.call_run_id,
-                            call.call_input.unwrap(),
+                            call.call_input.unwrap_or(Payload::new(&None::<String>)),
                             safe_app_data,
                         )
                         .await;
@@ -620,19 +622,28 @@ impl Worker {
         let wf_handle;
         {
             let mut wf2 = registered_workflows.lock().await;
-            let wf = wf2.get_mut(&workflow_type).unwrap();
+            if let Some(wf) = wf2.get_mut(&workflow_type) {
+                wf_handle = wf.0.start_workflow(
+                    client,
+                    workflow_options
+                        .input
+                        .clone()
+                        .unwrap_or(Payloads::default()),
+                    workflow_type.clone(),
+                    workflow_id.clone(),
+                    self.config.namespace.clone(),
+                    self.config.task_queue.clone(),
+                );
+            } else {
+                if let Err(e) = sender.send((
+                    workflow_id.to_string(),
+                    Err(anyhow!("Workflow doesn't exist")),
+                )) {
+                    eprintln!("Error sending to sender: {}", e.to_string())
+                }
 
-            wf_handle = wf.0.start_workflow(
-                client,
-                workflow_options
-                    .input
-                    .clone()
-                    .unwrap_or(Payloads::default()),
-                workflow_type.clone(),
-                workflow_id.clone(),
-                self.config.namespace.clone(),
-                self.config.task_queue.clone(),
-            );
+                return;
+            }
         }
         let handle;
         {
@@ -641,12 +652,14 @@ impl Worker {
                 let res = tokio::spawn(wf_handle);
                 match res.await {
                     Ok(res) => {
-                        sender.send((workflow_id.to_string(), res)).unwrap();
+                        if let Err(e) = sender.send((workflow_id.to_string(), res)) {
+                            eprintln!("Error sending to sender: {}", e.to_string())
+                        }
                     }
                     Err(e) => {
-                        sender
-                            .send((workflow_id.to_string(), Err(e.into())))
-                            .unwrap();
+                        if let Err(e) = sender.send((workflow_id.to_string(), Err(e.into()))) {
+                            eprintln!("Error sending to sender: {}", e.to_string())
+                        }
                     }
                 }
             });
@@ -660,13 +673,13 @@ impl Worker {
         }
 
         let running_workflow = RunningWorkflow {
-            workflow_id,
+            workflow_id: workflow_id.clone(),
             join_handle: handle,
         };
         self.running_workflows
             .lock()
             .await
-            .insert("test".to_string(), running_workflow);
+            .insert(workflow_id.to_string(), running_workflow);
     }
 
     pub fn workflow_thread(
@@ -680,12 +693,12 @@ impl Worker {
             while let Some(result) = rx.recv().await {
                 match result.1 {
                     Ok(res) => {
-                        client
+                        if let Err(e) = client
                             .completed_workflow(WorkflowResultVersion {
                                 version: Some(workflow_result_version::Version::V1(
                                     WorkflowResultV1 {
                                         worker_id: worker_key.clone(),
-                                        workflow_id: result.0,
+                                        workflow_id: result.0.clone(),
                                         status: Some(workflow_result_v1::Status::Completed(
                                             ImmortalSuccess {
                                                 result: Some(Payload::new(&res)),
@@ -695,15 +708,17 @@ impl Worker {
                                 )),
                             })
                             .await
-                            .unwrap();
+                        {
+                            eprintln!("Error sending completed workflow: {}", e.to_string())
+                        }
                     }
                     Err(e) => {
-                        client
+                        if let Err(e) = client
                             .completed_workflow(WorkflowResultVersion {
                                 version: Some(workflow_result_version::Version::V1(
                                     WorkflowResultV1 {
                                         worker_id: worker_key.clone(),
-                                        workflow_id: result.0,
+                                        workflow_id: result.0.clone(),
                                         status: Some(workflow_result_v1::Status::Failed(
                                             ImmortalFailure {
                                                 failure: Some(Failure {
@@ -720,13 +735,15 @@ impl Worker {
                                 )),
                             })
                             .await
-                            .unwrap();
+                        {
+                            eprintln!("Error sending completed workflow: {}", e.to_string())
+                        }
                     }
                 }
                 let mut running_workflows = running_workflows_arc.lock().await;
                 // let running_workflow = running_workflows.get("test").unwrap();
                 // running_workflow.join_handle.abort();
-                running_workflows.remove("test");
+                running_workflows.remove(&result.0);
             }
         });
     }
@@ -784,7 +801,13 @@ impl Worker {
                                 result.1.clone(),
                                 result.2.clone(),
                                 match details {
-                                    Some(d) => Some(vec![serde_json::to_vec(&d).unwrap()]),
+                                    Some(d) => {
+                                        if let Ok(x) = serde_json::to_vec(&d) {
+                                            Some(vec![x])
+                                        } else {
+                                            None
+                                        }
+                                    }
                                     None => None,
                                 },
                             )
@@ -797,13 +820,14 @@ impl Worker {
                         ),
                     },
                 };
-                client
+                if let Err(e) = client
                     .completed_activity(ActivityResultVersion {
                         version: Some(activity_result_version::Version::V1(res)),
                     })
                     .await
-                    .unwrap();
-
+                {
+                    eprintln!("Error completing activity: {}", e);
+                }
                 let mut running_activities = running_activities_arc.lock().await;
                 // let running_activity = running_activities.get("test").unwrap();
                 // running_activity.join_handle.abort();
@@ -850,7 +874,13 @@ impl Worker {
                             result.0.clone(),
                             result.1.clone(),
                             match details {
-                                Some(d) => Some(vec![serde_json::to_vec(&d).unwrap()]),
+                                Some(d) => {
+                                    if let Ok(x) = serde_json::to_vec(&d) {
+                                        Some(vec![x])
+                                    } else {
+                                        None
+                                    }
+                                }
                                 None => None,
                             },
                         ),
@@ -861,12 +891,14 @@ impl Worker {
                         ),
                     },
                 };
-                client
+                if let Err(e) = client
                     .completed_call(CallResultVersion {
                         version: Some(call_result_version::Version::V1(res)),
                     })
                     .await
-                    .unwrap();
+                {
+                    eprintln!("error completing call: {}", e.to_string());
+                }
 
                 let mut running_activities = running_calls_arc.lock().await;
                 // let running_activity = running_activities.get("test").unwrap();
@@ -922,7 +954,9 @@ impl Worker {
                         Some(activity_result_v1::Status::Cancelled(x)) => Err(anyhow!("{:#?}", x)),
                         Some(activity_result_v1::Status::Completed(y)) => {
                             println!("Activity result: {:?}", y.result);
-                            Ok(serde_json::from_slice(&y.result.unwrap().data)?)
+                            Ok(serde_json::from_slice(
+                                &y.result.ok_or(anyhow!("No payload"))?.data,
+                            )?)
                         }
 
                         None => Err(anyhow!("Activity failed")),
@@ -969,7 +1003,9 @@ impl Worker {
         let handle = tokio::spawn(async move {
             let res = act_handle.await;
 
-            atx.send((wid.to_string(), aid, aid_run, res)).unwrap();
+            if let Err(e) = atx.send((wid.to_string(), aid, aid_run, res)) {
+                eprintln!("Error atx send: {}", e.to_string())
+            }
         });
         let running_workflow = RunningActivity {
             activity_id: activity_id.to_string(),
@@ -980,60 +1016,68 @@ impl Worker {
             .lock()
             .await
             .insert(activity_id.to_string(), running_workflow);
-        let result = arx.recv().await.unwrap();
-        let res = match result.3 {
-            // Err(e) => ActivityExecutionResult::fail(Failure::application_failure(
-            //     format!("Activity function panicked: {}", panic_formatter(e)),
-            //     true,
-            // )),
-            Ok(ActExitValue::Normal(p)) => ActivityResultV1::ok(
-                result.0.clone(),
-                result.1.clone(),
-                result.2.clone(),
-                Some(Payload::new(&p)),
-            ),
+        loop {
+            if let Some(result) = arx.recv().await {
+                let res = match result.3 {
+                    // Err(e) => ActivityExecutionResult::fail(Failure::application_failure(
+                    //     format!("Activity function panicked: {}", panic_formatter(e)),
+                    //     true,
+                    // )),
+                    Ok(ActExitValue::Normal(p)) => ActivityResultV1::ok(
+                        result.0.clone(),
+                        result.1.clone(),
+                        result.2.clone(),
+                        Some(Payload::new(&p)),
+                    ),
 
-            Err(err) => match err {
-                ActivityError::Retryable {
-                    source,
-                    explicit_delay,
-                } => {
-                    ActivityResultV1::fail(result.0.clone(), result.1.clone(), result.2.clone(), {
-                        println!("source: {:?}", source);
-                        let mut f = Failure::application_failure_from_error(source, false);
-                        if let Some(d) = explicit_delay {
-                            if let Some(FailureInfo::ApplicationFailureInfo(fi)) =
-                                f.failure_info.as_mut()
+                    Err(err) => match err {
+                        ActivityError::Retryable {
+                            source,
+                            explicit_delay,
+                        } => ActivityResultV1::fail(
+                            result.0.clone(),
+                            result.1.clone(),
+                            result.2.clone(),
                             {
-                                fi.next_retry_delay = d.try_into().ok();
-                            }
+                                println!("source: {:?}", source);
+                                let mut f = Failure::application_failure_from_error(source, false);
+                                if let Some(d) = explicit_delay {
+                                    if let Some(FailureInfo::ApplicationFailureInfo(fi)) =
+                                        f.failure_info.as_mut()
+                                    {
+                                        fi.next_retry_delay = d.try_into().ok();
+                                    }
+                                }
+                                f
+                            },
+                        ),
+                        ActivityError::Cancelled { details } => {
+                            ActivityResultV1::cancel_from_details(
+                                result.0.clone(),
+                                result.1.clone(),
+                                result.2.clone(),
+                                match details {
+                                    Some(d) => Some(vec![serde_json::to_vec(&d).unwrap()]),
+                                    None => None,
+                                },
+                            )
                         }
-                        f
-                    })
-                }
-                ActivityError::Cancelled { details } => ActivityResultV1::cancel_from_details(
-                    result.0.clone(),
-                    result.1.clone(),
-                    result.2.clone(),
-                    match details {
-                        Some(d) => Some(vec![serde_json::to_vec(&d).unwrap()]),
-                        None => None,
+                        ActivityError::NonRetryable(nre) => ActivityResultV1::fail(
+                            result.0.clone(),
+                            result.1.clone(),
+                            result.2.clone(),
+                            Failure::application_failure_from_error(nre, true),
+                        ),
                     },
-                ),
-                ActivityError::NonRetryable(nre) => ActivityResultV1::fail(
-                    result.0.clone(),
-                    result.1.clone(),
-                    result.2.clone(),
-                    Failure::application_failure_from_error(nre, true),
-                ),
-            },
-        };
+                };
 
-        let mut running_activities = running_activities_arc.lock().await;
-        // let running_activity = running_activities.get("test").unwrap();
-        // running_activity.join_handle.abort();
-        running_activities.remove(&result.0);
-        Ok(res)
+                let mut running_activities = running_activities_arc.lock().await;
+                // let running_activity = running_activities.get("test").unwrap();
+                // running_activity.join_handle.abort();
+                running_activities.remove(&result.0);
+                return Ok(res);
+            }
+        }
         // self.app_data = Some(
         //     Arc::try_unwrap(safe_app_data)
         //         .map_err(|_| anyhow!("some references of AppData exist on worker shutdown"))
@@ -1074,18 +1118,18 @@ impl Worker {
             match res.await {
                 Ok(res) => {
                     if let Err(e) = sender.send((wid.to_string(), aid, aid_run, res)) {
-                        println!("{:#?}", e);
+                        eprintln!("{:#?}", e);
                     }
                 }
                 Err(e) => {
-                    sender
-                        .send((
-                            wid.to_string(),
-                            aid,
-                            aid_run,
-                            Err(ActivityError::NonRetryable(e.into())),
-                        ))
-                        .unwrap();
+                    if let Err(e) = sender.send((
+                        wid.to_string(),
+                        aid,
+                        aid_run,
+                        Err(ActivityError::NonRetryable(e.into())),
+                    )) {
+                        eprintln!("{:#?}", e);
+                    }
                 }
             }
         });
@@ -1158,14 +1202,15 @@ impl Worker {
             let res = tokio::spawn(act_handle);
             match res.await {
                 Ok(res) => {
-                    sender
-                        .send((cid.to_string(), crid.to_string(), res))
-                        .unwrap();
+                    if let Err(e) = sender.send((cid.to_string(), crid.to_string(), res)) {
+                        eprintln!("error sending to sender: {}", e.to_string())
+                    }
                 }
                 Err(e) => {
-                    sender
-                        .send((cid, crid, Err(CallError::NonRetryable(e.into()))))
-                        .unwrap();
+                    if let Err(e) = sender.send((cid, crid, Err(CallError::NonRetryable(e.into()))))
+                    {
+                        eprintln!("error sending to sender: {}", e.to_string())
+                    }
                 }
             }
         });

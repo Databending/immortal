@@ -15,6 +15,142 @@ macro_rules! register_workflow {
     };
 }
 
+use common::{Payload, Payloads};
+use immortal::{
+    immortal_client::ImmortalClient, CallResultV1, CallV1, CallVersion, ClientStartWorkflowOptionsV1, ClientStartWorkflowOptionsVersion, ClientStartWorkflowResponse, NotifyV1, NotifyVersion, WorkflowResultV1
+};
+use tonic::transport::Channel;
+
+#[derive(Clone)]
+pub struct Client {
+    inner: ImmortalClient<Channel>,
+}
+
+impl Client {
+    pub async fn connect(addr: String) -> Result<Self, tonic::transport::Error> {
+        let inner = ImmortalClient::connect(addr).await?;
+        Ok(Self { inner })
+    }
+
+    pub async fn execute_workflow_v1(
+        &mut self,
+        input: Option<Payloads>,
+        workflow_type: &str,
+        task_queue: &str,
+    ) -> Result<WorkflowResultV1, tonic::Status> {
+        let result = self
+            .inner
+            .execute_workflow(ClientStartWorkflowOptionsVersion {
+                version: Some(
+                    immortal::client_start_workflow_options_version::Version::V1(
+                        ClientStartWorkflowOptionsV1 {
+                            workflow_type: workflow_type.to_string(),
+                            input,
+                            task_queue: task_queue.to_string(),
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            })
+            .await?;
+        Ok(match result.into_inner().version.unwrap() {
+            immortal::workflow_result_version::Version::V1(v1) => v1,
+        })
+    }
+
+    //pub async fn start_activity_v1(
+    //    &mut self,
+    //    input: Option<Payloads>,
+    //    activity_type: &str,
+    //    task_queue: &str,
+    //) -> Result<ClientStartWorkflowResponse, tonic::Status> {
+    //    let result = self
+    //        .inner
+    //        .start_activity(RequestStartActivityOptionsVersion {
+    //            version: Some(
+    //                immortal::request_start_activity_options_version::Version::V1(
+    //                    immortal::RequestStartActivityOptionsV1 { 
+    //                        activity_type: activity_type.to_string(),
+    //                        input,
+    //                        task_queue: task_queue.to_string(),
+    //                        ..Default::default()
+    //                    },
+    //                ),
+    //            ),
+    //        })
+    //        .await?;
+    //    Ok(result.into_inner())
+    //}
+
+    pub async fn start_workflow_v1(
+        &mut self,
+        input: Option<Payloads>,
+        workflow_type: &str,
+        task_queue: &str,
+    ) -> Result<ClientStartWorkflowResponse, tonic::Status> {
+        let result = self
+            .inner
+            .start_workflow(ClientStartWorkflowOptionsVersion {
+                version: Some(
+                    immortal::client_start_workflow_options_version::Version::V1(
+                        ClientStartWorkflowOptionsV1 {
+                            workflow_type: workflow_type.to_string(),
+                            input,
+                            task_queue: task_queue.to_string(),
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            })
+            .await?;
+        Ok(result.into_inner())
+    }
+
+    pub async fn call_v1(
+        &mut self,
+        input: Option<Payload>,
+        call_type: &str,
+        task_queue: &str,
+    ) -> Result<CallResultV1, tonic::Status> {
+        let result = self
+            .inner
+            .call(CallVersion {
+                version: Some(immortal::call_version::Version::V1(CallV1 {
+                    input,
+                    call_type: call_type.to_string(),
+                    call_version: "V1".to_string(),
+                    task_queue: task_queue.to_string(),
+                    ..Default::default()
+                })),
+            })
+            .await?;
+        Ok(match result.into_inner().version.unwrap() {
+            immortal::call_result_version::Version::V1(v1) => v1,
+        })
+    }
+
+    pub async fn notify_v1(
+        &mut self,
+        input: Option<Payload>,
+        call_type: &str,
+        task_queues: Vec<&str>,
+    ) -> Result<(), tonic::Status> {
+        let _result = self
+            .inner
+            .notify(NotifyVersion {
+                version: Some(immortal::notify_version::Version::V1(NotifyV1 {
+                    input,
+                    notify_type: call_type.to_string(),
+                    notify_version: "V1".to_string(),
+                    task_queues: task_queues.iter().map(|f| f.to_string()).collect(),
+                    ..Default::default()
+                })),
+            })
+            .await?;
+        Ok(())
+    }
+}
+
 pub mod immortal {
     tonic::include_proto!("immortal");
     use serde::{de::DeserializeOwned, Serialize};

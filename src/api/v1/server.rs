@@ -2,7 +2,7 @@ use crate::ImmortalService;
 use axum::{extract::State, response::IntoResponse, Json};
 use immortal::{
     immortal::RequestStartActivityOptionsV1,
-    models::{ActivitySchema, WfSchema},
+    models::{history, ActivitySchema, WfSchema},
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -15,6 +15,8 @@ struct Worker {
     activities: HashMap<String, ActivitySchema>,
     activity_capacity: i32,
     workflow_capacity: i32,
+    max_activity_capacity: i32,
+    max_workflow_capacity: i32,
 }
 
 struct StrippedActivityQueue(HashMap<String, Vec<(String, RequestStartActivityOptionsV1)>>);
@@ -24,11 +26,16 @@ pub async fn get_history(
     // this argument tells axum to parse the request body
     // as JSON into a `CreateUser` type
 ) -> impl IntoResponse {
-    let history = state.history.get_workflows(Some(100), None).await.unwrap();
+    match state.history.get_workflows(Some(100), None).await {
+        Ok(history) => Json(history),
+        Err(e) => {
+            println!("{:#?}", e);
+            Json(vec![])
+        }
+    }
 
     // this will be converted into a JSON response
     // with a status code of `201 Created`
-    Json(history)
 }
 
 pub async fn get_workers(
@@ -46,6 +53,8 @@ pub async fn get_workers(
             task_queue: worker.task_queue.clone(),
             activity_capacity: worker.activity_capacity,
             workflow_capacity: worker.workflow_capacity,
+            max_activity_capacity: worker.max_activity_capacity,
+            max_workflow_capacity: worker.max_workflow_capacity,
         });
     }
 
@@ -73,7 +82,14 @@ pub async fn get_activity_queue(
             .lock()
             .await
             .iter()
-            .map(|f| (f.0.clone(), f.1.iter().map(|f| (f.0.clone(), f.1.clone())).collect::<Vec<_>>()))
+            .map(|f| {
+                (
+                    f.0.clone(),
+                    f.1.iter()
+                        .map(|f| (f.0.clone(), f.1.clone()))
+                        .collect::<Vec<_>>(),
+                )
+            })
             .collect::<HashMap<_, _>>(),
     )
 }

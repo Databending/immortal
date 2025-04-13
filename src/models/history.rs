@@ -28,13 +28,55 @@ impl History {
         self.1.get().await
     }
 
+    pub async fn sync_workflow_index(&self) -> Result<()> {
+        let mut con = self.get_con().await?;
+        let currently_logged_workflows: Vec<String> = con
+            .keys(format!("{WORKFLOW_BASE_REDIS_KEY}::*").as_str())
+            .await?;
+        let mut offset = 0;
+        let limit = 100;
+
+        loop {
+            let workflows_in_index: Vec<String> = con
+                .lrange(
+                    format!("{WORKFLOW_BASE_REDIS_KEY}::workflow_index"),
+                    (offset).try_into().unwrap(),
+                    (offset + limit).try_into().unwrap(),
+                )
+                .await?;
+            if workflows_in_index.len() == 0 {
+                break;
+            }
+            for workflow_index in &workflows_in_index {
+                if !currently_logged_workflows.contains(&format!("{WORKFLOW_BASE_REDIS_KEY}::{workflow_index}")) {
+                    let _: () = con
+                        .ltrim(
+                            format!("{WORKFLOW_BASE_REDIS_KEY}::workflow_index"),
+                            0,
+                            offset,
+                        )
+                        .await?;
+                }
+
+                offset += 1;
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn add_workflow(&self, workflow: WorkflowHistory) -> Result<()> {
         let mut con = self.get_con().await?;
         let key = format!("{WORKFLOW_BASE_REDIS_KEY}::{}", workflow.workflow_id);
         if con.exists(&key).await? {
             return Err(anyhow!("Workflow already exists"));
         }
-        let _: () = con.lpush(format!("{WORKFLOW_BASE_REDIS_KEY}::workflow_index"), workflow.workflow_id.clone()).await?;
+        let _: () = con
+            .lpush(
+                format!("{WORKFLOW_BASE_REDIS_KEY}::workflow_index"),
+                workflow.workflow_id.clone(),
+            )
+            .await?;
         let _: () = con
             .set_ex(&key, WorkflowHistoryVersion::V1(workflow), 259200)
             .await?;
@@ -56,11 +98,32 @@ impl History {
         let limit = limit.unwrap_or(10) as isize;
         let offset = offset.unwrap_or(0) as isize;
         let mut con = self.get_con().await?;
-        let _keys: Vec<String> = con
-            .keys(format!("{WORKFLOW_BASE_REDIS_KEY}::*").as_str())
+        //let _keys: Vec<String> = con
+        //    .keys(format!("{WORKFLOW_BASE_REDIS_KEY}::*").as_str())
+        //    .await?;
+        // not sure why I moved to a workflow_index
+        // second thought, probably to allow for pagination. I need to create a sync mechanism
+        let keys2: Vec<String> = con
+            .lrange(
+                format!("{WORKFLOW_BASE_REDIS_KEY}::workflow_index"),
+                (-1 - (offset + limit)).try_into().unwrap(),
+                (-1 - offset).try_into().unwrap(),
+            )
             .await?;
-        let keys2: Vec<String> = con.lrange(format!("{WORKFLOW_BASE_REDIS_KEY}::workflow_index"), (-1 - (offset + limit)).try_into().unwrap(), (-1 - offset).try_into().unwrap()).await?;
-        let workflows: Vec<WorkflowHistoryVersion> = con.mget(keys2.iter().map(|f| format!("{WORKFLOW_BASE_REDIS_KEY}::{f}")).collect_vec()).await?;
+        let workflows: Vec<Option<String>> = con
+            .mget(
+                keys2
+                    .iter()
+                    .map(|f| format!("{WORKFLOW_BASE_REDIS_KEY}::{f}"))
+                    .collect_vec(),
+            )
+            .await?;
+        let workflows = workflows
+            .into_iter()
+            .filter(|f| f.is_some())
+            .map(|x| serde_json::from_str(&x.unwrap()).unwrap())
+            .collect();
+
         Ok(workflows)
     }
 
@@ -71,7 +134,9 @@ impl History {
     ) -> Result<()> {
         let mut con = self.get_con().await?;
         let key = format!("{WORKFLOW_BASE_REDIS_KEY}::{}", workflow_id);
-        let _: () = con.set_ex(key, WorkflowHistoryVersion::V1(workflow), 259200).await?;
+        let _: () = con
+            .set_ex(key, WorkflowHistoryVersion::V1(workflow), 259200)
+            .await?;
         Ok(())
     }
 
@@ -93,11 +158,7 @@ impl History {
             .find(|a| a.activity_id == activity_id)
             .cloned())
     }
-    pub async fn add_activity(
-        &self,
-        workflow_id: &str,
-        activity: ActivityHistory,
-    ) -> Result<()> {
+    pub async fn add_activity(&self, workflow_id: &str, activity: ActivityHistory) -> Result<()> {
         let mut con = self.get_con().await?;
         let key = format!("{WORKFLOW_BASE_REDIS_KEY}::{}", workflow_id);
         let mut workflow = self
@@ -105,7 +166,9 @@ impl History {
             .await?
             .ok_or(anyhow!("Workflow does not exist"))?;
         workflow.activities.push(activity);
-        let _: () = con.set_ex(key, WorkflowHistoryVersion::V1(workflow), 259200).await?;
+        let _: () = con
+            .set_ex(key, WorkflowHistoryVersion::V1(workflow), 259200)
+            .await?;
         Ok(())
     }
     pub async fn update_activity(
@@ -126,7 +189,9 @@ impl History {
             .ok_or(anyhow!("Activity does not exist"))?;
         *previous_activity = activity;
 
-        let _: () = con.set_ex(key, WorkflowHistoryVersion::V1(workflow), 259200).await?;
+        let _: () = con
+            .set_ex(key, WorkflowHistoryVersion::V1(workflow), 259200)
+            .await?;
         Ok(())
     }
     // pub fn get_activity_mut(&mut self, activity_id: &str) -> Option<&mut ActivityHistory> {
