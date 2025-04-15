@@ -13,10 +13,9 @@ use tokio::sync::{
 };
 use tonic::transport::Channel;
 use tracing::field::{Field, Visit};
-use tracing::level_filters::LevelFilter;
 use tracing::span::{Attributes, Id};
 use tracing::{Event, Subscriber};
-use tracing_subscriber::Registry;
+use tracing_subscriber::{EnvFilter, Registry};
 use tracing_subscriber::{layer::Context, layer::SubscriberExt, Layer};
 use uuid::Uuid;
 
@@ -225,7 +224,6 @@ where
         let _ = writeln!(&mut event_str, "{:?}", event);
         let mut visitor = EventVisitor::default();
         event.record(&mut visitor);
-        println!("Event: {:?}", event);
         if let Some(scope) = ctx.event_scope(&event) {
             for span in scope.from_root() {
                 if let Some(data) = span.extensions().get::<SpanData>() {
@@ -279,7 +277,7 @@ impl Worker {
         let subscriber = Registry::default()
             .with(channel_layer)
             .with(tracing_subscriber::fmt::Layer::default())
-            .with(LevelFilter::INFO);
+            .with(EnvFilter::from_default_env());
         tracing::subscriber::set_global_default(subscriber)
             .expect("Failed to set global subscriber");
         let client = ImmortalClient::connect(config.url.clone()).await?;
@@ -441,6 +439,8 @@ impl Worker {
             })
             .await?
             .into_inner();
+
+        println!("WORKER REGISTERED");
 
         // info!("Worker registered");
         // on failure this needs to reconnect

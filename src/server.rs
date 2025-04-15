@@ -327,8 +327,8 @@ impl ImmortalService {
         let notify = self.call_notify.clone();
         tokio::spawn(async move {
             loop {
-
                 notify.notified().await;
+                println!("running call queue");
                 // Lock once and take a snapshot of queues
                 let queues_snapshot: HashMap<String, _> = {
                     let call_queues = call_queue.lock().await;
@@ -426,7 +426,6 @@ impl ImmortalService {
                         }
                     }
                 }
-
             }
         });
     }
@@ -440,7 +439,6 @@ impl ImmortalService {
         let notify = self.activity_notify.clone();
         tokio::spawn(async move {
             loop {
-
                 notify.notified().await;
                 let mut activity_queues = activity_queue.lock().await;
 
@@ -944,78 +942,84 @@ impl Immortal for ImmortalService {
             }
             println!("incoming Stream ended");
         });
-        // worker_details_version.next().await
-        let mut workers = self.workers.write().await;
 
         let (tx, rx) = mpsc::channel(4);
-        let mut worker_details = worker_details.ok_or(tonic::Status::invalid_argument(
-            "Worker details never provided",
-        ))?;
+        let worker_id;
+        {
+            let mut workers = self.workers.write().await;
 
-        println!("{:#?}", worker_details.worker_id);
+            let mut worker_details = worker_details.ok_or(tonic::Status::invalid_argument(
+                "Worker details never provided",
+            ))?;
 
-        let worker_ids = workers.iter().map(|f| f.0.clone()).collect::<Vec<_>>();
+            println!("{:#?}", worker_details.worker_id);
 
-        if worker_ids.contains(&worker_details.worker_id) {
-            worker_details.worker_id = format!("{}-{}", worker_details.worker_id, Uuid::new_v4());
+            worker_id = worker_details.worker_id.clone();
+            let worker_ids = workers.iter().map(|f| f.0.clone()).collect::<Vec<_>>();
+
+            if worker_ids.contains(&worker_details.worker_id) {
+                worker_details.worker_id =
+                    format!("{}-{}", worker_details.worker_id, Uuid::new_v4());
+            }
+
+            println!("{:#?}", worker_ids);
+            let registered_workflows = worker_details
+                .registered_workflows
+                .iter()
+                .map(|x| {
+                    (
+                        x.workflow_type.clone(),
+                        WfSchema {
+                            args: serde_json::from_slice(&x.args).unwrap(),
+                            output: serde_json::from_slice(&x.output).unwrap(),
+                        },
+                    )
+                })
+                .collect();
+            let registered_activities = worker_details
+                .registered_activities
+                .iter()
+                .map(|x| {
+                    (
+                        x.activity_type.clone(),
+                        ActivitySchema {
+                            args: serde_json::from_slice(&x.args).unwrap(),
+                            output: serde_json::from_slice(&x.output).unwrap(),
+                        },
+                    )
+                })
+                .collect();
+            let registered_calls = worker_details
+                .registered_calls
+                .iter()
+                .map(|x| {
+                    (
+                        x.call_type.clone(),
+                        CallSchema {
+                            args: serde_json::from_slice(&x.args).unwrap(),
+                            output: serde_json::from_slice(&x.output).unwrap(),
+                        },
+                    )
+                })
+                .collect();
+            workers.insert(
+                worker_details.worker_id.clone(),
+                RegisteredWorker {
+                    activity_capacity: worker_details.activity_capacity,
+                    task_queue: worker_details.task_queue,
+                    workflow_capacity: worker_details.workflow_capacity,
+                    incoming: handle,
+                    tx: tx.clone(),
+                    worker_id: worker_details.worker_id.clone(),
+                    registered_workflows,
+                    registered_activities,
+                    registered_calls,
+                    max_activity_capacity: worker_details.activity_capacity,
+                    max_workflow_capacity: worker_details.workflow_capacity,
+                },
+            );
         }
 
-        println!("{:#?}", worker_ids);
-        let registered_workflows = worker_details
-            .registered_workflows
-            .iter()
-            .map(|x| {
-                (
-                    x.workflow_type.clone(),
-                    WfSchema {
-                        args: serde_json::from_slice(&x.args).unwrap(),
-                        output: serde_json::from_slice(&x.output).unwrap(),
-                    },
-                )
-            })
-            .collect();
-        let registered_activities = worker_details
-            .registered_activities
-            .iter()
-            .map(|x| {
-                (
-                    x.activity_type.clone(),
-                    ActivitySchema {
-                        args: serde_json::from_slice(&x.args).unwrap(),
-                        output: serde_json::from_slice(&x.output).unwrap(),
-                    },
-                )
-            })
-            .collect();
-        let registered_calls = worker_details
-            .registered_calls
-            .iter()
-            .map(|x| {
-                (
-                    x.call_type.clone(),
-                    CallSchema {
-                        args: serde_json::from_slice(&x.args).unwrap(),
-                        output: serde_json::from_slice(&x.output).unwrap(),
-                    },
-                )
-            })
-            .collect();
-        workers.insert(
-            worker_details.worker_id.clone(),
-            RegisteredWorker {
-                activity_capacity: worker_details.activity_capacity,
-                task_queue: worker_details.task_queue,
-                workflow_capacity: worker_details.workflow_capacity,
-                incoming: handle,
-                tx: tx.clone(),
-                worker_id: worker_details.worker_id.clone(),
-                registered_workflows,
-                registered_activities,
-                registered_calls,
-                max_activity_capacity: worker_details.activity_capacity,
-                max_workflow_capacity: worker_details.workflow_capacity,
-            },
-        );
         let workers = Arc::clone(&self.workers);
         println!("workers = {:?}", workers);
         self.call_notify.notify_one();
@@ -1044,7 +1048,7 @@ impl Immortal for ImmortalService {
 
             {
                 let mut workers = workers.write().await;
-                workers.remove(&worker_details.worker_id);
+                workers.remove(&worker_id);
             }
 
             println!("Stream ended");
