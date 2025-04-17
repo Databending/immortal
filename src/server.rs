@@ -846,6 +846,7 @@ impl Immortal for ImmortalService {
         request: Request<Streaming<ImmortalServerActionVersion>>,
     ) -> Result<Response<Self::RegisterWorkerStream>, Status> {
 
+        println!("received worker register call");
         let mut stream = request.into_inner();
         let mut worker_details = None;
         if let Some(Ok(action)) = stream.next().await {
@@ -859,6 +860,8 @@ impl Immortal for ImmortalService {
                 _ => {}
             }
         }
+
+        println!("received worker details");
         let redis_pool = self.redis_pool.clone(); // clone the pool handle before spawning
 
         let handle = tokio::spawn(async move {
@@ -936,9 +939,10 @@ impl Immortal for ImmortalService {
             println!("incoming Stream ended");
         });
 
-        let (tx, rx) = mpsc::channel(4);
+        let (tx, rx) = mpsc::channel(10);
         let worker_id;
         {
+            println!("waiting to receive workers write handle");
             let mut workers = self.workers.write().await;
 
             let mut worker_details = worker_details.ok_or(tonic::Status::invalid_argument(
