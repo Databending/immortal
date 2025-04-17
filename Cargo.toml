@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 
+[build]
+rustflags = ["--cfg", "tokio_unstable"]
+
 [dependencies]
 tonic = "0.12"
 prost = "0.13"
@@ -39,6 +42,7 @@ const_format = "0.2.33"
 tower = "0.5.1"
 regex = "1.11.1"
 dotenvy = "0.15.7"
+console-subscriber = "0.4.1"
 [build-dependencies]
 tonic-build = "0.12"
 prost-wkt-build = "0.6"

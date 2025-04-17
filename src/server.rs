@@ -102,11 +102,11 @@ struct RegisteredWorker {
     worker_id: String,
 
     task_queue: String,
-    incoming: JoinHandle<()>,
+    _incoming: JoinHandle<()>,
     tx: Sender<Result<ImmortalWorkerActionVersion, Status>>,
     registered_workflows: HashMap<String, WfSchema>,
     registered_activities: HashMap<String, ActivitySchema>,
-    registered_calls: HashMap<String, CallSchema>,
+    _registered_calls: HashMap<String, CallSchema>,
     activity_capacity: i32,
     max_activity_capacity: i32,
     workflow_capacity: i32,
@@ -139,7 +139,7 @@ struct CallOptions {
 }
 
 #[derive(Debug, Clone)]
-struct RunningProperties<T> {
+struct _RunningProperties<T> {
     start: NaiveDateTime,
     timeout: NaiveDateTime,
     // in seconds
@@ -152,7 +152,7 @@ struct RunningProperties<T> {
 struct CallProperties {}
 
 #[derive(Debug, Clone)]
-struct ActivityProperties {
+struct _ActivityProperties {
     pub workflow_id: String,
 }
 
@@ -176,7 +176,7 @@ pub struct ImmortalService {
                 String,
                 (
                     tokio::sync::broadcast::Sender<CallResultV1>,
-                    RunningProperties<CallProperties>,
+                    _RunningProperties<CallProperties>,
                 ),
             >,
         >,
@@ -191,7 +191,7 @@ pub struct ImmortalService {
                     // worker id
                     String,
                     tokio::sync::oneshot::Sender<ActivityResultV1>,
-                    RunningProperties<ActivityProperties>,
+                    _RunningProperties<_ActivityProperties>,
                 ),
             >,
         >,
@@ -225,7 +225,27 @@ pub struct ImmortalService {
     >,
 }
 
+enum AdjustCapacity {
+    Workflow,
+    Activity,
+}
+
 impl ImmortalService {
+    async fn adjust_capacity(
+        workers: Arc<RwLock<HashMap<String, RegisteredWorker>>>,
+        worker_id: String,
+        amount: i32,
+        capacity: AdjustCapacity,
+    ) {
+        let mut workers = workers.write().await;
+        if let Some(worker) = workers.iter_mut().find(|f| f.1.worker_id == worker_id) {
+            match capacity {
+                AdjustCapacity::Workflow => worker.1.workflow_capacity += amount,
+                AdjustCapacity::Activity => worker.1.activity_capacity += amount,
+            }
+        }
+    }
+
     fn watchdog(&self) {
         let running_calls = Arc::clone(&self.running_calls);
         let running_activities = Arc::clone(&self.running_activities);
@@ -338,21 +358,30 @@ impl ImmortalService {
                         .collect()
                 };
 
+                println!("got snapshot");
                 for (queue_name, queue) in queues_snapshot {
                     if queue.is_empty() {
+                        println!("queue is empty so continuing");
                         continue;
                     }
-
-                    let mut workers_guard = workers.write().await;
 
                     // Try to assign one call from this queue
                     for (_index, (call_id, call_options, sender)) in queue.into_iter().enumerate() {
                         // Find eligible workers
-                        let mut available_workers: Vec<_> = workers_guard
-                            .iter_mut()
-                            .filter(|(_, worker)| worker.task_queue == call_options.task_queue)
-                            .map(|(_, worker)| worker)
-                            .collect();
+
+                        let available_workers: Vec<_>;
+
+                        {
+                            println!("waiting to acquire workers");
+                            let mut workers_guard = workers.write().await;
+
+                            println!(" workers acquired");
+                            available_workers = workers_guard
+                                .iter_mut()
+                                .filter(|(_, worker)| worker.task_queue == call_options.task_queue)
+                                .map(|(_, worker)| (worker.worker_id.clone(), worker.tx.clone()))
+                                .collect();
+                        }
 
                         if available_workers.is_empty() {
                             break;
@@ -361,10 +390,11 @@ impl ImmortalService {
                         let chosen_worker_index =
                             rand::thread_rng().gen_range(0..available_workers.len());
 
-                        if let Some(worker) = available_workers.get_mut(chosen_worker_index) {
+                        if let Some(worker) = available_workers.get(chosen_worker_index) {
+                            println!("sending to worker");
                             // Dispatch call to worker
                             if let Err(e) = worker
-                                .tx
+                                .1
                                 .send(Ok(ImmortalWorkerActionVersion {
                                     version: Some(immortal_worker_action_version::Version::V1(
                                         ImmortalWorkerActionV1 {
@@ -381,13 +411,12 @@ impl ImmortalService {
                                 }))
                                 .await
                             {
-                                eprintln!(
-                                    "Failed to send call to worker {}: {:?}",
-                                    worker.worker_id, e
-                                );
+                                eprintln!("Failed to send call to worker {}: {:?}", worker.0, e);
                             } else {
+                                println!("finished sending to worker");
                                 // Remove the item from the actual call queue (not the snapshot)
                                 {
+                                    println!("waiting to acquire queue lock");
                                     let mut call_queues = call_queue.lock().await;
                                     if let Some(queue_vec) = call_queues.get_mut(&queue_name) {
                                         if let Some(pos) =
@@ -403,6 +432,7 @@ impl ImmortalService {
 
                                 // Register running call
                                 {
+                                    println!("waiting to acquire running_calls lock");
                                     let mut running_calls = running_calls.write().await;
                                     let now = Utc::now().naive_utc();
                                     let timeout = now + Duration::seconds(30);
@@ -410,11 +440,11 @@ impl ImmortalService {
                                         call_id.clone(),
                                         (
                                             sender,
-                                            RunningProperties {
+                                            _RunningProperties {
                                                 start: now,
                                                 timeout,
                                                 max_duration: Duration::seconds(30),
-                                                worker_id: worker.worker_id.clone(),
+                                                worker_id: worker.0.clone(),
                                                 additional_properties: CallProperties {},
                                             },
                                         ),
@@ -424,8 +454,10 @@ impl ImmortalService {
 
                             //break; // Assign one call per loop per queue
                         }
+                        println!("no available workers");
                     }
                 }
+                println!("finished running loop");
             }
         });
     }
@@ -444,18 +476,21 @@ impl ImmortalService {
 
                 for (queue_name, queue) in activity_queues.iter_mut() {
                     if let Some((activity_run_id, activity_options, tx)) = queue.pop_front() {
-                        let mut workers_guard = workers.write().await;
+                        let available_workers: Vec<_>;
+                        {
+                            let mut workers_guard = workers.write().await;
 
-                        let mut available_workers: Vec<_> = workers_guard
-                            .iter_mut()
-                            .filter(|(_, worker)| {
-                                worker.task_queue == *queue_name
-                                    && worker
-                                        .registered_activities
-                                        .contains_key(&activity_options.activity_type)
-                            })
-                            .map(|(_, worker)| worker)
-                            .collect();
+                            available_workers = workers_guard
+                                .iter_mut()
+                                .filter(|(_, worker)| {
+                                    worker.task_queue == *queue_name
+                                        && worker
+                                            .registered_activities
+                                            .contains_key(&activity_options.activity_type)
+                                })
+                                .map(|(_, worker)| (worker.worker_id.clone(), worker.tx.clone()))
+                                .collect();
+                        }
 
                         if available_workers.is_empty() {
                             queue.push_front((activity_run_id, activity_options, tx));
@@ -464,7 +499,7 @@ impl ImmortalService {
 
                         let random_index = rand::thread_rng().gen_range(0..available_workers.len());
 
-                        if let Some(worker) = available_workers.get_mut(random_index) {
+                        if let Some(worker) = available_workers.get(random_index) {
                             let now = Utc::now().naive_utc();
                             let duration = Duration::seconds(5);
                             let timeout = now + duration;
@@ -472,14 +507,14 @@ impl ImmortalService {
                             running_activities.write().await.insert(
                                 activity_options.activity_id.clone(),
                                 (
-                                    worker.worker_id.clone(),
+                                    worker.0.clone(),
                                     tx,
-                                    RunningProperties {
+                                    _RunningProperties {
                                         start: now,
                                         timeout,
                                         max_duration: duration,
-                                        worker_id: worker.worker_id.clone(),
-                                        additional_properties: ActivityProperties {
+                                        worker_id: worker.0.clone(),
+                                        additional_properties: _ActivityProperties {
                                             workflow_id: activity_options.workflow_id.clone(),
                                         },
                                     },
@@ -487,7 +522,7 @@ impl ImmortalService {
                             );
 
                             if let Err(e) = worker
-                                .tx
+                                .1
                                 .send(Ok(ImmortalWorkerActionVersion {
                                     version: Some(immortal_worker_action_version::Version::V1(
                                         ImmortalWorkerActionV1 {
@@ -517,7 +552,13 @@ impl ImmortalService {
                                 continue;
                             }
 
-                            worker.activity_capacity -= 1;
+                            Self::adjust_capacity(
+                                Arc::clone(&workers),
+                                worker.0.clone(),
+                                -1,
+                                AdjustCapacity::Activity,
+                            )
+                            .await;
 
                             let mut activity_history = ActivityHistory::new(
                                 activity_options.activity_type.clone(),
@@ -597,19 +638,21 @@ impl ImmortalService {
                         continue;
                     }
 
-                    let mut workers_guard = workers.write().await;
-
                     for (workflow_id, workflow_options) in queue {
-                        let mut available_workers: Vec<_> = workers_guard
-                            .iter_mut()
-                            .filter(|(_, worker)| {
-                                worker.task_queue == queue_name
-                                    && worker
-                                        .registered_workflows
-                                        .contains_key(&workflow_options.workflow_type)
-                            })
-                            .map(|(_, worker)| worker)
-                            .collect();
+                        let available_workers: Vec<_>;
+                        {
+                            let mut workers_guard = workers.write().await;
+                            available_workers = workers_guard
+                                .iter_mut()
+                                .filter(|(_, worker)| {
+                                    worker.task_queue == queue_name
+                                        && worker
+                                            .registered_workflows
+                                            .contains_key(&workflow_options.workflow_type)
+                                })
+                                .map(|(_, worker)| (worker.worker_id.clone(), worker.tx.clone()))
+                                .collect();
+                        }
 
                         if available_workers.is_empty() {
                             println!("No available workers for workflow queue {}", queue_name);
@@ -618,7 +661,7 @@ impl ImmortalService {
 
                         let chosen_index = rand::thread_rng().gen_range(0..available_workers.len());
 
-                        if let Some(worker) = available_workers.get_mut(chosen_index) {
+                        if let Some(worker) = available_workers.get(chosen_index) {
                             // Remove the item from the actual queue
                             {
                                 let mut queue_guard = workflow_queue.lock().await;
@@ -656,7 +699,7 @@ impl ImmortalService {
 
                             // Send to worker
                             if let Err(e) = worker
-                                .tx
+                                .1
                                 .send(Ok(ImmortalWorkerActionVersion {
                                     version: Some(immortal_worker_action_version::Version::V1(
                                         ImmortalWorkerActionV1 {
@@ -681,8 +724,13 @@ impl ImmortalService {
                                 eprintln!("Failed to send workflow to worker: {:?}", e);
                                 continue;
                             }
-
-                            worker.workflow_capacity -= 1;
+                            Self::adjust_capacity(
+                                Arc::clone(&workers),
+                                worker.0.clone(),
+                                -1,
+                                AdjustCapacity::Workflow,
+                            )
+                            .await;
 
                             if let Err(e) = notification_tx.send(Notification::WorkflowStarted(
                                 Uuid::parse_str(&workflow_id).unwrap_or_default(),
@@ -815,6 +863,7 @@ impl Immortal for ImmortalService {
                             .map(|(_, worker)| worker)
                             .collect::<Vec<_>>();
                         for worker in workers_to_notify {
+                            println!("sending tx to worker");
                             if let Err(e) = worker
                                 .tx
                                 .send(Ok(ImmortalWorkerActionVersion {
@@ -834,6 +883,7 @@ impl Immortal for ImmortalService {
                             {
                                 eprintln!("Failed to send workflow notification: {:?}", e);
                             }
+                            println!("finished sending to worker")
                         }
                     }
                 }
@@ -845,7 +895,6 @@ impl Immortal for ImmortalService {
         &self,
         request: Request<Streaming<ImmortalServerActionVersion>>,
     ) -> Result<Response<Self::RegisterWorkerStream>, Status> {
-
         println!("received worker register call");
         let mut stream = request.into_inner();
         let mut worker_details = None;
@@ -939,7 +988,7 @@ impl Immortal for ImmortalService {
             println!("incoming Stream ended");
         });
 
-        let (tx, rx) = mpsc::channel(10);
+        let (tx, rx) = mpsc::channel(100);
         let worker_id;
         {
             println!("waiting to receive workers write handle");
@@ -948,7 +997,6 @@ impl Immortal for ImmortalService {
             let mut worker_details = worker_details.ok_or(tonic::Status::invalid_argument(
                 "Worker details never provided",
             ))?;
-
 
             worker_id = worker_details.worker_id.clone();
             let worker_ids = workers.iter().map(|f| f.0.clone()).collect::<Vec<_>>();
@@ -1004,12 +1052,12 @@ impl Immortal for ImmortalService {
                     activity_capacity: worker_details.activity_capacity,
                     task_queue: worker_details.task_queue,
                     workflow_capacity: worker_details.workflow_capacity,
-                    incoming: handle,
+                    _incoming: handle,
                     tx: tx.clone(),
                     worker_id: worker_details.worker_id.clone(),
                     registered_workflows,
                     registered_activities,
-                    registered_calls,
+                    _registered_calls: registered_calls,
                     max_activity_capacity: worker_details.activity_capacity,
                     max_workflow_capacity: worker_details.workflow_capacity,
                 },
@@ -1611,7 +1659,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     immortal_service.workflow_queue_thread();
     immortal_service.activity_queue_thread();
     immortal_service.call_queue_thread();
-    immortal_service.watchdog();
+    //immortal_service.watchdog();
     let svc = ImmortalServer::new(immortal_service.clone());
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
@@ -1620,6 +1668,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     immortal_service.history.sync_workflow_index().await?;
     tokio::spawn(service_status(health_reporter.clone()));
+    console_subscriber::init();
 
     {
         let cors = CorsLayer::very_permissive();
