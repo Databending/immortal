@@ -207,7 +207,10 @@ where
                         })
                     })
                     .boxed(),
-                Err(e) => async move { Err(CallError::NonRetryable(e.into())) }.boxed(),
+                Err(e) => {
+                    println!("ERROR DESERIALIZING: {}", e.to_string());
+                    async move { Err(CallError::NonRetryable(e.into())) }.boxed()
+                }
             }
             // Some minor gymnastics are required to avoid needing to clone the function
             // match A::from_json_payload(&input) {

@@ -133,6 +133,7 @@ where
                         .boxed()
                 }
                 Err(e) => {
+                    println!("ERROR DESERIALIZING: {}", e.to_string());
                     // Handle deserialization failure by returning a NonRetryable error
                     async move { Err(anyhow::anyhow!(e)) }.boxed()
                 }

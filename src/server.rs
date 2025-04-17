@@ -945,7 +945,6 @@ impl Immortal for ImmortalService {
                 "Worker details never provided",
             ))?;
 
-            println!("{:#?}", worker_details.worker_id);
 
             worker_id = worker_details.worker_id.clone();
             let worker_ids = workers.iter().map(|f| f.0.clone()).collect::<Vec<_>>();
@@ -1014,7 +1013,6 @@ impl Immortal for ImmortalService {
         }
 
         let workers = Arc::clone(&self.workers);
-        println!("workers = {:?}", workers);
         self.call_notify.notify_one();
         self.workflow_notify.notify_one();
         self.activity_notify.notify_one();
