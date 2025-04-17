@@ -4,8 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 
-[build]
-rustflags = ["--cfg", "tokio_unstable"]
 
 [dependencies]
 tonic = "0.12"
@@ -50,6 +48,8 @@ prost-wkt-build = "0.6"
 [[bin]]
 name = "server"
 path = "src/server.rs"
+[build]
+rustflags = ["--cfg", "tokio_unstable"]
 
 
 [[bin]]

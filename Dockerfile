@@ -9,7 +9,7 @@ RUN echo "[credential]\n\thelper = store" > ~/.gitconfig
 RUN git config --global credential.helper store
 RUN echo "https://oauth2:$GIT_TOKEN@gitlab.databending.ca" > ~/.git-credentials
 RUN rustup default nightly
-RUN cargo +nightly build --bin server --release
+RUN RUSTFLAGS="--cfg tokio_unstable" cargo +nightly build --bin server --release
 
 
 FROM debian:bookworm-slim
