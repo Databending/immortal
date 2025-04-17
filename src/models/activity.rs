@@ -15,8 +15,7 @@ use tracing::info_span;
 use tracing::Instrument;
 
 #[derive(Default, Debug)]
-pub struct ActivityOptions
-{
+pub struct ActivityOptions {
     /// Identifier to use for tracking the activity in Workflow history.
     /// The `activityId` can be accessed by the activity function.
     /// Does not need to be unique.
@@ -196,20 +195,24 @@ where
 {
     fn into_activity_fn(self) -> BoxActFn {
         let wrapper = move |ctx: ActContext, input: Payload| {
-            self(ctx, serde_json::from_slice(&input.data).unwrap())
-                .map(|r| {
-                    r.and_then(|r| {
-                        let exit_val: ActExitValue<O> = r.into();
-                        match exit_val {
-                            // ActExitValue::WillCompleteAsync => Ok(ActExitValue::WillCompleteAsync),
-                            ActExitValue::Normal(x) => match serde_json::to_value(x) {
-                                Ok(v) => Ok(ActExitValue::Normal(v)),
-                                Err(e) => Err(ActivityError::NonRetryable(e.into())),
-                            },
-                        }
+            match serde_json::from_slice(&input.data) {
+                Ok(x) => self(ctx, x)
+                    .map(|r| {
+                        r.and_then(|r| {
+                            let exit_val: ActExitValue<O> = r.into();
+                            match exit_val {
+                                // ActExitValue::WillCompleteAsync => Ok(ActExitValue::WillCompleteAsync),
+                                ActExitValue::Normal(x) => match serde_json::to_value(x) {
+                                    Ok(v) => Ok(ActExitValue::Normal(v)),
+                                    Err(e) => Err(ActivityError::NonRetryable(e.into())),
+                                },
+                            }
+                        })
                     })
-                })
-                .boxed()
+                    .boxed(),
+                Err(e) => async move { Err(ActivityError::NonRetryable(e.into())) }.boxed(),
+            }
+
             // Some minor gymnastics are required to avoid needing to clone the function
             // match A::from_json_payload(&input) {
             //     Ok(deser) => ,
@@ -340,7 +343,7 @@ pub struct Start {
 impl ActContext {
     /// Construct new Activity Context, returning the context and the first argument to the activity
     /// (which may be a default [Payload]).
-    pub(crate) fn new(
+    pub(crate) fn _new(
         // worker: Arc<dyn Worker>,
         app_data: Arc<AppData>,
         cancellation_token: CancellationToken,
@@ -367,7 +370,7 @@ impl ActContext {
             retry_policy,
             is_local,
         } = task;
-        let deadline = calculate_deadline(
+        let deadline = _calculate_deadline(
             scheduled_time.as_ref(),
             started_time.as_ref(),
             start_to_close_timeout.as_ref(),
@@ -429,7 +432,7 @@ impl ActContext {
     }
 
     /// RecordHeartbeat sends heartbeat for the currently executing activity
-    pub fn record_heartbeat(&self, details: Vec<Value>) {
+    pub fn record_heartbeat(&self, _details: Vec<Value>) {
         // self.worker.record_activity_heartbeat(ActivityHeartbeat {
         //     task_token: self.info.task_token.clone(),
         //     details,
@@ -454,7 +457,7 @@ impl ActContext {
 
 /// Deadline calculation.  This is a port of
 /// https://github.com/temporalio/sdk-go/blob/8651550973088f27f678118f997839fb1bb9e62f/internal/activity.go#L225
-fn calculate_deadline(
+fn _calculate_deadline(
     scheduled_time: Option<&SystemTime>,
     started_time: Option<&SystemTime>,
     start_to_close_timeout: Option<&Duration>,

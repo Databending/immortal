@@ -845,14 +845,7 @@ impl Immortal for ImmortalService {
         &self,
         request: Request<Streaming<ImmortalServerActionVersion>>,
     ) -> Result<Response<Self::RegisterWorkerStream>, Status> {
-        let mut con = self
-            .redis_pool
-            .get()
-            .await
-            .map_err(|e| {
-                tonic::Status::internal(format!("Couldn't access redis: {}", e.to_string()))
-            })?
-            .clone();
+
         let mut stream = request.into_inner();
         let mut worker_details = None;
         if let Some(Ok(action)) = stream.next().await {
@@ -1652,7 +1645,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let con = pool.get().await.unwrap();
     Server::builder()
         .add_service(svc)
         .add_service(health_service)

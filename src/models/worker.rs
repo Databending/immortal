@@ -173,12 +173,12 @@ impl Visit for StrVisitor {
 
 impl Visit for EventVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
-        if field.name() == "message" {
+        if field.name() == "message" || field.name() == "summary" {
             self.message = Some(format!("{:?}", value));
         }
     }
     fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "message" {
+        if field.name() == "message" || field.name() == "summary" {
             self.message = Some(value.to_string());
         }
     }
@@ -1414,7 +1414,7 @@ pub struct WorkerConfig {
     pub max_outstanding_local_activities: Option<usize>,
 }
 
-pub(crate) trait WorkerClient: Sync + Send {
+pub(crate) trait _WorkerClient: Sync + Send {
     // async fn poll_workflow_task(
     //     &self,
     //     task_queue: TaskQueue,

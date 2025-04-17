@@ -192,20 +192,23 @@ where
 {
     fn into_call_fn(self) -> BoxCallFn {
         let wrapper = move |ctx: CallContext, input: Payload| {
-            self(ctx, serde_json::from_slice(&input.data).unwrap())
-                .map(|r| {
-                    r.and_then(|r| {
-                        let exit_val: CallExitValue<O> = r.into();
-                        match exit_val {
-                            // ActExitValue::WillCompleteAsync => Ok(ActExitValue::WillCompleteAsync),
-                            CallExitValue::Normal(x) => match serde_json::to_value(x) {
-                                Ok(v) => Ok(CallExitValue::Normal(v)),
-                                Err(e) => Err(CallError::NonRetryable(e.into())),
-                            },
-                        }
+            match serde_json::from_slice(&input.data) {
+                Ok(x) => self(ctx, x)
+                    .map(|r| {
+                        r.and_then(|r| {
+                            let exit_val: CallExitValue<O> = r.into();
+                            match exit_val {
+                                // ActExitValue::WillCompleteAsync => Ok(ActExitValue::WillCompleteAsync),
+                                CallExitValue::Normal(x) => match serde_json::to_value(x) {
+                                    Ok(v) => Ok(CallExitValue::Normal(v)),
+                                    Err(e) => Err(CallError::NonRetryable(e.into())),
+                                },
+                            }
+                        })
                     })
-                })
-                .boxed()
+                    .boxed(),
+                Err(e) => async move { Err(CallError::NonRetryable(e.into())) }.boxed(),
+            }
             // Some minor gymnastics are required to avoid needing to clone the function
             // match A::from_json_payload(&input) {
             //     Ok(deser) => ,
@@ -230,11 +233,11 @@ pub struct CallContext {
     header_fields: HashMap<String, Value>,
     info: CallInfo,
 }
-
-struct CallHeartbeat {
-    pub task_token: Vec<u8>,
-    pub details: Vec<Value>,
-}
+//
+//struct CallHeartbeat {
+//    pub task_token: Vec<u8>,
+//    pub details: Vec<Value>,
+//}
 
 #[derive(Clone, Default)]
 pub struct CallInfo {
@@ -258,9 +261,8 @@ pub struct CallInfo {
     pub is_local: bool,
 }
 
-
 #[derive(Clone)]
-pub(crate) struct Start {
+pub(crate) struct _Start {
     // The namespace the workflow lives in
     pub namespace: String,
     // The activity's ID
@@ -299,15 +301,15 @@ pub(crate) struct Start {
 impl CallContext {
     /// Construct new Activity Context, returning the context and the first argument to the activity
     /// (which may be a default [Payload]).
-    pub(crate) fn new(
+    pub(crate) fn _new(
         // worker: Arc<dyn Worker>,
         app_data: Arc<AppData>,
         cancellation_token: CancellationToken,
         task_queue: String,
         task_token: Vec<u8>,
-        task: Start,
+        task: _Start,
     ) -> (Self, Value) {
-        let Start {
+        let _Start {
             namespace,
             notification_id,
             notification_type,
@@ -324,7 +326,7 @@ impl CallContext {
             retry_policy,
             is_local,
         } = task;
-        let deadline = calculate_deadline(
+        let deadline = _calculate_deadline(
             scheduled_time.as_ref(),
             started_time.as_ref(),
             start_to_close_timeout.as_ref(),
@@ -409,7 +411,7 @@ impl CallContext {
 
 /// Deadline calculation.  This is a port of
 /// https://github.com/temporalio/sdk-go/blob/8651550973088f27f678118f997839fb1bb9e62f/internal/activity.go#L225
-fn calculate_deadline(
+fn _calculate_deadline(
     scheduled_time: Option<&SystemTime>,
     started_time: Option<&SystemTime>,
     start_to_close_timeout: Option<&Duration>,

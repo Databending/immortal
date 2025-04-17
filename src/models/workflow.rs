@@ -33,7 +33,7 @@ pub struct Workflow {
 
 #[derive(Clone)]
 pub struct WfContext {
-    namespace: String,
+    _namespace: String,
     task_queue: String,
     pub client: ImmortalClient<Channel>,
     pub args: Arc<Payloads>,
@@ -83,7 +83,10 @@ impl WfContext {
                     Some(Status::Failed(x)) => Err(anyhow!("{:#?}", x)),
                     Some(Status::Cancelled(x)) => Err(anyhow!("{:#?}", x)),
                     Some(Status::Completed(y)) => {
-                        Ok(y.result.unwrap().to()?)
+                        match y.result {
+                            Some(x) => Ok(x.to()?),
+                            None => Err(anyhow!("Paylaod empty"))
+                        }
                         // let result: ActExitValue<T> = serde_json::from_slice(&y.result.unwrap().data)?;
                         // match result {
                         // ActExitValue::Normal(x) => Ok(x),
@@ -230,7 +233,7 @@ impl WorkflowFunction {
             "workflow_id" = workflow_id.clone(),
         );
         let handle = (self.wf_func)(WfContext {
-            namespace,
+            _namespace: namespace,
             task_queue,
             client,
             args: Arc::new(args),

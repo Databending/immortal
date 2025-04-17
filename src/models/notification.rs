@@ -4,7 +4,6 @@ use futures::future::FutureExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::any::Any;
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::{collections::HashMap, future::Future, sync::Arc};
@@ -93,7 +92,7 @@ impl NotificationFunction {
         let handle = (self.notification_func)(
             NotificationContext {
                 app_data,
-                cancellation_token: CancellationToken::new(),
+                //cancellation_token: CancellationToken::new(),
                 input: vec![],
                 header_fields: HashMap::new(),
                 info: NotificationInfo::default(),
@@ -119,21 +118,27 @@ where
 {
     fn into_notification_fn(self) -> BoxNotificationFn {
         let wrapper = move |ctx: NotificationContext, input: Payload| {
-            self(ctx, serde_json::from_slice(&input.data).unwrap())
-                .map(|r| {
-                    r.and_then(|r| {
-                        Ok(r)
-                        // let exit_val: CallExitValue<O> = r.into();
-                        // match exit_val {
-                        //     // ActExitValue::WillCompleteAsync => Ok(ActExitValue::WillCompleteAsync),
-                        //     CallExitValue::Normal(x) => match serde_json::to_value(x) {
-                        //         Ok(v) => Ok(CallExitValue::Normal(v)),
-                        //         Err(e) => Err(CallError::NonRetryable(e.into())),
-                        //     },
-                        // }
-                    })
-                })
-                .boxed()
+            let result = serde_json::from_slice(&input.data);
+
+            let fut = match result {
+                Ok(deserialized) => {
+                    // Call the inner function with the deserialized input
+                    self(ctx, deserialized)
+                        .map(|r| {
+                            r.and_then(|r| {
+                                Ok(r)
+                                // Additional logic can go here
+                            })
+                        })
+                        .boxed()
+                }
+                Err(e) => {
+                    // Handle deserialization failure by returning a NonRetryable error
+                    async move { Err(anyhow::anyhow!(e)) }.boxed()
+                }
+            };
+
+            fut
             // Some minor gymnastics are required to avoid needing to clone the function
             // match A::from_json_payload(&input) {
             //     Ok(deser) => ,
@@ -143,16 +148,16 @@ where
         Arc::new(wrapper)
     }
 }
-
-fn downcast_owned<T: Send + Sync + 'static>(boxed: Box<dyn Any + Send + Sync>) -> Option<T> {
-    boxed.downcast().ok().map(|boxed| *boxed)
-}
+//
+//fn downcast_owned<T: Send + Sync + 'static>(boxed: Box<dyn Any + Send + Sync>) -> Option<T> {
+//    boxed.downcast().ok().map(|boxed| *boxed)
+//}
 
 #[derive(Clone)]
 pub struct NotificationContext {
     // worker: Arc<dyn Worker>,
     app_data: Arc<AppData>,
-    cancellation_token: CancellationToken,
+    //cancellation_token: CancellationToken,
     input: Vec<Value>,
     // heartbeat_details: Vec<Value>,
     header_fields: HashMap<String, Value>,
@@ -193,7 +198,7 @@ pub struct NotificationInfo {
 // }
 
 #[derive(Clone)]
-struct Start {
+pub struct Start {
     // The namespace the workflow lives in
     pub namespace: String,
     // The workflow's type name or function identifier
@@ -222,10 +227,10 @@ struct Start {
 impl NotificationContext {
     /// Construct new Activity Context, returning the context and the first argument to the activity
     /// (which may be a default [Payload]).
-    pub(crate) fn new(
+    pub(crate) fn _new(
         // worker: Arc<dyn Worker>,
         app_data: Arc<AppData>,
-        cancellation_token: CancellationToken,
+        _cancellation_token: CancellationToken,
         task_queue: String,
         task_token: Vec<u8>,
         task: Start,
@@ -244,7 +249,7 @@ impl NotificationContext {
             NotificationContext {
                 // worker,
                 app_data,
-                cancellation_token,
+                //cancellation_token,
                 input,
                 header_fields,
                 info: NotificationInfo {

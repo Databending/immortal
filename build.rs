@@ -7,7 +7,7 @@ fn main() {
         .extern_path(".google.protobuf.Duration", "::prost_wkt_types::Duration")
         .extern_path(".google.protobuf.Value", "::prost_wkt_types::Value")
         .build_server(true)
-        .compile(
+        .compile_protos(
             &[
 
                 "proto/common/message.proto",

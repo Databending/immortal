@@ -1,9 +1,6 @@
 use crate::ImmortalService;
 use axum::{extract::State, response::IntoResponse, Json};
-use immortal::{
-    immortal::RequestStartActivityOptionsV1,
-    models::{history, ActivitySchema, WfSchema},
-};
+use immortal::models::{ActivitySchema, WfSchema};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -19,7 +16,7 @@ struct Worker {
     max_workflow_capacity: i32,
 }
 
-struct StrippedActivityQueue(HashMap<String, Vec<(String, RequestStartActivityOptionsV1)>>);
+//struct StrippedActivityQueue(HashMap<String, Vec<(String, RequestStartActivityOptionsV1)>>);
 
 pub async fn get_history(
     State(state): State<ImmortalService>,

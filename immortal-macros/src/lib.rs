@@ -84,7 +84,6 @@ pub fn wf(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // input.sig.ident = Ident::new(&format!("{}_wf", input.sig.ident), input.sig.ident.span());
 
     let out = extract_generic_from_return_type(fn_output);
-    println!("ty: {:#?}", quote! {#out});
     // println!("fn_name: {:#?}", fn_output);
     // match fn_output {
     //     ReturnType::Type(_, ty) => {
@@ -153,7 +152,6 @@ pub fn wf(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
-    println!("{}", expanded.to_string());
 
     TokenStream::from(expanded)
 }

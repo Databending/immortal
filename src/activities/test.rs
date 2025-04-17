@@ -20,10 +20,10 @@ pub struct ActivityOutput {
     pub data: String,
 }
 
-pub async fn hs_tariff_sync(ctx: ActContext, _payload: Uuid) -> Result<ActivityOutput, ActivityError> {
+pub async fn hs_tariff_sync(_ctx: ActContext, _payload: Uuid) -> Result<ActivityOutput, ActivityError> {
     
 
-    for x in 0..10 {
+    for _x in 0..10 {
         tokio::time::sleep(Duration::from_secs(1)).await;
         info!("Hello from the test activity!");
     }
