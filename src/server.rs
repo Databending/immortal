@@ -1668,7 +1668,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     immortal_service.history.sync_workflow_index().await?;
     tokio::spawn(service_status(health_reporter.clone()));
-    console_subscriber::init();
+    //console_subscriber::init();
 
     {
         let cors = CorsLayer::very_permissive();
