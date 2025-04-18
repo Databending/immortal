@@ -60,13 +60,13 @@ pub async fn get_workers(
     Json(registered_workers)
 }
 
-pub async fn get_workflow_queue(
-    State(state): State<ImmortalService>,
-    // this argument tells axum to parse the request body
-    // as JSON into a `CreateUser` type
-) -> impl IntoResponse {
-    Json(state.workflow_queue.lock().await.clone())
-}
+//pub async fn get_workflow_queue(
+//    State(state): State<ImmortalService>,
+//    // this argument tells axum to parse the request body
+//    // as JSON into a `CreateUser` type
+//) -> impl IntoResponse {
+//    Json(state.workflow_queue.lock().await.clone())
+//}
 
 pub async fn get_activity_queue(
     State(state): State<ImmortalService>,

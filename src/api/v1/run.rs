@@ -12,7 +12,7 @@ pub async fn run(
 ) -> impl IntoResponse {
     println!("Received request to start a workflow: {:?}", workflow_options);
     state
-        .start_workflow_internal(workflow_options)
+        .start_workflow_internal(workflow_options, None)
         .await
         .unwrap();
 

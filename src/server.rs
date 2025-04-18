@@ -1,5 +1,4 @@
 // easy break: run and didn't instantly die
-
 use chrono::DateTime;
 use chrono::Duration;
 use chrono::NaiveDateTime;
@@ -58,6 +57,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::watch;
 use tokio::sync::{broadcast, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
@@ -129,6 +129,40 @@ pub enum WorkflowStatus {
     Running,
     Completed,
     Failed,
+}
+
+#[derive(Debug, Clone)]
+struct CallQueue(
+    Arc<
+        Mutex<
+            HashMap<
+                String,
+                VecDeque<(
+                    String,
+                    CallOptions,
+                    tokio::sync::broadcast::Sender<CallResultV1>,
+                )>,
+            >,
+        >,
+    >,
+);
+
+impl CallQueue {
+    async fn get_queue(
+        &self,
+    ) -> tokio::sync::MutexGuard<
+        '_,
+        HashMap<
+            String,
+            VecDeque<(
+                String,
+                CallOptions,
+                tokio::sync::broadcast::Sender<CallResultV1>,
+            )>,
+        >,
+    > {
+        self.0.lock().await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -208,9 +242,19 @@ pub struct ImmortalService {
             >,
         >,
     >,
-
     workflow_notify: Arc<Notify>,
-    workflow_queue: Arc<Mutex<HashMap<String, VecDeque<(String, ClientStartWorkflowOptionsV1)>>>>,
+    workflow_queue: Arc<
+        Mutex<
+            HashMap<
+                String,
+                VecDeque<(
+                    String,
+                    ClientStartWorkflowOptionsV1,
+                    Option<watch::Sender<i32>>,
+                )>,
+            >,
+        >,
+    >,
     activity_queue: Arc<
         Mutex<
             HashMap<
@@ -367,15 +411,28 @@ impl ImmortalService {
 
                     // Try to assign one call from this queue
                     for (_index, (call_id, call_options, sender)) in queue.into_iter().enumerate() {
+                        //println!("executing {call_id}");
                         // Find eligible workers
+
+                        if sender.receiver_count() == 0 {
+                            let mut call_queues = call_queue.lock().await;
+                            if let Some(queue_vec) = call_queues.get_mut(&queue_name) {
+                                if let Some(pos) =
+                                    queue_vec.iter().position(|(id, _, _)| *id == call_id)
+                                {
+                                    queue_vec.remove(pos);
+                                }
+                                if queue_vec.is_empty() {
+                                    call_queues.remove(&queue_name);
+                                }
+                            }
+                        }
 
                         let available_workers: Vec<_>;
 
                         {
-                            println!("waiting to acquire workers");
                             let mut workers_guard = workers.write().await;
 
-                            println!(" workers acquired");
                             available_workers = workers_guard
                                 .iter_mut()
                                 .filter(|(_, worker)| worker.task_queue == call_options.task_queue)
@@ -391,7 +448,6 @@ impl ImmortalService {
                             rand::thread_rng().gen_range(0..available_workers.len());
 
                         if let Some(worker) = available_workers.get(chosen_worker_index) {
-                            println!("sending to worker");
                             // Dispatch call to worker
                             if let Err(e) = worker
                                 .1
@@ -413,10 +469,8 @@ impl ImmortalService {
                             {
                                 eprintln!("Failed to send call to worker {}: {:?}", worker.0, e);
                             } else {
-                                println!("finished sending to worker");
                                 // Remove the item from the actual call queue (not the snapshot)
                                 {
-                                    println!("waiting to acquire queue lock");
                                     let mut call_queues = call_queue.lock().await;
                                     if let Some(queue_vec) = call_queues.get_mut(&queue_name) {
                                         if let Some(pos) =
@@ -432,7 +486,6 @@ impl ImmortalService {
 
                                 // Register running call
                                 {
-                                    println!("waiting to acquire running_calls lock");
                                     let mut running_calls = running_calls.write().await;
                                     let now = Utc::now().naive_utc();
                                     let timeout = now + Duration::seconds(30);
@@ -521,6 +574,24 @@ impl ImmortalService {
                                 ),
                             );
 
+                            let mut activity_history = ActivityHistory::new(
+                                activity_options.activity_type.clone(),
+                                activity_options.activity_id.clone(),
+                            );
+                            activity_history
+                                .runs
+                                .push(ActivityRun::new("0".to_string()));
+
+                            if let Err(e) = history
+                                .add_activity(
+                                    &activity_options.workflow_id,
+                                    activity_history.clone(),
+                                )
+                                .await
+                            {
+                                error!("Failed to add activity to history: {:?}", e);
+                            }
+                            println!("added activity history");
                             if let Err(e) = worker
                                 .1
                                 .send(Ok(ImmortalWorkerActionVersion {
@@ -560,24 +631,6 @@ impl ImmortalService {
                             )
                             .await;
 
-                            let mut activity_history = ActivityHistory::new(
-                                activity_options.activity_type.clone(),
-                                activity_options.activity_id.clone(),
-                            );
-                            activity_history
-                                .runs
-                                .push(ActivityRun::new("0".to_string()));
-
-                            if let Err(e) = history
-                                .add_activity(
-                                    &activity_options.workflow_id,
-                                    activity_history.clone(),
-                                )
-                                .await
-                            {
-                                eprintln!("Failed to add activity to history: {:?}", e);
-                            }
-
                             if let Err(e) = notification_tx.send(Notification::ActivityRunStarted(
                                 Uuid::parse_str(&activity_options.workflow_id).unwrap_or_default(),
                                 activity_history,
@@ -606,7 +659,10 @@ impl ImmortalService {
                 notify.notified().await;
 
                 // Snapshot and convert the queue structure
-                let queues_snapshot: HashMap<String, Vec<(String, StartWorkflowOptionsV1)>> = {
+                let queues_snapshot: HashMap<
+                    String,
+                    Vec<(String, StartWorkflowOptionsV1, Option<watch::Sender<i32>>)>,
+                > = {
                     let queue_guard = workflow_queue.lock().await;
                     queue_guard
                         .iter()
@@ -614,7 +670,7 @@ impl ImmortalService {
                         .map(|(queue_name, items)| {
                             let converted_items = items
                                 .iter()
-                                .map(|(id, client_opts)| {
+                                .map(|(id, client_opts, sender)| {
                                     (
                                         id.clone(),
                                         StartWorkflowOptionsV1 {
@@ -625,6 +681,7 @@ impl ImmortalService {
                                             task_queue: client_opts.task_queue.clone(),
                                             input: client_opts.input.clone(),
                                         },
+                                        sender.clone(),
                                     )
                                 })
                                 .collect::<Vec<_>>();
@@ -637,8 +694,12 @@ impl ImmortalService {
                     if queue.is_empty() {
                         continue;
                     }
+                    println!(
+                        "QUEUE: {:?}",
+                        queue.iter().map(|f| f.0.clone()).collect::<Vec<_>>()
+                    );
 
-                    for (workflow_id, workflow_options) in queue {
+                    for (workflow_id, workflow_options, sender) in queue {
                         let available_workers: Vec<_>;
                         {
                             let mut workers_guard = workers.write().await;
@@ -667,13 +728,19 @@ impl ImmortalService {
                                 let mut queue_guard = workflow_queue.lock().await;
                                 if let Some(vec) = queue_guard.get_mut(&queue_name) {
                                     if let Some(pos) =
-                                        vec.iter().position(|(id, _)| *id == workflow_id)
+                                        vec.iter().position(|(id, _, _)| *id == workflow_id)
                                     {
                                         vec.remove(pos);
                                     }
                                     if vec.is_empty() {
                                         queue_guard.remove(&queue_name);
                                     }
+                                }
+                            }
+                            if let Some(tx) = sender {
+                                if tx.receiver_count() == 0 {
+                                    println!("DROPPING WORKFLOW AS RECEVIER NO LONG EXISTS");
+                                    continue;
                                 }
                             }
 
@@ -739,10 +806,11 @@ impl ImmortalService {
                                 eprintln!("Failed to send workflow notification: {:?}", e);
                             }
 
-                            break;
+                            //break;
                         }
                     }
                 }
+                println!("DONE");
             }
         });
     }
@@ -750,6 +818,7 @@ impl ImmortalService {
     pub async fn start_workflow_internal(
         &self,
         workflow_options: ClientStartWorkflowOptionsVersion,
+        sender: Option<watch::Sender<i32>>,
     ) -> Result<String, Status> {
         println!("starting workflow");
         Ok(match workflow_options.version {
@@ -758,17 +827,15 @@ impl ImmortalService {
                     .workflow_id
                     .clone()
                     .unwrap_or(Uuid::new_v4().to_string());
-                println!("waiting for queue lock");
                 let mut wq = self.workflow_queue.lock().await;
 
-                println!("obtained queue lock");
                 match wq.get_mut(&workflow_options.task_queue) {
                     Some(queue) => {
-                        queue.push_back((workflow_id.clone(), workflow_options.clone()));
+                        queue.push_back((workflow_id.clone(), workflow_options.clone(), sender));
                     }
                     None => {
                         let mut queue = VecDeque::new();
-                        queue.push_back((workflow_id.clone(), workflow_options.clone()));
+                        queue.push_back((workflow_id.clone(), workflow_options.clone(), sender));
                         wq.insert(workflow_options.task_queue.clone(), queue);
                     }
                 }
@@ -863,7 +930,6 @@ impl Immortal for ImmortalService {
                             .map(|(_, worker)| worker)
                             .collect::<Vec<_>>();
                         for worker in workers_to_notify {
-                            println!("sending tx to worker");
                             if let Err(e) = worker
                                 .tx
                                 .send(Ok(ImmortalWorkerActionVersion {
@@ -883,7 +949,6 @@ impl Immortal for ImmortalService {
                             {
                                 eprintln!("Failed to send workflow notification: {:?}", e);
                             }
-                            println!("finished sending to worker")
                         }
                     }
                 }
@@ -1106,23 +1171,25 @@ impl Immortal for ImmortalService {
     ) -> Result<Response<WorkflowResultVersion>, Status> {
         let workflow_options = request.into_inner();
         let mut rx = self.notification_rx.resubscribe();
-        let workflow_id =
-            Uuid::parse_str(&self.start_workflow_internal(workflow_options).await?)
-                .map_err(|e| tonic::Status::invalid_argument(format!("Invalid UUID: {}", e)))?;
+        let (tx, _rx) = watch::channel::<i32>(0);
+        let workflow_id = Uuid::parse_str(
+            &self
+                .start_workflow_internal(workflow_options, Some(tx))
+                .await?,
+        )
+        .map_err(|e| tonic::Status::invalid_argument(format!("Invalid UUID: {}", e)))?;
         println!("executed workflow {workflow_id}");
         loop {
             match &rx.recv().await {
-                Ok(x) => {
-                    println!("workflow completed");
-                    match x {
-                        Notification::WorkflowResult(id, result) => {
-                            if *id == workflow_id {
-                                return Ok(Response::new(result.clone()));
-                            }
+                Ok(x) => match x {
+                    Notification::WorkflowResult(id, result) => {
+                        if *id == workflow_id {
+                            println!("workflow completed");
+                            return Ok(Response::new(result.clone()));
                         }
-                        _ => {}
                     }
-                }
+                    _ => {}
+                },
                 Err(_) => {}
             }
         }
@@ -1132,7 +1199,7 @@ impl Immortal for ImmortalService {
         request: Request<ClientStartWorkflowOptionsVersion>,
     ) -> Result<Response<ClientStartWorkflowResponse>, Status> {
         let workflow_options = request.into_inner();
-        let workflow_id = self.start_workflow_internal(workflow_options).await?;
+        let workflow_id = self.start_workflow_internal(workflow_options, None).await?;
 
         println!("started workflow: {workflow_id}");
         Ok(Response::new(ClientStartWorkflowResponse { workflow_id }))
@@ -1142,7 +1209,6 @@ impl Immortal for ImmortalService {
         request: Request<ActivityResultVersion>,
     ) -> Result<Response<()>, Status> {
         let activity_version = request.into_inner();
-
         match activity_version.version {
             Some(activity_result_version::Version::V1(activity_result)) => {
                 // Remove the activity from the running map
@@ -1170,6 +1236,8 @@ impl Immortal for ImmortalService {
                     error!("Worker {} not found", worker_id);
                 }
 
+                println!("workflow_id {:?}", activity_result.workflow_id);
+                println!("activity_id {:?}", activity_result.activity_id);
                 // Fetch and update activity history
                 let activity_opt = self
                     .history

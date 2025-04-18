@@ -14,8 +14,8 @@ use serde_json::Value;
 
 #[derive(Debug, Clone)]
 pub struct History(pub Vec<WorkflowHistory>, Pool<RedisConnectionManager>);
-const BASE_REDIS_KEY: &str = "immortal::history";
-const WORKFLOW_BASE_REDIS_KEY: &str = formatcp!("{}::workflow", BASE_REDIS_KEY);
+const BASE_REDIS_KEY: &str = "immortal:history";
+const WORKFLOW_BASE_REDIS_KEY: &str = formatcp!("{}:workflow", BASE_REDIS_KEY);
 impl History {
     pub fn new(pool: &Pool<RedisConnectionManager>) -> Self {
         Self(Vec::new(), pool.clone())
@@ -31,7 +31,7 @@ impl History {
     pub async fn sync_workflow_index(&self) -> Result<()> {
         let mut con = self.get_con().await?;
         let currently_logged_workflows: Vec<String> = con
-            .keys(format!("{WORKFLOW_BASE_REDIS_KEY}::*").as_str())
+            .keys(format!("{WORKFLOW_BASE_REDIS_KEY}:*").as_str())
             .await?;
         let mut offset = 0;
         let limit = 100;
@@ -39,7 +39,7 @@ impl History {
         loop {
             let workflows_in_index: Vec<String> = con
                 .lrange(
-                    format!("{WORKFLOW_BASE_REDIS_KEY}::workflow_index"),
+                    format!("{WORKFLOW_BASE_REDIS_KEY}:workflow_index"),
                     (offset).try_into().unwrap(),
                     (offset + limit).try_into().unwrap(),
                 )
@@ -48,10 +48,10 @@ impl History {
                 break;
             }
             for workflow_index in &workflows_in_index {
-                if !currently_logged_workflows.contains(&format!("{WORKFLOW_BASE_REDIS_KEY}::{workflow_index}")) {
+                if !currently_logged_workflows.contains(&format!("{WORKFLOW_BASE_REDIS_KEY}:{workflow_index}")) {
                     let _: () = con
                         .ltrim(
-                            format!("{WORKFLOW_BASE_REDIS_KEY}::workflow_index"),
+                            format!("{WORKFLOW_BASE_REDIS_KEY}:workflow_index"),
                             0,
                             offset,
                         )
@@ -67,13 +67,13 @@ impl History {
 
     pub async fn add_workflow(&self, workflow: WorkflowHistory) -> Result<()> {
         let mut con = self.get_con().await?;
-        let key = format!("{WORKFLOW_BASE_REDIS_KEY}::{}", workflow.workflow_id);
+        let key = format!("{WORKFLOW_BASE_REDIS_KEY}:{}", workflow.workflow_id);
         if con.exists(&key).await? {
             return Err(anyhow!("Workflow already exists"));
         }
         let _: () = con
             .lpush(
-                format!("{WORKFLOW_BASE_REDIS_KEY}::workflow_index"),
+                format!("{WORKFLOW_BASE_REDIS_KEY}:workflow_index"),
                 workflow.workflow_id.clone(),
             )
             .await?;
@@ -84,7 +84,7 @@ impl History {
     }
     pub async fn get_workflow(&self, workflow_id: &str) -> Result<Option<WorkflowHistory>> {
         let mut con = self.get_con().await?;
-        let key = format!("{WORKFLOW_BASE_REDIS_KEY}::{}", workflow_id);
+        let key = format!("{WORKFLOW_BASE_REDIS_KEY}:{}", workflow_id);
         let wv: Option<WorkflowHistoryVersion> = con.get(key).await?;
         Ok(wv.map(|wv| match wv {
             WorkflowHistoryVersion::V1(w) => w,
@@ -105,7 +105,7 @@ impl History {
         // second thought, probably to allow for pagination. I need to create a sync mechanism
         let keys2: Vec<String> = con
             .lrange(
-                format!("{WORKFLOW_BASE_REDIS_KEY}::workflow_index"),
+                format!("{WORKFLOW_BASE_REDIS_KEY}:workflow_index"),
                 (-1 - (offset + limit)).try_into().unwrap(),
                 (-1 - offset).try_into().unwrap(),
             )
@@ -114,7 +114,7 @@ impl History {
             .mget(
                 keys2
                     .iter()
-                    .map(|f| format!("{WORKFLOW_BASE_REDIS_KEY}::{f}"))
+                    .map(|f| format!("{WORKFLOW_BASE_REDIS_KEY}:{f}"))
                     .collect_vec(),
             )
             .await?;
@@ -133,7 +133,7 @@ impl History {
         workflow: WorkflowHistory,
     ) -> Result<()> {
         let mut con = self.get_con().await?;
-        let key = format!("{WORKFLOW_BASE_REDIS_KEY}::{}", workflow_id);
+        let key = format!("{WORKFLOW_BASE_REDIS_KEY}:{}", workflow_id);
         let _: () = con
             .set_ex(key, WorkflowHistoryVersion::V1(workflow), 259200)
             .await?;
@@ -160,7 +160,7 @@ impl History {
     }
     pub async fn add_activity(&self, workflow_id: &str, activity: ActivityHistory) -> Result<()> {
         let mut con = self.get_con().await?;
-        let key = format!("{WORKFLOW_BASE_REDIS_KEY}::{}", workflow_id);
+        let key = format!("{WORKFLOW_BASE_REDIS_KEY}:{}", workflow_id);
         let mut workflow = self
             .get_workflow(workflow_id)
             .await?
@@ -177,7 +177,7 @@ impl History {
         activity: ActivityHistory,
     ) -> Result<()> {
         let mut con = self.get_con().await?;
-        let key = format!("{WORKFLOW_BASE_REDIS_KEY}::{}", workflow_id);
+        let key = format!("{WORKFLOW_BASE_REDIS_KEY}:{}", workflow_id);
         let mut workflow = self
             .get_workflow(workflow_id)
             .await?
