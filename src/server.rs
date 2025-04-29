@@ -431,10 +431,10 @@ impl ImmortalService {
                         let available_workers: Vec<_>;
 
                         {
-                            let mut workers_guard = workers.write().await;
+                            let workers_guard = workers.read().await;
 
                             available_workers = workers_guard
-                                .iter_mut()
+                                .iter()
                                 .filter(|(_, worker)| worker.task_queue == call_options.task_queue)
                                 .map(|(_, worker)| (worker.worker_id.clone(), worker.tx.clone()))
                                 .collect();
@@ -467,7 +467,9 @@ impl ImmortalService {
                                 }))
                                 .await
                             {
-                                eprintln!("Failed to send call to worker {}: {:?}", worker.0, e);
+                                notify.notify_one();
+                                eprintln!("Failed to send call to worker {}: {:#?}", worker.0, e.0);
+                                println!("{:#?}", available_workers);
                             } else {
                                 // Remove the item from the actual call queue (not the snapshot)
                                 {
@@ -506,8 +508,9 @@ impl ImmortalService {
                             }
 
                             //break; // Assign one call per loop per queue
+                        } else {
+                            println!("no available workers");
                         }
-                        println!("no available workers");
                     }
                 }
                 println!("finished running loop");
@@ -531,10 +534,10 @@ impl ImmortalService {
                     if let Some((activity_run_id, activity_options, tx)) = queue.pop_front() {
                         let available_workers: Vec<_>;
                         {
-                            let mut workers_guard = workers.write().await;
+                            let workers_guard = workers.read().await;
 
                             available_workers = workers_guard
-                                .iter_mut()
+                                .iter()
                                 .filter(|(_, worker)| {
                                     worker.task_queue == *queue_name
                                         && worker
@@ -702,9 +705,9 @@ impl ImmortalService {
                     for (workflow_id, workflow_options, sender) in queue {
                         let available_workers: Vec<_>;
                         {
-                            let mut workers_guard = workers.write().await;
+                            let workers_guard = workers.read().await;
                             available_workers = workers_guard
-                                .iter_mut()
+                                .iter()
                                 .filter(|(_, worker)| {
                                     worker.task_queue == queue_name
                                         && worker
@@ -1155,6 +1158,7 @@ impl Immortal for ImmortalService {
             }
 
             {
+                
                 let mut workers = workers.write().await;
                 workers.remove(&worker_id);
             }
