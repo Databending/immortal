@@ -15,10 +15,14 @@ macro_rules! register_workflow {
     };
 }
 
+use anyhow::anyhow;
 use common::{Payload, Payloads};
 use immortal::{
-    immortal_client::ImmortalClient, CallResultV1, CallV1, CallVersion, ClientStartWorkflowOptionsV1, ClientStartWorkflowOptionsVersion, ClientStartWorkflowResponse, NotifyV1, NotifyVersion, WorkflowResultV1
+    call_result_v1, immortal_client::ImmortalClient, CallV1, CallVersion,
+    ClientStartWorkflowOptionsV1, ClientStartWorkflowOptionsVersion, ClientStartWorkflowResponse,
+    NotifyV1, NotifyVersion, WorkflowResultV1,
 };
+use serde::de::DeserializeOwned;
 use tonic::transport::Channel;
 
 #[derive(Clone)]
@@ -69,7 +73,7 @@ impl Client {
     //        .start_activity(RequestStartActivityOptionsVersion {
     //            version: Some(
     //                immortal::request_start_activity_options_version::Version::V1(
-    //                    immortal::RequestStartActivityOptionsV1 { 
+    //                    immortal::RequestStartActivityOptionsV1 {
     //                        activity_type: activity_type.to_string(),
     //                        input,
     //                        task_queue: task_queue.to_string(),
@@ -106,12 +110,12 @@ impl Client {
         Ok(result.into_inner())
     }
 
-    pub async fn call_v1(
+    pub async fn call_v1<O: DeserializeOwned>(
         &mut self,
         input: Option<Payload>,
         call_type: &str,
         task_queue: &str,
-    ) -> Result<CallResultV1, tonic::Status> {
+    ) -> anyhow::Result<Option<O>> {
         let result = self
             .inner
             .call(CallVersion {
@@ -124,9 +128,21 @@ impl Client {
                 })),
             })
             .await?;
-        Ok(match result.into_inner().version.unwrap() {
-            immortal::call_result_version::Version::V1(v1) => v1,
-        })
+        match result.into_inner().version.unwrap() {
+            immortal::call_result_version::Version::V1(v1) => match v1.status {
+                Some(x) => match x {
+                    call_result_v1::Status::Completed(x) => if let Some(result) = x.result {
+                       
+                        Ok(Some(result.to()?))
+                    } else {
+                        Ok(None)
+                    },
+                    call_result_v1::Status::Failed(x) => Err(anyhow!("{:#?}", x)),
+                    call_result_v1::Status::Cancelled(x) => Err(anyhow!("{:#?}", x)),
+                },
+                None => Err(anyhow!("Call returned empty status")),
+            },
+        }
     }
 
     pub async fn notify_v1(

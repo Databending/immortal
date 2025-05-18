@@ -3,6 +3,7 @@ use async_stream::stream;
 use schemars::schema::RootSchema;
 use schemars::schema_for;
 use serde_json::{json, Value};
+use tokio::sync::broadcast::error::RecvError;
 use std::fmt::{Debug, Write};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::broadcast::Receiver;
@@ -15,8 +16,8 @@ use tonic::transport::Channel;
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id};
 use tracing::{Event, Subscriber};
-use tracing_subscriber::{EnvFilter, Registry};
 use tracing_subscriber::{layer::Context, layer::SubscriberExt, Layer};
+use tracing_subscriber::{EnvFilter, Registry};
 use uuid::Uuid;
 
 use crate::common::{Payload, Payloads};
@@ -423,17 +424,22 @@ impl Worker {
                     }
                     ))
                 };
-                while let y = rx.recv().await {
+                loop {
+                    let y = rx.recv().await;
                     match y {
                         Ok(y) => {
                             yield ImmortalServerActionVersion {
                                 version: Some(immortal_server_action_version::Version::V1(y))
                             }
                         },
-                        Err(e) => println!("Error: {:?}", e)
+                        Err(e) => {
+                            match e {
+                                RecvError::Closed => break,
+                                _ => println!("Error: {:?}", e)
 
+                            }
+                        }
                     }
-
                 }
                 println!("worker Stream ended");
             })
@@ -1182,47 +1188,112 @@ impl Worker {
         safe_app_data: &Arc<AppData>,
     ) {
         let registered_calls = Arc::clone(&self.registered_calls);
+        let registered_activities = Arc::clone(&self.registered_activities);
         let call_type = call_type.to_string();
 
         let sender = self.call_sender.clone();
         let mut act2 = registered_calls.lock().await;
-        let act = act2.get_mut(&call_type).unwrap();
+        if let Some(act) = act2.get_mut(&call_type) {
+            let cid = call_id.to_string();
+            let crid = call_run_id.to_string();
 
-        let cid = call_id.to_string();
-        let crid = call_run_id.to_string();
+            let act_handle = act.0.start_call(
+                payload,
+                safe_app_data.clone(),
+                call_type.to_string(),
+                call_id.to_string(),
+            );
 
-        let act_handle = act.0.start_call(
-            payload,
-            safe_app_data.clone(),
-            call_type.to_string(),
-            call_id.to_string(),
-        );
-
-        let handle = tokio::spawn(async move {
-            let res = tokio::spawn(act_handle);
-            match res.await {
-                Ok(res) => {
-                    if let Err(e) = sender.send((cid.to_string(), crid.to_string(), res)) {
-                        eprintln!("error sending to sender: {}", e.to_string())
+            let handle = tokio::spawn(async move {
+                let res = tokio::spawn(act_handle);
+                match res.await {
+                    Ok(res) => {
+                        if let Err(e) = sender.send((cid.to_string(), crid.to_string(), res)) {
+                            eprintln!("error sending to sender: {}", e.to_string())
+                        }
+                    }
+                    Err(e) => {
+                        if let Err(e) =
+                            sender.send((cid, crid, Err(CallError::NonRetryable(e.into()))))
+                        {
+                            eprintln!("error sending to sender: {}", e.to_string())
+                        }
                     }
                 }
-                Err(e) => {
-                    if let Err(e) = sender.send((cid, crid, Err(CallError::NonRetryable(e.into()))))
-                    {
-                        eprintln!("error sending to sender: {}", e.to_string())
+            });
+            let running_workflow = RunningCall {
+                call_id: call_id.to_string(),
+                call_run_id: call_run_id.to_string(),
+                join_handle: handle,
+            };
+            self.running_calls
+                .lock()
+                .await
+                .insert(call_id.to_string(), running_workflow);
+        } else {
+            let mut act2 = registered_activities.lock().await;
+            let act = act2.get_mut(&call_type).unwrap();
+            let cid = call_id.to_string();
+            let crid = call_run_id.to_string();
+
+            let act_handle = act.0.start_activity(
+                payload,
+                safe_app_data.clone(),
+                call_type.to_string(),
+                Uuid::new_v4().to_string(),
+                call_id.to_string(),
+                "0".to_string(),
+            );
+
+            let handle = tokio::spawn(async move {
+                let res = tokio::spawn(act_handle);
+                match res.await {
+                    Ok(res) => {
+                        if let Err(e) = sender.send((
+                            cid.to_string(),
+                            crid.to_string(),
+                            match res {
+                                Ok(x) => Ok(match x {
+                                    ActExitValue::Normal(y) => CallExitValue::Normal(y)
+                                }),
+                                Err(e) => Err(match e {
+                                    ActivityError::Retryable {
+                                        source,
+                                        explicit_delay,
+                                    } => CallError::Retryable {
+                                        source,
+                                        explicit_delay,
+                                    },
+                                    ActivityError::Cancelled { details } => {
+                                        CallError::Cancelled { details }
+                                    }
+                                    ActivityError::NonRetryable(e) => CallError::NonRetryable(e),
+                                }),
+                            },
+                        )) {
+                            eprintln!("error sending to sender: {}", e.to_string())
+                        }
+                    }
+                    Err(e) => {
+                        if let Err(e) =
+                            sender.send((cid, crid, Err(CallError::NonRetryable(e.into()))))
+                        {
+                            eprintln!("error sending to sender: {}", e.to_string())
+                        }
                     }
                 }
-            }
-        });
-        let running_workflow = RunningCall {
-            call_id: call_id.to_string(),
-            call_run_id: call_run_id.to_string(),
-            join_handle: handle,
-        };
-        self.running_calls
-            .lock()
-            .await
-            .insert(call_id.to_string(), running_workflow);
+            });
+            let running_workflow = RunningCall {
+                call_id: call_id.to_string(),
+                call_run_id: call_run_id.to_string(),
+                join_handle: handle,
+            };
+            self.running_calls
+                .lock()
+                .await
+                .insert(call_id.to_string(), running_workflow);
+        }
+
         // self.app_data = Some(
         //     Arc::try_unwrap(safe_app_data)
         //         .map_err(|_| anyhow!("some references of AppData exist on worker shutdown"))

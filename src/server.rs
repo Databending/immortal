@@ -47,7 +47,7 @@ use immortal::{
 };
 use regex::Regex;
 use serde_json::Value;
-use socketioxide::extract::{AckSender, Bin, State};
+use socketioxide::extract::{AckSender, State};
 use socketioxide::socket::DisconnectReason;
 use socketioxide::{
     extract::{Data, SocketRef},
@@ -1545,7 +1545,7 @@ impl Immortal for ImmortalService {
     }
 }
 
-async fn service_status(mut reporter: HealthReporter) {
+async fn service_status(reporter: HealthReporter) {
     reporter
         .set_serving::<ImmortalServer<ImmortalService>>()
         .await;
@@ -1571,17 +1571,17 @@ async fn on_connect(
 
     socket.on(
         "message",
-        |socket: SocketRef, Data::<Value>(data), Bin(bin)| {
-            info!("Received event: {:?} {:?}", data, bin);
-            socket.bin(bin).emit("message-back", data).ok();
+        |socket: SocketRef, Data::<Value>(data)| {
+            info!("Received event: {:?}", data);
+            socket.emit("message-back", &data).ok();
         },
     );
 
     socket.on(
         "message-with-ack",
-        |Data::<Value>(data), ack: AckSender, Bin(bin)| {
-            info!("Received event: {:?} {:?}", data, bin);
-            ack.bin(bin).send(data).ok();
+        |Data::<Value>(data), ack: AckSender| {
+            info!("Received event: {:?}", data);
+            ack.send(&data).ok();
         },
     );
 
@@ -1590,16 +1590,16 @@ async fn on_connect(
 
         socket.on(
             "history-notifications",
-            |socket: SocketRef, Data::<Value>(data), ack: AckSender, Bin(bin)| async move {
-                info!("Received event: {:?} {:?}", data, bin);
-                ack.bin(bin).send(data).ok();
+            |socket: SocketRef, Data::<Value>(data), ack: AckSender| async move {
+                info!("Received event: {:?} ", data);
+                ack.send(&data).ok();
                 let s2 = socket.clone();
                 let mut rx = tx.clone().subscribe();
                 let handle = tokio::spawn(async move {
                     while let Ok(z) = rx.recv().await {
                         s2.emit(
                             "history-update",
-                            serde_json::to_value(z).unwrap_or(serde_json::json!({})),
+                            &serde_json::to_value(z).unwrap_or(serde_json::json!({})),
                         )
                         .ok();
                     }
@@ -1621,10 +1621,10 @@ async fn on_connect(
 
     socket.on(
         "fetch-logs",
-        |socket: SocketRef, Data::<Value>(data), ack: AckSender, Bin(bin)| {
-            info!("Received event: {:?} {:?}", data, bin);
+        |socket: SocketRef, Data::<Value>(data), ack: AckSender| {
+            info!("Received event: {:?}", data);
             let log_id: String = serde_json::from_value(data.clone()).unwrap();
-            ack.bin(bin);
+            ack.send(&data).ok();
             let s2 = socket.clone();
             let handle = tokio::spawn(async move {
                 let mut last_id = "0-0".to_string();
@@ -1658,7 +1658,7 @@ async fn on_connect(
                                     panic!("Weird data")
                                 }
                             }
-                            s2.emit("message-back", parsed_map).ok();
+                            s2.emit("message-back", &parsed_map).ok();
                         }
                     }
                 }
@@ -1731,9 +1731,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     immortal_service.workflow_queue_thread();
     immortal_service.activity_queue_thread();
     immortal_service.call_queue_thread();
-    //immortal_service.watchdog();
+    immortal_service.watchdog();
     let svc = ImmortalServer::new(immortal_service.clone());
-    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
         .set_serving::<ImmortalServer<ImmortalService>>()
         .await;

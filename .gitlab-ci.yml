@@ -1,12 +1,48 @@
-build_image:
-  stage: build
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+stages:
+  - build 
+  - deploy
+
+
+deploy:
+  stage: deploy 
   image:
     name: gcr.io/kaniko-project/executor:v1.19.2-debug
     entrypoint: [""]
   script:
     - |-
       if [ "$CI_COMMIT_BRANCH" = "master" ]; then
-        /kaniko/executor --context "${CI_PROJECT_DIR}" --dockerfile "${CI_PROJECT_DIR}/Dockerfile" --build-arg CI_JOB_TOKEN="${CI_JOB_TOKEN}" --build-arg GIT_TOKEN="${GIT_TOKEN}" --destination "databending/${CONTAINER_NAME}:${CI_COMMIT_TAG}"
-      else  
-        /kaniko/executor --context "${CI_PROJECT_DIR}" --dockerfile "${CI_PROJECT_DIR}/Dockerfile" --build-arg CI_JOB_TOKEN="${CI_JOB_TOKEN}" --build-arg GIT_TOKEN="${GIT_TOKEN}" --destination "databending/${CONTAINER_NAME}:dev"
+          /kaniko/executor --context "${CI_PROJECT_DIR}" --dockerfile "${CI_PROJECT_DIR}/Dockerfile" --build-arg CI_JOB_TOKEN="${CI_JOB_TOKEN}" --build-arg GIT_TOKEN="${GIT_TOKEN}" --destination "databending/${CONTAINER_NAME}:${CI_COMMIT_TAG}" --destination "databending/${CONTAINER_NAME}:latest"
+      else
+          /kaniko/executor --context "${CI_PROJECT_DIR}" --dockerfile "${CI_PROJECT_DIR}/Dockerfile" --build-arg CI_JOB_TOKEN="${CI_JOB_TOKEN}" --build-arg GIT_TOKEN="${GIT_TOKEN}" --no-push
       fi
+
+server:
+  stage: build 
+  image:
+    name: rust:slim-bookworm
+    entrypoint: [""]
+  script:
+    - apt-get update -y
+    - apt-get -y install pkg-config libssl-dev git make protobuf-compiler
+    - git config --global credential.helper store
+    - |-
+      if [ -n "$CI_JOB_TOKEN" ]; then \
+        echo "https://gitlab-ci-token:$CI_JOB_TOKEN@gitlab.databending.ca" > ~/.git-credentials; \
+      else \
+        echo "https://oauth2:$GIT_TOKEN@gitlab.databending.ca" > ~/.git-credentials; \
+      fi
+    - rustup default nightly
+    - cargo +nightly build --release
+  cache:
+    key: $CI_COMMIT_REF_SLUG
+    paths:
+      - target/release/*
+  artifacts:
+    paths:
+      - target/release/server
+    expire_in: 1 day
+

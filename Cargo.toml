@@ -6,43 +6,43 @@ edition = "2021"
 
 
 [dependencies]
-tonic = "0.12"
+tonic = "0.13"
 prost = "0.13"
-tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tokio-stream = {version = "0.1",features=["sync"]}
 prost-wkt = "0.6"
 prost-wkt-types = "0.6"
-async-stream = "0.2"
+async-stream = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-rand = "0.8"
-anyhow = "1.0.88"
-thiserror = "1.0.63"
-futures = "0.3.30"
-tokio-util = "0.7.12"
-tracing = "0.1.40"
-tracing-subscriber = {version = "0.3.18", features=["env-filter"]}
-derive_builder = "0.20.1"
-tonic-health = "0.12.2"
-uuid = { version = "1.10.0", features = ["v4", "serde"] }
-prost-types = "0.13.2"
-axum = "0.7.5"
-socketioxide = { version = "0.14.1", features = ["state"] }
-tower-http = { version = "0.6.0", features = ["cors"] }
-bb8-redis = "0.17.0"
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "streams", "aio"] }
-chrono = {version = "0.4.38", features=["serde"]}
-schemars = {version = "0.8.21", features=["uuid1"]}
+rand = "0.9"
+anyhow = "1.0.98"
+thiserror = "2.0.12"
+futures = "0.3.31"
+tokio-util = "0.7.15"
+tracing = "0.1.41"
+tracing-subscriber = {version = "0.3.19", features=["env-filter"]}
+derive_builder = "0.20.2"
+tonic-health = "0.13.0"
+uuid = { version = "1.16.0", features = ["v4", "serde"] }
+prost-types = "0.13.5"
+axum = "0.8.4"
+socketioxide = { version = "0.16.2", features = ["state"] }
+tower-http = { version = "0.6.2", features = ["cors"] }
+bb8-redis = "0.22.0"
+redis = { version = "0.30", default-features = false, features = ["tokio-comp", "streams", "aio"] }
+chrono = {version = "0.4.41", features=["serde"]}
+schemars = {version = "0.8.22", features=["uuid1"]}
 immortal-macros = { path = "immortal-macros" }
-itertools = "0.13.0"
+itertools = "0.14.0"
 paste = "1.0.15"
-const_format = "0.2.33"
-tower = "0.5.1"
+const_format = "0.2.34"
+tower = "0.5.2"
 regex = "1.11.1"
 dotenvy = "0.15.7"
 console-subscriber = "0.4.1"
 [build-dependencies]
-tonic-build = "0.12"
+tonic-build = "0.13"
 prost-wkt-build = "0.6"
 
 [[bin]]
