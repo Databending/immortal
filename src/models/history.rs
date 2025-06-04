@@ -11,6 +11,7 @@ use itertools::Itertools;
 use redis::{AsyncCommands, ErrorKind, FromRedisValue, RedisError, RedisWrite, ToRedisArgs};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing_subscriber::filter;
 
 #[derive(Debug, Clone)]
 pub struct History(pub Vec<WorkflowHistory>, Pool<RedisConnectionManager>);
@@ -48,7 +49,9 @@ impl History {
                 break;
             }
             for workflow_index in &workflows_in_index {
-                if !currently_logged_workflows.contains(&format!("{WORKFLOW_BASE_REDIS_KEY}:{workflow_index}")) {
+                if !currently_logged_workflows
+                    .contains(&format!("{WORKFLOW_BASE_REDIS_KEY}:{workflow_index}"))
+                {
                     let _: () = con
                         .ltrim(
                             format!("{WORKFLOW_BASE_REDIS_KEY}:workflow_index"),
@@ -94,6 +97,8 @@ impl History {
         &self,
         limit: Option<usize>,
         offset: Option<usize>,
+        task_queue: Option<String>,
+        worker_id: Option<String>,
     ) -> Result<Vec<WorkflowHistoryVersion>> {
         let limit = limit.unwrap_or(10) as isize;
         let offset = offset.unwrap_or(0) as isize;
@@ -118,11 +123,39 @@ impl History {
                     .collect_vec(),
             )
             .await?;
-        let workflows = workflows
+        let mut workflows: Vec<_> = workflows
             .into_iter()
             .filter(|f| f.is_some())
             .map(|x| serde_json::from_str(&x.unwrap()).unwrap())
             .collect();
+        // .filter(|f| match f {
+        //     WorkflowHistoryVersion::V1(v1) => v1.work
+        //
+        // })
+        // .collect();
+
+        if let Some(task_queue) = task_queue {
+            workflows = workflows
+                .iter()
+                .filter(|f| match &f {
+                    WorkflowHistoryVersion::V1(v1) => {
+                        v1.task_queue.clone().map(|f| *f == task_queue).is_some()
+                    }
+                })
+                .map(|x| x.clone())
+                .collect();
+        }
+        if let Some(worker_id) = worker_id{
+            workflows = workflows
+                .iter()
+                .filter(|f| match &f {
+                    WorkflowHistoryVersion::V1(v1) => {
+                        v1.worker_id.clone().map(|f| *f == worker_id).is_some()
+                    }
+                })
+                .map(|x| x.clone())
+                .collect();
+        }
 
         Ok(workflows)
     }
@@ -134,6 +167,7 @@ impl History {
     ) -> Result<()> {
         let mut con = self.get_con().await?;
         let key = format!("{WORKFLOW_BASE_REDIS_KEY}:{}", workflow_id);
+        println!("setting workflow_history :{:#?}", workflow);
         let _: () = con
             .set_ex(key, WorkflowHistoryVersion::V1(workflow), 259200)
             .await?;
@@ -188,7 +222,7 @@ impl History {
             .find(|a| a.activity_id == activity.activity_id)
             .ok_or(anyhow!("Activity does not exist"))?;
         *previous_activity = activity;
-
+        println!("setting: {:#?}", workflow);
         let _: () = con
             .set_ex(key, WorkflowHistoryVersion::V1(workflow), 259200)
             .await?;
@@ -256,11 +290,19 @@ pub struct WorkflowHistory {
     pub activities: Vec<ActivityHistory>,
     pub start_time: NaiveDateTime,
     pub end_time: Option<NaiveDateTime>,
+    pub task_queue: Option<String>,
+    pub worker_id: Option<String>,
     // pub status: Status,
 }
 
 impl WorkflowHistory {
-    pub fn new(workflow_type: String, workflow_id: String, args: Vec<Value>) -> Self {
+    pub fn new(
+        workflow_type: String,
+        workflow_id: String,
+        args: Vec<Value>,
+        task_queue: String,
+        worker_id: String,
+    ) -> Self {
         Self {
             args,
             workflow_type,
@@ -269,6 +311,8 @@ impl WorkflowHistory {
             activities: Vec::new(),
             start_time: chrono::Utc::now().naive_utc(),
             end_time: None,
+            task_queue: Some(task_queue),
+            worker_id: Some(worker_id),
         }
     }
 }

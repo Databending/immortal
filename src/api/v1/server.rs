@@ -1,7 +1,7 @@
 use crate::ImmortalService;
-use axum::{extract::State, response::IntoResponse, Json};
+use axum::{extract::{Query, State}, response::IntoResponse, Json};
 use immortal::models::{ActivitySchema, WfSchema};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -18,12 +18,23 @@ struct Worker {
 
 //struct StrippedActivityQueue(HashMap<String, Vec<(String, RequestStartActivityOptionsV1)>>);
 
+#[derive(Deserialize)]
+pub struct HistoryFilter {
+    worker_id: Option<String>,
+    task_queue: Option<String>,
+}
 pub async fn get_history(
     State(state): State<ImmortalService>,
+
+    Query(params): Query<HistoryFilter>
     // this argument tells axum to parse the request body
     // as JSON into a `CreateUser` type
 ) -> impl IntoResponse {
-    match state.history.get_workflows(Some(100), None).await {
+    match state
+        .history
+        .get_workflows(Some(100), None, params.task_queue, params.worker_id)
+        .await
+    {
         Ok(history) => Json(history),
         Err(e) => {
             println!("{:#?}", e);

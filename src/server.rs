@@ -761,6 +761,8 @@ impl ImmortalService {
                                             .collect()
                                     })
                                     .unwrap_or_default(),
+                                    queue_name.clone(),
+                                    worker.0.clone()
                             );
 
                             if let Err(e) = history.add_workflow(workflow_history.clone()).await {
@@ -818,12 +820,61 @@ impl ImmortalService {
         });
     }
 
+    pub async fn start_activity_internal(
+        &self,
+        call_options: CallVersion,
+    ) -> anyhow::Result<CallResultVersion> {
+        match call_options.version {
+            Some(call_version::Version::V1(call)) => {
+                let (tx, mut rx) = broadcast::channel::<CallResultV1>(100);
+
+                {
+                    let mut queue = self.call_queue.lock().await;
+                    match queue.get_mut(&call.call_type) {
+                        Some(queue) => {
+                            queue.push_back((
+                                Uuid::new_v4().to_string(),
+                                CallOptions {
+                                    call_type: call.call_type.clone(),
+                                    input: call.input.clone(),
+                                    task_queue: call.task_queue.clone(),
+                                },
+                                tx,
+                            ));
+                        }
+                        None => {
+                            let mut queue2 = VecDeque::new();
+                            queue2.push_back((
+                                Uuid::new_v4().to_string(),
+                                CallOptions {
+                                    call_type: call.call_type.clone(),
+                                    input: call.input.clone(),
+                                    task_queue: call.task_queue.clone(),
+                                },
+                                tx,
+                            ));
+                            queue.insert(call.call_type.clone(), queue2);
+                        }
+                    }
+                }
+
+                self.call_notify.notify_one();
+                match rx.recv().await {
+                    Ok(payload) => Ok(CallResultVersion {
+                        version: Some(call_result_version::Version::V1(payload)),
+                    }),
+                    Err(_) => Err(anyhow::anyhow!("Call failed")),
+                }
+            }
+            _ => Err(anyhow::anyhow!("unsupported version")),
+        }
+    }
+
     pub async fn start_workflow_internal(
         &self,
         workflow_options: ClientStartWorkflowOptionsVersion,
         sender: Option<watch::Sender<i32>>,
     ) -> Result<String, Status> {
-        println!("starting workflow");
         Ok(match workflow_options.version {
             Some(client_start_workflow_options_version::Version::V1(workflow_options)) => {
                 let workflow_id = workflow_options
@@ -869,56 +920,54 @@ impl Immortal for ImmortalService {
         &self,
         request: Request<CallVersion>,
     ) -> Result<Response<CallResultVersion>, Status> {
-        {
-            match request.into_inner().version {
-                Some(call_version::Version::V1(call)) => {
-                    let (tx, mut rx) = broadcast::channel::<CallResultV1>(100);
+        match request.into_inner().version {
+            Some(call_version::Version::V1(call)) => {
+                let (tx, mut rx) = broadcast::channel::<CallResultV1>(100);
 
-                    {
-                        let mut queue = self.call_queue.lock().await;
-                        match queue.get_mut(&call.call_type) {
-                            Some(queue) => {
-                                queue.push_back((
-                                    Uuid::new_v4().to_string(),
-                                    CallOptions {
-                                        call_type: call.call_type.clone(),
-                                        input: call.input.clone(),
-                                        task_queue: call.task_queue.clone(),
-                                    },
-                                    tx,
-                                ));
-                            }
-                            None => {
-                                let mut queue2 = VecDeque::new();
-                                queue2.push_back((
-                                    Uuid::new_v4().to_string(),
-                                    CallOptions {
-                                        call_type: call.call_type.clone(),
-                                        input: call.input.clone(),
-                                        task_queue: call.task_queue.clone(),
-                                    },
-                                    tx,
-                                ));
-                                queue.insert(call.call_type.clone(), queue2);
-                            }
+                {
+                    let mut queue = self.call_queue.lock().await;
+                    match queue.get_mut(&call.call_type) {
+                        Some(queue) => {
+                            queue.push_back((
+                                Uuid::new_v4().to_string(),
+                                CallOptions {
+                                    call_type: call.call_type.clone(),
+                                    input: call.input.clone(),
+                                    task_queue: call.task_queue.clone(),
+                                },
+                                tx,
+                            ));
+                        }
+                        None => {
+                            let mut queue2 = VecDeque::new();
+                            queue2.push_back((
+                                Uuid::new_v4().to_string(),
+                                CallOptions {
+                                    call_type: call.call_type.clone(),
+                                    input: call.input.clone(),
+                                    task_queue: call.task_queue.clone(),
+                                },
+                                tx,
+                            ));
+                            queue.insert(call.call_type.clone(), queue2);
                         }
                     }
-
-                    self.call_notify.notify_one();
-                    // queue.get_mut(&call.call_type).unwrap().push_back((
-                    //     Uuid::new_v4().to_string(),
-                    //     call.clone(),
-                    //     tx,
-                    // ));
-                    match rx.recv().await {
-                        Ok(payload) => Ok(Response::new(CallResultVersion {
-                            version: Some(call_result_version::Version::V1(payload)),
-                        })),
-                        Err(_) => Err(Status::internal("Call failed")),
-                    }
                 }
-                _ => Err(Status::internal("unsupported version")),
+
+                self.call_notify.notify_one();
+                // queue.get_mut(&call.call_type).unwrap().push_back((
+                //     Uuid::new_v4().to_string(),
+                //     call.clone(),
+                //     tx,
+                // ));
+                match rx.recv().await {
+                    Ok(payload) => Ok(Response::new(CallResultVersion {
+                        version: Some(call_result_version::Version::V1(payload)),
+                    })),
+                    Err(_) => Err(Status::internal("Call failed")),
+                }
             }
+            _ => Err(Status::internal("unsupported version")),
         }
     }
     async fn notify(&self, request: Request<NotifyVersion>) -> Result<Response<()>, Status> {
@@ -1158,7 +1207,6 @@ impl Immortal for ImmortalService {
             }
 
             {
-                
                 let mut workers = workers.write().await;
                 workers.remove(&worker_id);
             }
@@ -1226,20 +1274,6 @@ impl Immortal for ImmortalService {
                     None => return Err(Status::not_found("Activity not found")),
                 };
 
-                // Update the worker's activity capacity
-                let mut workers = self.workers.write().await;
-                if let Some(worker) = workers.get_mut(&worker_id) {
-                    if worker.activity_capacity < worker.max_activity_capacity {
-                        worker.activity_capacity += 1;
-                    }
-
-                    if let Err(e) = tx.send(activity_result.clone()) {
-                        error!("Failed to send activity result: {:?}", e);
-                    }
-                } else {
-                    error!("Worker {} not found", worker_id);
-                }
-
                 println!("workflow_id {:?}", activity_result.workflow_id);
                 println!("activity_id {:?}", activity_result.activity_id);
                 // Fetch and update activity history
@@ -1277,7 +1311,7 @@ impl Immortal for ImmortalService {
 
                 run.end_time = Some(chrono::Utc::now().naive_utc());
 
-                match activity_result.status {
+                match activity_result.status.clone() {
                     Some(immortal::activity_result_v1::Status::Completed(x)) => {
                         match x.result {
                             Some(result_data) => match serde_json::from_slice(&result_data.data) {
@@ -1341,8 +1375,24 @@ impl Immortal for ImmortalService {
                     .update_activity(&activity_result.workflow_id, activity)
                     .await
                 {
+                    println!("error");
                     error!("Failed to update activity history: {:?}", e);
                     return Err(Status::internal("Failed to update activity history"));
+                }
+
+                // Update the worker's activity capacity
+                let mut workers = self.workers.write().await;
+                //this is the root of my problems
+                if let Some(worker) = workers.get_mut(&worker_id) {
+                    if worker.activity_capacity < worker.max_activity_capacity {
+                        worker.activity_capacity += 1;
+                    }
+
+                    if let Err(e) = tx.send(activity_result) {
+                        error!("Failed to send activity result: {:?}", e);
+                    }
+                } else {
+                    error!("Worker {} not found", worker_id);
                 }
             }
 
@@ -1392,6 +1442,8 @@ impl Immortal for ImmortalService {
             return Err(Status::invalid_argument("Missing workflow result version"));
         };
 
+        // give it a time to let activities sync with redis
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         // Fetch workflow history
         let workflow_opt = self
             .history
@@ -1416,6 +1468,7 @@ impl Immortal for ImmortalService {
         // Update end time
         workflow.end_time = Some(chrono::Utc::now().naive_utc());
 
+        println!("{:#?}", workflow);
         // Notify workflow result
         match Uuid::parse_str(&workflow_result.workflow_id) {
             Ok(uuid) => {
@@ -1569,21 +1622,15 @@ async fn on_connect(
     //     .await
     //     .unwrap();
 
-    socket.on(
-        "message",
-        |socket: SocketRef, Data::<Value>(data)| {
-            info!("Received event: {:?}", data);
-            socket.emit("message-back", &data).ok();
-        },
-    );
+    socket.on("message", |socket: SocketRef, Data::<Value>(data)| {
+        info!("Received event: {:?}", data);
+        socket.emit("message-back", &data).ok();
+    });
 
-    socket.on(
-        "message-with-ack",
-        |Data::<Value>(data), ack: AckSender| {
-            info!("Received event: {:?}", data);
-            ack.send(&data).ok();
-        },
-    );
+    socket.on("message-with-ack", |Data::<Value>(data), ack: AckSender| {
+        info!("Received event: {:?}", data);
+        ack.send(&data).ok();
+    });
 
     {
         let tx = notification_tx.clone();
