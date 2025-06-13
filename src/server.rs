@@ -557,7 +557,7 @@ impl ImmortalService {
 
                         if let Some(worker) = available_workers.get(random_index) {
                             let now = Utc::now().naive_utc();
-                            let duration = Duration::seconds(5);
+                            let duration = Duration::seconds(30);
                             let timeout = now + duration;
 
                             running_activities.write().await.insert(

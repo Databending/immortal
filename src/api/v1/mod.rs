@@ -9,7 +9,7 @@ pub mod server;
 
 pub fn router() -> Router<ImmortalService> {
     Router::new()
-        .route("/run", post(run::run))
+        .route("/run/workflow", post(run::run_workflow))
         .route("/run/activity", post(run::run_activity))
         .route("/history", get(server::get_history))
         .route("/workers", get(server::get_workers))

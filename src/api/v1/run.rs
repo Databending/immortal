@@ -3,7 +3,7 @@ use immortal::immortal::CallVersion;
 
 use crate::{immortal::ClientStartWorkflowOptionsVersion, ImmortalService};
 
-pub async fn run(
+pub async fn run_workflow(
     State(state): State<ImmortalService>,
     // this argument tells axum to parse the request body
     // as JSON into a `CreateUser` type
