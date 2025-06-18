@@ -397,6 +397,7 @@ service Immortal {
 
   rpc Notify(NotifyVersion) returns (google.protobuf.Empty) {}
   rpc Call(CallVersion) returns (CallResultVersion) {}
+  rpc CallAsync(CallVersion) returns (google.protobuf.Empty) {}
 }
 
 service ImmortalServerless {

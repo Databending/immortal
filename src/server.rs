@@ -761,8 +761,8 @@ impl ImmortalService {
                                             .collect()
                                     })
                                     .unwrap_or_default(),
-                                    queue_name.clone(),
-                                    worker.0.clone()
+                                queue_name.clone(),
+                                worker.0.clone(),
                             );
 
                             if let Err(e) = history.add_workflow(workflow_history.clone()).await {
@@ -916,6 +916,62 @@ fn matches_any(patterns: &[String], input: &str) -> bool {
 #[tonic::async_trait]
 impl Immortal for ImmortalService {
     type RegisterWorkerStream = ReceiverStream<Result<ImmortalWorkerActionVersion, Status>>;
+
+    async fn call_async(
+        &self,
+        request: Request<CallVersion>,
+    ) -> Result<Response<()>, Status> {
+        match request.into_inner().version {
+            Some(call_version::Version::V1(call)) => {
+                let (tx, _) = broadcast::channel::<CallResultV1>(100);
+
+                {
+                    let mut queue = self.call_queue.lock().await;
+                    match queue.get_mut(&call.call_type) {
+                        Some(queue) => {
+                            queue.push_back((
+                                Uuid::new_v4().to_string(),
+                                CallOptions {
+                                    call_type: call.call_type.clone(),
+                                    input: call.input.clone(),
+                                    task_queue: call.task_queue.clone(),
+                                },
+                                tx,
+                            ));
+                        }
+                        None => {
+                            let mut queue2 = VecDeque::new();
+                            queue2.push_back((
+                                Uuid::new_v4().to_string(),
+                                CallOptions {
+                                    call_type: call.call_type.clone(),
+                                    input: call.input.clone(),
+                                    task_queue: call.task_queue.clone(),
+                                },
+                                tx,
+                            ));
+                            queue.insert(call.call_type.clone(), queue2);
+                        }
+                    }
+                }
+
+                self.call_notify.notify_one();
+                Ok(Response::new(()))
+                // queue.get_mut(&call.call_type).unwrap().push_back((
+                //     Uuid::new_v4().to_string(),
+                //     call.clone(),
+                //     tx,
+                // ));
+                // match rx.recv().await {
+                //     Ok(payload) => Ok(Response::new(CallResultVersion {
+                //         version: Some(call_result_version::Version::V1(payload)),
+                //     })),
+                //     Err(_) => Err(Status::internal("Call failed")),
+                // }
+            }
+            _ => Err(Status::internal("unsupported version")),
+        }
+    }
     async fn call(
         &self,
         request: Request<CallVersion>,
@@ -1108,6 +1164,7 @@ impl Immortal for ImmortalService {
         let (tx, rx) = mpsc::channel(100);
         let worker_id;
         {
+            // sometimes immortal freezes here, not sure why
             println!("waiting to receive workers write handle");
             let mut workers = self.workers.write().await;
 

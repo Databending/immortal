@@ -110,6 +110,27 @@ impl Client {
         Ok(result.into_inner())
     }
 
+    pub async fn call_async_v1(
+        &mut self,
+        input: Option<Payload>,
+        call_type: &str,
+        task_queue: &str,
+    ) -> anyhow::Result<()> {
+        self
+            .inner
+            .call_async(CallVersion {
+                version: Some(immortal::call_version::Version::V1(CallV1 {
+                    input,
+                    call_type: call_type.to_string(),
+                    call_version: "V1".to_string(),
+                    task_queue: task_queue.to_string(),
+                    ..Default::default()
+                })),
+            })
+            .await?;
+        Ok(())
+    }
+
     pub async fn call_v1<O: DeserializeOwned>(
         &mut self,
         input: Option<Payload>,
@@ -131,12 +152,13 @@ impl Client {
         match result.into_inner().version.unwrap() {
             immortal::call_result_version::Version::V1(v1) => match v1.status {
                 Some(x) => match x {
-                    call_result_v1::Status::Completed(x) => if let Some(result) = x.result {
-                       
-                        Ok(Some(result.to()?))
-                    } else {
-                        Ok(None)
-                    },
+                    call_result_v1::Status::Completed(x) => {
+                        if let Some(result) = x.result {
+                            Ok(Some(result.to()?))
+                        } else {
+                            Ok(None)
+                        }
+                    }
                     call_result_v1::Status::Failed(x) => Err(anyhow!("{:#?}", x)),
                     call_result_v1::Status::Cancelled(x) => Err(anyhow!("{:#?}", x)),
                 },
