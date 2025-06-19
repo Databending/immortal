@@ -209,7 +209,7 @@ pub struct ImmortalService {
             HashMap<
                 String,
                 (
-                    tokio::sync::broadcast::Sender<CallResultV1>,
+                    Option<tokio::sync::broadcast::Sender<CallResultV1>>,
                     _RunningProperties<CallProperties>,
                 ),
             >,
@@ -237,7 +237,7 @@ pub struct ImmortalService {
                 VecDeque<(
                     String,
                     CallOptions,
-                    tokio::sync::broadcast::Sender<CallResultV1>,
+                    Option<tokio::sync::broadcast::Sender<CallResultV1>>,
                 )>,
             >,
         >,
@@ -414,16 +414,18 @@ impl ImmortalService {
                         //println!("executing {call_id}");
                         // Find eligible workers
 
-                        if sender.receiver_count() == 0 {
-                            let mut call_queues = call_queue.lock().await;
-                            if let Some(queue_vec) = call_queues.get_mut(&queue_name) {
-                                if let Some(pos) =
-                                    queue_vec.iter().position(|(id, _, _)| *id == call_id)
-                                {
-                                    queue_vec.remove(pos);
-                                }
-                                if queue_vec.is_empty() {
-                                    call_queues.remove(&queue_name);
+                        if let Some(sender) = &sender {
+                            if sender.receiver_count() == 0 {
+                                let mut call_queues = call_queue.lock().await;
+                                if let Some(queue_vec) = call_queues.get_mut(&queue_name) {
+                                    if let Some(pos) =
+                                        queue_vec.iter().position(|(id, _, _)| *id == call_id)
+                                    {
+                                        queue_vec.remove(pos);
+                                    }
+                                    if queue_vec.is_empty() {
+                                        call_queues.remove(&queue_name);
+                                    }
                                 }
                             }
                         }
@@ -839,7 +841,7 @@ impl ImmortalService {
                                     input: call.input.clone(),
                                     task_queue: call.task_queue.clone(),
                                 },
-                                tx,
+                                Some(tx),
                             ));
                         }
                         None => {
@@ -851,7 +853,7 @@ impl ImmortalService {
                                     input: call.input.clone(),
                                     task_queue: call.task_queue.clone(),
                                 },
-                                tx,
+                                Some(tx),
                             ));
                             queue.insert(call.call_type.clone(), queue2);
                         }
@@ -917,13 +919,10 @@ fn matches_any(patterns: &[String], input: &str) -> bool {
 impl Immortal for ImmortalService {
     type RegisterWorkerStream = ReceiverStream<Result<ImmortalWorkerActionVersion, Status>>;
 
-    async fn call_async(
-        &self,
-        request: Request<CallVersion>,
-    ) -> Result<Response<()>, Status> {
+    async fn call_async(&self, request: Request<CallVersion>) -> Result<Response<()>, Status> {
         match request.into_inner().version {
             Some(call_version::Version::V1(call)) => {
-                let (tx, _) = broadcast::channel::<CallResultV1>(100);
+                // let (tx, _) = broadcast::channel::<CallResultV1>(100);
 
                 {
                     let mut queue = self.call_queue.lock().await;
@@ -936,7 +935,7 @@ impl Immortal for ImmortalService {
                                     input: call.input.clone(),
                                     task_queue: call.task_queue.clone(),
                                 },
-                                tx,
+                                None,
                             ));
                         }
                         None => {
@@ -948,7 +947,7 @@ impl Immortal for ImmortalService {
                                     input: call.input.clone(),
                                     task_queue: call.task_queue.clone(),
                                 },
-                                tx,
+                                None,
                             ));
                             queue.insert(call.call_type.clone(), queue2);
                         }
@@ -991,7 +990,7 @@ impl Immortal for ImmortalService {
                                     input: call.input.clone(),
                                     task_queue: call.task_queue.clone(),
                                 },
-                                tx,
+                                Some(tx),
                             ));
                         }
                         None => {
@@ -1003,7 +1002,7 @@ impl Immortal for ImmortalService {
                                     input: call.input.clone(),
                                     task_queue: call.task_queue.clone(),
                                 },
-                                tx,
+                                Some(tx),
                             ));
                             queue.insert(call.call_type.clone(), queue2);
                         }
@@ -1471,11 +1470,13 @@ impl Immortal for ImmortalService {
                 // let tx = running_activities.get(&activity_result.activity_id).unwrap();
                 match running_calls.remove(&call_result.call_id) {
                     Some(tx) => {
-                        // need to watch out for this as it can increase past max
+                        if let Some(tx) = tx.0 {
+                            // need to watch out for this as it can increase past max
 
-                        match tx.0.send(call_result.clone()) {
-                            Ok(_) => {}
-                            Err(e) => println!("{:#?}", e),
+                            match tx.send(call_result.clone()) {
+                                Ok(_) => {}
+                                Err(e) => println!("{:#?}", e),
+                            }
                         }
                     }
                     None => {
