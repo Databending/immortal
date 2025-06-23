@@ -23,7 +23,9 @@ in Rust with minimal boilerplate.
 <!-- tocstop -->
 
 ## Goals
-
+- Be as lightweight as possible. Temporal is great, however, for a production environment, it requires a fully featured database and a decent amount of memory to run. Immortal, on the other hand, requires about 10MiB to run + redis db. 
+- Allow for one-off rpc calls. Instead of tracking every single workflow and having full durability for every single action, Immortal allows for one-off rpc calls as you would normally do with a rpc/grpc server. However the benefit with this is that it is fully dynamic and doesn't require for you to know the grpc server's address, function name & parameters during build time. You can just connect to the Immortal server and call a task-queue + activity-name during runtime.
+- Typesafety/documentation. As every function requires the JsonSchema trait. Workers allow full visibility of their inputs and outputs, allowing for them to be consumed during runtime and displayed nicely in a UI.
 - Provide a Rust-native workflow orchestration system with familiar concepts: workflows,
   activities, signals, and queries.
 - Offer gRPC and HTTP/REST endpoints for server interaction, plus real-time notifications
@@ -31,6 +33,11 @@ in Rust with minimal boilerplate.
 - Minimize boilerplate with procedural macros (`#[wf]`) and auto-generated schemas for
   workflow signatures.
 - Ensure reliability and scalability through Redis-backed task queues and health checks.
+
+## ToDo
+- Hardden & make production ready. Includes writing tests.
+- Add serverless support (allow for serverless workers)
+- Allow for easy scaling (multi-node support)
 
 ## Features
 
