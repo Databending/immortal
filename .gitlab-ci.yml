@@ -37,7 +37,7 @@ server:
       fi
     - rustup default nightly
     - RUSTFLAGS="--cfg tokio_unstable"  cargo +nightly build --release
-    - cargo install --locked tokio-console --root /usr/local
+    - cargo install --locked tokio-console --root ./ 
   cache:
     key: $CI_COMMIT_REF_SLUG
     paths:
@@ -45,7 +45,7 @@ server:
   artifacts:
     paths:
       - target/release/server
-      - /usr/local/bin/tokio-console 
+      - bin/tokio-console 
     expire_in: 1 day
 
 
