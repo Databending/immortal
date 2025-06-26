@@ -66,7 +66,7 @@ use tonic_health::server::HealthReporter;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
-use tracing_subscriber::FmtSubscriber;
+// use tracing_subscriber::FmtSubscriber;
 use uuid::Uuid;
 // use immortal::immortal_s
 // use immortal::im::{Server, ServerServer};
@@ -174,10 +174,10 @@ struct CallOptions {
 
 #[derive(Debug, Clone)]
 struct _RunningProperties<T> {
-    start: NaiveDateTime,
+    _start: NaiveDateTime,
     timeout: NaiveDateTime,
     // in seconds
-    max_duration: Duration,
+    _max_duration: Duration,
     worker_id: String,
     additional_properties: T,
 }
@@ -447,7 +447,7 @@ impl ImmortalService {
                         }
 
                         let chosen_worker_index =
-                            rand::thread_rng().gen_range(0..available_workers.len());
+                            rand::rng().random_range(0..available_workers.len());
 
                         if let Some(worker) = available_workers.get(chosen_worker_index) {
                             // Dispatch call to worker
@@ -498,9 +498,9 @@ impl ImmortalService {
                                         (
                                             sender,
                                             _RunningProperties {
-                                                start: now,
+                                                _start: now,
                                                 timeout,
-                                                max_duration: Duration::seconds(30),
+                                                _max_duration: Duration::seconds(30),
                                                 worker_id: worker.0.clone(),
                                                 additional_properties: CallProperties {},
                                             },
@@ -555,7 +555,7 @@ impl ImmortalService {
                             continue;
                         }
 
-                        let random_index = rand::thread_rng().gen_range(0..available_workers.len());
+                        let random_index = rand::rng().random_range(0..available_workers.len());
 
                         if let Some(worker) = available_workers.get(random_index) {
                             let now = Utc::now().naive_utc();
@@ -568,9 +568,9 @@ impl ImmortalService {
                                     worker.0.clone(),
                                     tx,
                                     _RunningProperties {
-                                        start: now,
+                                        _start: now,
                                         timeout,
-                                        max_duration: duration,
+                                        _max_duration: duration,
                                         worker_id: worker.0.clone(),
                                         additional_properties: _ActivityProperties {
                                             workflow_id: activity_options.workflow_id.clone(),
@@ -725,7 +725,7 @@ impl ImmortalService {
                             break;
                         }
 
-                        let chosen_index = rand::thread_rng().gen_range(0..available_workers.len());
+                        let chosen_index = rand::rng().random_range(0..available_workers.len());
 
                         if let Some(worker) = available_workers.get(chosen_index) {
                             // Remove the item from the actual queue
@@ -1254,7 +1254,7 @@ impl Immortal for ImmortalService {
                 };
                 match tx.send(Ok(action)).await {
                     Ok(_) => {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                     }
                     Err(_) => {
                         break;
@@ -1800,7 +1800,7 @@ async fn on_connect(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
-    tracing::subscriber::set_global_default(FmtSubscriber::default())?;
+    // tracing::subscriber::set_global_default(FmtSubscriber::default())?;
     let addr = "0.0.0.0:10000".parse().unwrap();
 
     let redis_username = std::env::var("REDIS_USERNAME").unwrap_or("".to_string());
@@ -1845,8 +1845,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     immortal_service.history.sync_workflow_index().await?;
     tokio::spawn(service_status(health_reporter.clone()));
-    //console_subscriber::init();
-
+    console_subscriber::ConsoleLayer::builder()
+        // set how long the console will retain data from completed tasks
+        // set the address the server is bound to
+        .server_addr(([0, 0, 0, 0], 6669))
+        // ... other configurations ...
+        .init();
     {
         let cors = CorsLayer::very_permissive();
 

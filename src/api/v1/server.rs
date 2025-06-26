@@ -1,6 +1,13 @@
 use crate::ImmortalService;
-use axum::{extract::{Query, State}, response::IntoResponse, Json};
-use immortal::models::{ActivitySchema, WfSchema};
+use axum::{
+    extract::{Query, State},
+    response::IntoResponse,
+    Json,
+};
+use immortal::{
+    immortal::ClientStartWorkflowOptionsV1,
+    models::{ActivitySchema, WfSchema},
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -16,6 +23,7 @@ struct Worker {
     max_workflow_capacity: i32,
 }
 
+
 //struct StrippedActivityQueue(HashMap<String, Vec<(String, RequestStartActivityOptionsV1)>>);
 
 #[derive(Deserialize)]
@@ -26,9 +34,8 @@ pub struct HistoryFilter {
 pub async fn get_history(
     State(state): State<ImmortalService>,
 
-    Query(params): Query<HistoryFilter>
-    // this argument tells axum to parse the request body
-    // as JSON into a `CreateUser` type
+    Query(params): Query<HistoryFilter>, // this argument tells axum to parse the request body
+                                         // as JSON into a `CreateUser` type
 ) -> impl IntoResponse {
     match state
         .history
@@ -78,6 +85,54 @@ pub async fn get_workers(
 //) -> impl IntoResponse {
 //    Json(state.workflow_queue.lock().await.clone())
 //}
+//
+// pub async fn get_workflow_queue(
+//     State(state): State<ImmortalService>,
+//     // this argument tells axum to parse the request body
+//     // as JSON into a `CreateUser` type
+// ) -> impl IntoResponse {
+//     Json(
+//         state
+//             .workflow_queue
+//             .lock()
+//             .await
+//             .iter()
+//             .map(|f| {
+//                 (
+//                     f.0.clone(),
+//                     f.1.iter()
+//                         .map(|f| (f.0.clone(), f.1.clone()))
+//                         .collect::<Vec<_>>(),
+//                 )
+//             })
+//             .collect::<HashMap<_, _>>(),
+//     )
+// }
+//
+
+
+pub async fn get_workflow_queue(
+    State(state): State<ImmortalService>,
+    // this argument tells axum to parse the request body
+    // as JSON into a `CreateUser` type
+) -> impl IntoResponse {
+    Json(
+        state
+            .workflow_queue
+            .lock()
+            .await
+            .iter()
+            .map(|f| {
+                (
+                    f.0.clone(),
+                    f.1.iter()
+                        .map(|f| (f.0.clone(), f.1.clone()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<HashMap<_, _>>(),
+    )
+}
 
 pub async fn get_activity_queue(
     State(state): State<ImmortalService>,

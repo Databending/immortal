@@ -36,7 +36,8 @@ server:
         echo "https://oauth2:$GIT_TOKEN@gitlab.databending.ca" > ~/.git-credentials; \
       fi
     - rustup default nightly
-    - cargo +nightly build --release
+    - RUSTFLAGS="--cfg tokio_unstable"  cargo +nightly build --release
+    - cargo install --locked tokio-console --root /usr/local
   cache:
     key: $CI_COMMIT_REF_SLUG
     paths:
@@ -44,5 +45,7 @@ server:
   artifacts:
     paths:
       - target/release/server
+      - /usr/local/bin/tokio-console 
     expire_in: 1 day
+
 
