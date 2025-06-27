@@ -1,3 +1,8 @@
+extern crate jemallocator;
+
+#[global_allocator]
+static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 // easy break: run and didn't instantly die
 use chrono::DateTime;
 use chrono::Duration;
@@ -165,28 +170,28 @@ pub enum WorkflowStatus {
 //     }
 // }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 struct CallOptions {
     call_type: String,
     input: Option<Payload>,
     task_queue: String,
 }
 
-#[derive(Debug, Clone)]
-struct _RunningProperties<T> {
-    _start: NaiveDateTime,
+#[derive(Debug, Clone, Serialize)]
+struct RunningProperties<T> {
+    start: NaiveDateTime,
     timeout: NaiveDateTime,
     // in seconds
-    _max_duration: Duration,
+    max_duration: Duration,
     worker_id: String,
     additional_properties: T,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 struct CallProperties {}
 
-#[derive(Debug, Clone)]
-struct _ActivityProperties {
+#[derive(Debug, Clone, Serialize)]
+struct ActivityProperties {
     pub workflow_id: String,
 }
 
@@ -210,7 +215,7 @@ pub struct ImmortalService {
                 String,
                 (
                     Option<tokio::sync::broadcast::Sender<CallResultV1>>,
-                    _RunningProperties<CallProperties>,
+                    RunningProperties<CallProperties>,
                 ),
             >,
         >,
@@ -225,7 +230,7 @@ pub struct ImmortalService {
                     // worker id
                     String,
                     tokio::sync::oneshot::Sender<ActivityResultV1>,
-                    _RunningProperties<_ActivityProperties>,
+                    RunningProperties<ActivityProperties>,
                 ),
             >,
         >,
@@ -497,10 +502,10 @@ impl ImmortalService {
                                         call_id.clone(),
                                         (
                                             sender,
-                                            _RunningProperties {
-                                                _start: now,
+                                            RunningProperties {
+                                                start: now,
                                                 timeout,
-                                                _max_duration: Duration::seconds(30),
+                                                max_duration: Duration::seconds(30),
                                                 worker_id: worker.0.clone(),
                                                 additional_properties: CallProperties {},
                                             },
@@ -567,12 +572,12 @@ impl ImmortalService {
                                 (
                                     worker.0.clone(),
                                     tx,
-                                    _RunningProperties {
-                                        _start: now,
+                                    RunningProperties {
+                                        start: now,
                                         timeout,
-                                        _max_duration: duration,
+                                        max_duration: duration,
                                         worker_id: worker.0.clone(),
-                                        additional_properties: _ActivityProperties {
+                                        additional_properties: ActivityProperties {
                                             workflow_id: activity_options.workflow_id.clone(),
                                         },
                                     },

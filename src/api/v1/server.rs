@@ -4,10 +4,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use immortal::{
-    immortal::ClientStartWorkflowOptionsV1,
-    models::{ActivitySchema, WfSchema},
-};
+use immortal::models::{ActivitySchema, WfSchema};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -22,7 +19,6 @@ struct Worker {
     max_activity_capacity: i32,
     max_workflow_capacity: i32,
 }
-
 
 //struct StrippedActivityQueue(HashMap<String, Vec<(String, RequestStartActivityOptionsV1)>>);
 
@@ -110,7 +106,6 @@ pub async fn get_workers(
 // }
 //
 
-
 pub async fn get_workflow_queue(
     State(state): State<ImmortalService>,
     // this argument tells axum to parse the request body
@@ -153,6 +148,45 @@ pub async fn get_activity_queue(
                         .collect::<Vec<_>>(),
                 )
             })
+            .collect::<HashMap<_, _>>(),
+    )
+}
+
+pub async fn get_call_queue(
+    State(state): State<ImmortalService>,
+    // this argument tells axum to parse the request body
+    // as JSON into a `CreateUser` type
+) -> impl IntoResponse {
+    Json(
+        state
+            .call_queue
+            .lock()
+            .await
+            .iter()
+            .map(|f| {
+                (
+                    f.0.clone(),
+                    f.1.iter()
+                        .map(|f| (f.0.clone(), f.1.clone()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<HashMap<_, _>>(),
+    )
+}
+
+pub async fn running_calls(
+    State(state): State<ImmortalService>,
+    // this argument tells axum to parse the request body
+    // as JSON into a `CreateUser` type
+) -> impl IntoResponse {
+    Json(
+        state
+            .running_calls
+            .read()
+            .await
+            .iter()
+            .map(|f| (f.0.clone(), f.1 .1.clone()))
             .collect::<HashMap<_, _>>(),
     )
 }

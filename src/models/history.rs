@@ -11,7 +11,6 @@ use itertools::Itertools;
 use redis::{AsyncCommands, ErrorKind, FromRedisValue, RedisError, RedisWrite, ToRedisArgs};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing_subscriber::filter;
 
 #[derive(Debug, Clone)]
 pub struct History(pub Vec<WorkflowHistory>, Pool<RedisConnectionManager>);

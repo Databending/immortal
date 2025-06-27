@@ -98,7 +98,7 @@ pub async fn main(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let port = std::env::var("PORT").unwrap_or("10001".to_string());
     let addr = format!("0.0.0.0:{port}").parse().unwrap();
-    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
         .set_serving::<ImmortalServerlessServer<ImmortalServerlessService>>()
         .await;
