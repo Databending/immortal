@@ -190,3 +190,36 @@ pub async fn running_calls(
             .collect::<HashMap<_, _>>(),
     )
 }
+
+
+pub async fn running_activities(
+    State(state): State<ImmortalService>,
+    // this argument tells axum to parse the request body
+    // as JSON into a `CreateUser` type
+) -> impl IntoResponse {
+    Json(
+        state
+            .running_activities
+            .read()
+            .await
+            .iter()
+            .map(|f| (f.0.clone(), f.1.2.clone()))
+            .collect::<HashMap<_, _>>(),
+    )
+}
+//
+// pub async fn running_workflows(
+//     State(state): State<ImmortalService>,
+//     // this argument tells axum to parse the request body
+//     // as JSON into a `CreateUser` type
+// ) -> impl IntoResponse {
+//     Json(
+//         state
+//             .running_calls
+//             .read()
+//             .await
+//             .iter()
+//             .map(|f| (f.0.clone(), f.1.2.clone()))
+//             .collect::<HashMap<_, _>>(),
+//     )
+// }

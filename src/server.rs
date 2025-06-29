@@ -216,7 +216,7 @@ pub struct ImmortalService {
             HashMap<
                 String,
                 (
-                    Option<tokio::sync::broadcast::Sender<CallResultV1>>,
+                    Option<tokio::sync::mpsc::Sender<CallResultV1>>,
                     RunningProperties<CallProperties>,
                 ),
             >,
@@ -244,7 +244,7 @@ pub struct ImmortalService {
                 VecDeque<(
                     String,
                     CallOptions,
-                    Option<tokio::sync::broadcast::Sender<CallResultV1>>,
+                    Option<tokio::sync::mpsc::Sender<CallResultV1>>,
                 )>,
             >,
         >,
@@ -422,7 +422,7 @@ impl ImmortalService {
                         // Find eligible workers
 
                         if let Some(sender) = &sender {
-                            if sender.receiver_count() == 0 {
+                            if sender.is_closed()  {
                                 let mut call_queues = call_queue.lock().await;
                                 if let Some(queue_vec) = call_queues.get_mut(&queue_name) {
                                     if let Some(pos) =
@@ -835,7 +835,7 @@ impl ImmortalService {
     ) -> anyhow::Result<CallResultVersion> {
         match call_options.version {
             Some(call_version::Version::V1(call)) => {
-                let (tx, mut rx) = broadcast::channel::<CallResultV1>(100);
+                let (tx, mut rx) = mpsc::channel::<CallResultV1>(100);
 
                 {
                     let mut queue = self.call_queue.lock().await;
@@ -869,10 +869,10 @@ impl ImmortalService {
 
                 self.call_notify.notify_one();
                 match rx.recv().await {
-                    Ok(payload) => Ok(CallResultVersion {
+                    Some(payload) => Ok(CallResultVersion {
                         version: Some(call_result_version::Version::V1(payload)),
                     }),
-                    Err(_) => Err(anyhow::anyhow!("Call failed")),
+                    None => Err(anyhow::anyhow!("Call failed")),
                 }
             }
             _ => Err(anyhow::anyhow!("unsupported version")),
@@ -984,7 +984,7 @@ impl Immortal for ImmortalService {
     ) -> Result<Response<CallResultVersion>, Status> {
         match request.into_inner().version {
             Some(call_version::Version::V1(call)) => {
-                let (tx, mut rx) = broadcast::channel::<CallResultV1>(100);
+                let (tx, mut rx) = mpsc::channel::<CallResultV1>(100);
 
                 {
                     let mut queue = self.call_queue.lock().await;
@@ -1023,10 +1023,10 @@ impl Immortal for ImmortalService {
                 //     tx,
                 // ));
                 match rx.recv().await {
-                    Ok(payload) => Ok(Response::new(CallResultVersion {
+                    Some(payload) => Ok(Response::new(CallResultVersion {
                         version: Some(call_result_version::Version::V1(payload)),
                     })),
-                    Err(_) => Err(Status::internal("Call failed")),
+                    None => Err(Status::internal("Call failed")),
                 }
             }
             _ => Err(Status::internal("unsupported version")),
@@ -1480,7 +1480,7 @@ impl Immortal for ImmortalService {
                         if let Some(tx) = tx.0 {
                             // need to watch out for this as it can increase past max
 
-                            match tx.send(call_result.clone()) {
+                            match tx.send(call_result.clone()).await {
                                 Ok(_) => {}
                                 Err(e) => println!("{:#?}", e),
                             }
