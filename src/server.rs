@@ -422,7 +422,7 @@ impl ImmortalService {
                         // Find eligible workers
 
                         if let Some(sender) = &sender {
-                            if sender.is_closed()  {
+                            if sender.is_closed() {
                                 let mut call_queues = call_queue.lock().await;
                                 if let Some(queue_vec) = call_queues.get_mut(&queue_name) {
                                     if let Some(pos) =
@@ -1845,19 +1845,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     immortal_service.call_queue_thread();
     immortal_service.watchdog();
     let svc = ImmortalServer::new(immortal_service.clone());
-    let (health_reporter, health_service) = tonic_health::server::health_reporter();
-    health_reporter
-        .set_serving::<ImmortalServer<ImmortalService>>()
-        .await;
+    // let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    // health_reporter
+    //     .set_serving::<ImmortalServer<ImmortalService>>()
+    //     .await;
 
     immortal_service.history.sync_workflow_index().await?;
-    tokio::spawn(service_status(health_reporter.clone()));
-    console_subscriber::ConsoleLayer::builder()
-        // set how long the console will retain data from completed tasks
-        // set the address the server is bound to
-        .server_addr(([0, 0, 0, 0], 6669))
-        // ... other configurations ...
-        .init();
+    // tokio::spawn(service_status(health_reporter.clone()));
+    let use_tokio_console = std::env::var("ENABLE_TOKIO_CONSOLE").unwrap_or("false".to_string());
+    if use_tokio_console.as_str() == "true" {
+        console_subscriber::ConsoleLayer::builder()
+            // set how long the console will retain data from completed tasks
+            // set the address the server is bound to
+            .server_addr(([0, 0, 0, 0], 6669))
+            // ... other configurations ...
+            .init();
+    }
+
     {
         let cors = CorsLayer::very_permissive();
 
@@ -1886,7 +1890,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Server::builder()
         .add_service(svc)
-        .add_service(health_service)
+        // .add_service(health_service)
         .serve(addr)
         .await?;
 
