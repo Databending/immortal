@@ -8,7 +8,6 @@ static GLOBAL: Jemalloc = Jemalloc;
 // easy break: run and didn't instantly die
 use chrono::DateTime;
 use chrono::Duration;
-use chrono::NaiveDateTime;
 use chrono::Utc;
 // pub mod immortal {
 //     tonic::include_proto!("immortal");
@@ -69,7 +68,7 @@ use tokio::sync::{broadcast, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tonic::transport::Server;
-use tonic_health::server::HealthReporter;
+// use tonic_health::server::HealthReporter;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
@@ -181,8 +180,8 @@ struct CallOptions {
 
 #[derive(Debug, Clone, Serialize)]
 struct RunningProperties<T> {
-    start: NaiveDateTime,
-    timeout: NaiveDateTime,
+    start: DateTime<Utc>,
+    timeout: DateTime<Utc>,
     // in seconds
     max_duration: Duration,
     worker_id: String,
@@ -215,10 +214,10 @@ pub struct ImmortalService {
         RwLock<
             HashMap<
                 String,
-                (
+                Box<(
                     Option<tokio::sync::mpsc::Sender<CallResultV1>>,
                     RunningProperties<CallProperties>,
-                ),
+                )>,
             >,
         >,
     >,
@@ -228,12 +227,12 @@ pub struct ImmortalService {
         RwLock<
             HashMap<
                 String,
-                (
+                Box<(
                     // worker id
                     String,
                     tokio::sync::oneshot::Sender<ActivityResultV1>,
                     RunningProperties<ActivityProperties>,
-                ),
+                )>,
             >,
         >,
     >,
@@ -241,11 +240,13 @@ pub struct ImmortalService {
         Mutex<
             HashMap<
                 String,
-                VecDeque<(
-                    String,
-                    CallOptions,
-                    Option<tokio::sync::mpsc::Sender<CallResultV1>>,
-                )>,
+                VecDeque<
+                    Box<(
+                        String,
+                        CallOptions,
+                        Option<tokio::sync::mpsc::Sender<CallResultV1>>,
+                    )>,
+                >,
             >,
         >,
     >,
@@ -254,11 +255,13 @@ pub struct ImmortalService {
         Mutex<
             HashMap<
                 String,
-                VecDeque<(
-                    String,
-                    ClientStartWorkflowOptionsV1,
-                    Option<watch::Sender<i32>>,
-                )>,
+                VecDeque<
+                    Box<(
+                        String,
+                        ClientStartWorkflowOptionsV1,
+                        Option<watch::Sender<i32>>,
+                    )>,
+                >,
             >,
         >,
     >,
@@ -266,11 +269,13 @@ pub struct ImmortalService {
         Mutex<
             HashMap<
                 String,
-                VecDeque<(
-                    String,
-                    RequestStartActivityOptionsV1,
-                    tokio::sync::oneshot::Sender<ActivityResultV1>,
-                )>,
+                VecDeque<
+                    Box<(
+                        String,
+                        RequestStartActivityOptionsV1,
+                        tokio::sync::oneshot::Sender<ActivityResultV1>,
+                    )>,
+                >,
             >,
         >,
     >,
@@ -307,7 +312,7 @@ impl ImmortalService {
                     let mut activities_to_remove = vec![];
 
                     for (id, running_activity) in running_activities.read().await.iter() {
-                        let now = Utc::now().naive_utc();
+                        let now = Utc::now();
                         let max_time = running_activity.2.timeout;
                         if now > max_time {
                             let workers = workers.read().await;
@@ -338,9 +343,10 @@ impl ImmortalService {
                     if activities_to_remove.len() > 0 {
                         let mut running_activities = running_activities.write().await;
                         for activity_to_remove in activities_to_remove {
-                            if let Some((_worker_id, tx, props)) =
+                            if let Some(running_activity) =
                                 running_activities.remove(&activity_to_remove)
                             {
+                                let (_worker_id, tx, props) = *running_activity;
                                 if let Err(e) = tx.send(ActivityResultV1 {
                                     activity_id: activity_to_remove.clone(),
 
@@ -362,7 +368,7 @@ impl ImmortalService {
                         }
                     }
                     for (id, running_call) in running_calls.read().await.clone().iter() {
-                        let now = Utc::now().naive_utc();
+                        let now = Utc::now();
                         let max_time = running_call.1.timeout;
                         if now > max_time {
                             let workers = workers.read().await;
@@ -417,7 +423,8 @@ impl ImmortalService {
                     }
 
                     // Try to assign one call from this queue
-                    for (_index, (call_id, call_options, sender)) in queue.into_iter().enumerate() {
+                    for (_index, queued_item) in queue.into_iter().enumerate() {
+                        let (call_id, call_options, sender) = *queued_item;
                         //println!("executing {call_id}");
                         // Find eligible workers
 
@@ -426,7 +433,7 @@ impl ImmortalService {
                                 let mut call_queues = call_queue.lock().await;
                                 if let Some(queue_vec) = call_queues.get_mut(&queue_name) {
                                     if let Some(pos) =
-                                        queue_vec.iter().position(|(id, _, _)| *id == call_id)
+                                        queue_vec.iter().position(|x| (**x).0 == call_id)
                                     {
                                         queue_vec.remove(pos);
                                     }
@@ -468,7 +475,7 @@ impl ImmortalService {
                                                     call_run_id: "0".to_string(),
                                                     call_id: call_id.clone(),
                                                     call_type: call_options.call_type.clone(),
-                                                    call_input: call_options.input.clone(),
+                                                    call_input: call_options.input,
                                                 },
                                             )),
                                         },
@@ -485,7 +492,7 @@ impl ImmortalService {
                                     let mut call_queues = call_queue.lock().await;
                                     if let Some(queue_vec) = call_queues.get_mut(&queue_name) {
                                         if let Some(pos) =
-                                            queue_vec.iter().position(|(id, _, _)| *id == call_id)
+                                            queue_vec.iter().position(|x| (**x).0 == call_id)
                                         {
                                             queue_vec.remove(pos);
                                         }
@@ -498,11 +505,11 @@ impl ImmortalService {
                                 // Register running call
                                 {
                                     let mut running_calls = running_calls.write().await;
-                                    let now = Utc::now().naive_utc();
+                                    let now = Utc::now();
                                     let timeout = now + Duration::seconds(30);
                                     running_calls.insert(
                                         call_id.clone(),
-                                        (
+                                        Box::new((
                                             sender,
                                             RunningProperties {
                                                 start: now,
@@ -511,7 +518,7 @@ impl ImmortalService {
                                                 worker_id: worker.0.clone(),
                                                 additional_properties: CallProperties {},
                                             },
-                                        ),
+                                        )),
                                     );
                                 }
                             }
@@ -540,7 +547,8 @@ impl ImmortalService {
                 let mut activity_queues = activity_queue.lock().await;
 
                 for (queue_name, queue) in activity_queues.iter_mut() {
-                    if let Some((activity_run_id, activity_options, tx)) = queue.pop_front() {
+                    if let Some(queued_item) = queue.pop_front() {
+                        let (activity_run_id, activity_options, tx) = *queued_item;
                         let available_workers: Vec<_>;
                         {
                             let workers_guard = workers.read().await;
@@ -558,20 +566,20 @@ impl ImmortalService {
                         }
 
                         if available_workers.is_empty() {
-                            queue.push_front((activity_run_id, activity_options, tx));
+                            queue.push_front(Box::new((activity_run_id, activity_options, tx)));
                             continue;
                         }
 
                         let random_index = rand::rng().random_range(0..available_workers.len());
 
                         if let Some(worker) = available_workers.get(random_index) {
-                            let now = Utc::now().naive_utc();
+                            let now = Utc::now();
                             let duration = Duration::seconds(30);
                             let timeout = now + duration;
 
                             running_activities.write().await.insert(
                                 activity_options.activity_id.clone(),
-                                (
+                                Box::new((
                                     worker.0.clone(),
                                     tx,
                                     RunningProperties {
@@ -583,7 +591,7 @@ impl ImmortalService {
                                             workflow_id: activity_options.workflow_id.clone(),
                                         },
                                     },
-                                ),
+                                )),
                             );
 
                             let mut activity_history = ActivityHistory::new(
@@ -617,9 +625,7 @@ impl ImmortalService {
                                                     activity_type: activity_options
                                                         .activity_type
                                                         .clone(),
-                                                    activity_input: activity_options
-                                                        .activity_input
-                                                        .clone(),
+                                                    activity_input: activity_options.activity_input,
                                                     workflow_id: activity_options
                                                         .workflow_id
                                                         .clone(),
@@ -631,7 +637,7 @@ impl ImmortalService {
                                 }))
                                 .await
                             {
-                                eprintln!("Failed to send StartActivity to worker: {:?}", e);
+                                eprintln!("Failed to send StartActivity to worker: {:#?}", e);
                                 continue;
                             }
 
@@ -650,7 +656,7 @@ impl ImmortalService {
                                 eprintln!("Failed to send notification: {:?}", e);
                             }
                         } else {
-                            queue.push_front((activity_run_id, activity_options, tx));
+                            queue.push_front(Box::new((activity_run_id, activity_options, tx)));
                         }
                     }
                 }
@@ -682,16 +688,17 @@ impl ImmortalService {
                         .map(|(queue_name, items)| {
                             let converted_items = items
                                 .iter()
-                                .map(|(id, client_opts, sender)| {
+                                .map(|item| {
+                                    let (id, client_opts, sender) = *(item.clone());
                                     (
                                         id.clone(),
                                         StartWorkflowOptionsV1 {
                                             // this might be incorrect
-                                            workflow_id: id.clone(),
-                                            workflow_type: client_opts.workflow_type.clone(),
-                                            workflow_version: client_opts.workflow_version.clone(),
-                                            task_queue: client_opts.task_queue.clone(),
-                                            input: client_opts.input.clone(),
+                                            workflow_id: id,
+                                            workflow_type: client_opts.workflow_type,
+                                            workflow_version: client_opts.workflow_version,
+                                            task_queue: client_opts.task_queue,
+                                            input: client_opts.input,
                                         },
                                         sender.clone(),
                                     )
@@ -706,10 +713,6 @@ impl ImmortalService {
                     if queue.is_empty() {
                         continue;
                     }
-                    println!(
-                        "QUEUE: {:?}",
-                        queue.iter().map(|f| f.0.clone()).collect::<Vec<_>>()
-                    );
 
                     for (workflow_id, workflow_options, sender) in queue {
                         let available_workers: Vec<_>;
@@ -740,7 +743,7 @@ impl ImmortalService {
                                 let mut queue_guard = workflow_queue.lock().await;
                                 if let Some(vec) = queue_guard.get_mut(&queue_name) {
                                     if let Some(pos) =
-                                        vec.iter().position(|(id, _, _)| *id == workflow_id)
+                                        vec.iter().position(|x| (**x).0 == workflow_id)
                                     {
                                         vec.remove(pos);
                                     }
@@ -794,7 +797,7 @@ impl ImmortalService {
                                                         .workflow_version
                                                         .clone(),
                                                     task_queue: workflow_options.task_queue.clone(),
-                                                    input: workflow_options.input.clone(),
+                                                    input: workflow_options.input,
                                                 },
                                             )),
                                         },
@@ -841,27 +844,27 @@ impl ImmortalService {
                     let mut queue = self.call_queue.lock().await;
                     match queue.get_mut(&call.call_type) {
                         Some(queue) => {
-                            queue.push_back((
+                            queue.push_back(Box::new((
                                 Uuid::new_v4().to_string(),
                                 CallOptions {
                                     call_type: call.call_type.clone(),
-                                    input: call.input.clone(),
+                                    input: call.input,
                                     task_queue: call.task_queue.clone(),
                                 },
                                 Some(tx),
-                            ));
+                            )));
                         }
                         None => {
                             let mut queue2 = VecDeque::new();
-                            queue2.push_back((
+                            queue2.push_back(Box::new((
                                 Uuid::new_v4().to_string(),
                                 CallOptions {
                                     call_type: call.call_type.clone(),
-                                    input: call.input.clone(),
+                                    input: call.input,
                                     task_queue: call.task_queue.clone(),
                                 },
                                 Some(tx),
-                            ));
+                            )));
                             queue.insert(call.call_type.clone(), queue2);
                         }
                     }
@@ -894,11 +897,19 @@ impl ImmortalService {
 
                 match wq.get_mut(&workflow_options.task_queue) {
                     Some(queue) => {
-                        queue.push_back((workflow_id.clone(), workflow_options.clone(), sender));
+                        queue.push_back(Box::new((
+                            workflow_id.clone(),
+                            workflow_options.clone(),
+                            sender,
+                        )));
                     }
                     None => {
                         let mut queue = VecDeque::new();
-                        queue.push_back((workflow_id.clone(), workflow_options.clone(), sender));
+                        queue.push_back(Box::new((
+                            workflow_id.clone(),
+                            workflow_options.clone(),
+                            sender,
+                        )));
                         wq.insert(workflow_options.task_queue.clone(), queue);
                     }
                 }
@@ -935,27 +946,27 @@ impl Immortal for ImmortalService {
                     let mut queue = self.call_queue.lock().await;
                     match queue.get_mut(&call.call_type) {
                         Some(queue) => {
-                            queue.push_back((
+                            queue.push_back(Box::new((
                                 Uuid::new_v4().to_string(),
                                 CallOptions {
                                     call_type: call.call_type.clone(),
-                                    input: call.input.clone(),
+                                    input: call.input,
                                     task_queue: call.task_queue.clone(),
                                 },
                                 None,
-                            ));
+                            )));
                         }
                         None => {
                             let mut queue2 = VecDeque::new();
-                            queue2.push_back((
+                            queue2.push_back(Box::new((
                                 Uuid::new_v4().to_string(),
                                 CallOptions {
                                     call_type: call.call_type.clone(),
-                                    input: call.input.clone(),
+                                    input: call.input,
                                     task_queue: call.task_queue.clone(),
                                 },
                                 None,
-                            ));
+                            )));
                             queue.insert(call.call_type.clone(), queue2);
                         }
                     }
@@ -984,33 +995,33 @@ impl Immortal for ImmortalService {
     ) -> Result<Response<CallResultVersion>, Status> {
         match request.into_inner().version {
             Some(call_version::Version::V1(call)) => {
-                let (tx, mut rx) = mpsc::channel::<CallResultV1>(100);
+                let (tx, mut rx) = mpsc::channel::<CallResultV1>(10);
 
                 {
                     let mut queue = self.call_queue.lock().await;
                     match queue.get_mut(&call.call_type) {
                         Some(queue) => {
-                            queue.push_back((
+                            queue.push_back(Box::new((
                                 Uuid::new_v4().to_string(),
                                 CallOptions {
                                     call_type: call.call_type.clone(),
-                                    input: call.input.clone(),
+                                    input: call.input,
                                     task_queue: call.task_queue.clone(),
                                 },
                                 Some(tx),
-                            ));
+                            )));
                         }
                         None => {
                             let mut queue2 = VecDeque::new();
-                            queue2.push_back((
+                            queue2.push_back(Box::new((
                                 Uuid::new_v4().to_string(),
                                 CallOptions {
                                     call_type: call.call_type.clone(),
-                                    input: call.input.clone(),
+                                    input: call.input,
                                     task_queue: call.task_queue.clone(),
                                 },
                                 Some(tx),
-                            ));
+                            )));
                             queue.insert(call.call_type.clone(), queue2);
                         }
                     }
@@ -1333,7 +1344,7 @@ impl Immortal for ImmortalService {
                     .await
                     .remove(&activity_result.activity_id)
                 {
-                    Some(entry) => entry,
+                    Some(entry) => *entry,
                     None => return Err(Status::not_found("Activity not found")),
                 };
 
@@ -1357,90 +1368,106 @@ impl Immortal for ImmortalService {
                     }
                 };
 
-                let run = match activity
-                    .runs
-                    .iter_mut()
-                    .find(|f| f.run_id == activity_result.activity_run_id)
                 {
-                    Some(r) => r,
-                    None => {
-                        error!(
-                            "Run ID {} not found in activity history",
-                            activity_result.activity_run_id
-                        );
-                        return Err(Status::not_found("Run ID not found in activity history"));
-                    }
-                };
+                    let run = match activity
+                        .runs
+                        .iter_mut()
+                        .find(|f| f.run_id == activity_result.activity_run_id)
+                    {
+                        Some(r) => r,
+                        None => {
+                            error!(
+                                "Run ID {} not found in activity history",
+                                activity_result.activity_run_id
+                            );
+                            return Err(Status::not_found("Run ID not found in activity history"));
+                        }
+                    };
 
-                run.end_time = Some(chrono::Utc::now().naive_utc());
+                    run.end_time = Some(chrono::Utc::now());
 
-                match activity_result.status.clone() {
-                    Some(immortal::activity_result_v1::Status::Completed(x)) => {
-                        match x.result {
-                            Some(result_data) => match serde_json::from_slice(&result_data.data) {
-                                Ok(result_value) => {
-                                    run.status = HistoryStatus::Completed(result_value);
+                    match activity_result.status.clone() {
+                        Some(immortal::activity_result_v1::Status::Completed(x)) => {
+                            match x.result {
+                                Some(mut result_data) => {
+                                    HistoryStatus::Completed(
+                                        simd_json::to_owned_value(&mut result_data.data).unwrap(),
+                                    );
+                                    // match serde_json::from_slice(&result_data.data) {
+                                    //     Ok(result_value) => {
+                                    //         run.status = HistoryStatus::Completed(result_value);
+                                    //     }
+                                    //     Err(e) => {
+                                    //         println!("Failed to parse result: {:?}", e);
+                                    //         error!("Failed to parse result: {:?}", e);
+                                    //         run.status = HistoryStatus::Failed(
+                                    //             "Invalid result format".into(),
+                                    //         );
+                                    //     }
+                                    // }
                                 }
-                                Err(e) => {
-                                    error!("Failed to parse result: {:?}", e);
+                                None => {
                                     run.status =
-                                        HistoryStatus::Failed("Invalid result format".into());
+                                        HistoryStatus::Failed("Missing result payload".into());
                                 }
-                            },
-                            None => {
-                                run.status = HistoryStatus::Failed("Missing result payload".into());
+                            }
+                            if let Ok(id) = Uuid::parse_str(&activity_result.workflow_id) {
+                                if let Err(e) = self
+                                    .notification_tx
+                                    .send(Notification::ActivityRunCompleted(id, activity.clone()))
+                                {
+                                    error!(
+                                        "Error sending ActivityRunCompleted notification: {:?}",
+                                        e
+                                    );
+                                }
+                            } else {
+                                error!(
+                                    "Invalid UUID in workflow_id: {}",
+                                    activity_result.workflow_id
+                                );
                             }
                         }
-                        if let Ok(id) = Uuid::parse_str(&activity_result.workflow_id) {
-                            if let Err(e) = self
-                                .notification_tx
-                                .send(Notification::ActivityRunCompleted(id, activity.clone()))
-                            {
-                                error!("Error sending ActivityRunCompleted notification: {:?}", e);
+
+                        Some(immortal::activity_result_v1::Status::Failed(x)) => {
+                            run.status = HistoryStatus::Failed(format!("{:#?}", x));
+                            if let Ok(id) = Uuid::parse_str(&activity_result.workflow_id) {
+                                if let Err(e) = self
+                                    .notification_tx
+                                    .send(Notification::ActivityRunCompleted(id, activity.clone()))
+                                {
+                                    error!(
+                                        "Error sending ActivityRunCompleted notification: {:?}",
+                                        e
+                                    );
+                                }
+                            } else {
+                                error!(
+                                    "Invalid UUID in workflow_id: {}",
+                                    activity_result.workflow_id
+                                );
                             }
-                        } else {
-                            error!(
-                                "Invalid UUID in workflow_id: {}",
-                                activity_result.workflow_id
-                            );
+                        }
+
+                        Some(immortal::activity_result_v1::Status::Cancelled(x)) => {
+                            run.status = HistoryStatus::Failed(format!("{:#?}", x));
+                            // No notification in this case?
+                        }
+
+                        None => {
+                            run.status = HistoryStatus::Failed("Missing status field".into());
                         }
                     }
 
-                    Some(immortal::activity_result_v1::Status::Failed(x)) => {
-                        run.status = HistoryStatus::Failed(format!("{:#?}", x));
-                        if let Ok(id) = Uuid::parse_str(&activity_result.workflow_id) {
-                            if let Err(e) = self
-                                .notification_tx
-                                .send(Notification::ActivityRunCompleted(id, activity.clone()))
-                            {
-                                error!("Error sending ActivityRunCompleted notification: {:?}", e);
-                            }
-                        } else {
-                            error!(
-                                "Invalid UUID in workflow_id: {}",
-                                activity_result.workflow_id
-                            );
-                        }
+                    if let Err(e) = self
+                        .history
+                        .update_activity(&activity_result.workflow_id, activity)
+                        .await
+                    {
+                        println!("error");
+                        error!("Failed to update activity history: {:?}", e);
+                        return Err(Status::internal("Failed to update activity history"));
                     }
-
-                    Some(immortal::activity_result_v1::Status::Cancelled(x)) => {
-                        run.status = HistoryStatus::Failed(format!("{:#?}", x));
-                        // No notification in this case?
-                    }
-
-                    None => {
-                        run.status = HistoryStatus::Failed("Missing status field".into());
-                    }
-                }
-
-                if let Err(e) = self
-                    .history
-                    .update_activity(&activity_result.workflow_id, activity)
-                    .await
-                {
-                    println!("error");
-                    error!("Failed to update activity history: {:?}", e);
-                    return Err(Status::internal("Failed to update activity history"));
                 }
 
                 // Update the worker's activity capacity
@@ -1457,6 +1484,8 @@ impl Immortal for ImmortalService {
                 } else {
                     error!("Worker {} not found", worker_id);
                 }
+
+                println!("finished");
             }
 
             None => {
@@ -1500,9 +1529,10 @@ impl Immortal for ImmortalService {
         &self,
         request: Request<WorkflowResultVersion>,
     ) -> Result<Response<()>, Status> {
-        let workflow_version = request.into_inner();
+        let mut workflow_version = request.into_inner();
 
-        let Some(workflow_result_version::Version::V1(workflow_result)) = &workflow_version.version
+        let Some(workflow_result_version::Version::V1(ref mut workflow_result)) =
+            workflow_version.version
         else {
             return Err(Status::invalid_argument("Missing workflow result version"));
         };
@@ -1531,40 +1561,31 @@ impl Immortal for ImmortalService {
         };
 
         // Update end time
-        workflow.end_time = Some(chrono::Utc::now().naive_utc());
+        workflow.end_time = Some(chrono::Utc::now());
 
-        println!("{:#?}", workflow);
-        // Notify workflow result
-        match Uuid::parse_str(&workflow_result.workflow_id) {
-            Ok(uuid) => {
-                if let Err(e) = self
-                    .notification_tx
-                    .send(Notification::WorkflowResult(uuid, workflow_version.clone()))
-                {
-                    error!("Error sending WorkflowResult notification: {:?}", e);
-                }
-            }
-            Err(e) => {
-                error!(
-                    "Invalid UUID in workflow_id (result notification): {} ({:?})",
-                    workflow_result.workflow_id, e
-                );
-            }
-        }
-
+        let worker_id = workflow_result.worker_id.clone();
+        let workflow_id = workflow_result.workflow_id.clone();
         // Set status and send specific notification
-        match &workflow_result.status {
+        match &mut workflow_result.status {
             Some(workflow_result_v1::Status::Completed(x)) => {
-                match &x.result {
-                    Some(result_data) => match serde_json::from_slice(&result_data.data) {
-                        Ok(deserialized) => {
-                            workflow.status = HistoryStatus::Completed(deserialized);
-                        }
-                        Err(e) => {
-                            error!("Failed to deserialize workflow result: {:?}", e);
-                            workflow.status = HistoryStatus::Failed("Invalid result format".into());
-                        }
-                    },
+                match &mut x.result {
+                    Some(ref mut result_data) => {
+                        let mut x = result_data.data.clone();
+                        workflow.status = HistoryStatus::Completed(
+                            simd_json::to_owned_value(&mut x).unwrap(),
+                        );
+                        // match serde_json::from_slice(&result_data.data) {
+                        //     Ok(deserialized) => {
+                        //         workflow.status = HistoryStatus::Completed(deserialized);
+                        //     }
+                        //     Err(e) => {
+                        //         println!("Failed to parse result: {:?}", e);
+                        //         error!("Failed to deserialize workflow result: {:?}", e);
+                        //         workflow.status =
+                        //             HistoryStatus::Failed("Invalid result format".into());
+                        //     }
+                        // }
+                    }
                     None => {
                         workflow.status = HistoryStatus::Failed("Missing result payload".into());
                     }
@@ -1605,7 +1626,7 @@ impl Immortal for ImmortalService {
         // Increase worker capacity if found
         {
             let mut workers = self.workers.write().await;
-            if let Some(worker) = workers.get_mut(&workflow_result.worker_id) {
+            if let Some(worker) = workers.get_mut(&worker_id) {
                 if worker.workflow_capacity < worker.max_workflow_capacity {
                     worker.workflow_capacity += 1;
                 }
@@ -1619,13 +1640,31 @@ impl Immortal for ImmortalService {
 
         // Save updated workflow
         self.history
-            .update_workflow(&workflow_result.workflow_id, workflow)
+            .update_workflow(&workflow_id, workflow)
             .await
             .map_err(|e| {
                 error!("Failed to update workflow history: {:?}", e);
                 Status::internal("Failed to update workflow history")
             })?;
 
+        // Notify workflow result
+        match Uuid::parse_str(&workflow_result.workflow_id) {
+            Ok(uuid) => {
+                if let Err(e) = self
+                    .notification_tx
+                    .send(Notification::WorkflowResult(uuid, workflow_version))
+                {
+                    error!("Error sending WorkflowResult notification: {:?}", e);
+                }
+            }
+            Err(e) => {
+                error!(
+                    "Invalid UUID in workflow_id (result notification): {} ({:?})",
+                    workflow_result.workflow_id, e
+                );
+            }
+        }
+        println!("finished");
         Ok(Response::new(()))
     }
     async fn start_activity(
@@ -1640,11 +1679,19 @@ impl Immortal for ImmortalService {
                     let mut activity_queues = self.activity_queue.lock().await;
                     match activity_queues.get_mut(&activity_options.task_queue) {
                         Some(queue) => {
-                            queue.push_back(("0".to_string(), activity_options.clone(), tx));
+                            queue.push_back(Box::new((
+                                "0".to_string(),
+                                activity_options.clone(),
+                                tx,
+                            )));
                         }
                         None => {
                             let mut queue = VecDeque::new();
-                            queue.push_back(("0".to_string(), activity_options.clone(), tx));
+                            queue.push_back(Box::new((
+                                "0".to_string(),
+                                activity_options.clone(),
+                                tx,
+                            )));
                             activity_queues.insert(activity_options.task_queue.clone(), queue);
                         }
                     }
@@ -1662,12 +1709,12 @@ impl Immortal for ImmortalService {
         }
     }
 }
-
-async fn service_status(reporter: HealthReporter) {
-    reporter
-        .set_serving::<ImmortalServer<ImmortalService>>()
-        .await;
-}
+//
+// async fn service_status(reporter: HealthReporter) {
+//     reporter
+//         .set_serving::<ImmortalServer<ImmortalService>>()
+//         .await;
+// }
 
 async fn on_connect(
     socket: SocketRef,

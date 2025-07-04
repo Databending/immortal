@@ -789,7 +789,6 @@ impl Worker {
                             result.1.clone(),
                             result.2.clone(),
                             {
-                                println!("source: {:?}", source);
                                 let mut f = Failure::application_failure_from_error(source, false);
                                 if let Some(d) = explicit_delay {
                                     if let Some(FailureInfo::ApplicationFailureInfo(fi)) =
@@ -865,7 +864,6 @@ impl Worker {
                             source,
                             explicit_delay,
                         } => CallResultV1::fail(result.0.clone(), result.1.clone(), {
-                            println!("source: {:?}", source);
                             let mut f = Failure::application_failure_from_error(source, false);
                             if let Some(d) = explicit_delay {
                                 if let Some(FailureInfo::ApplicationFailureInfo(fi)) =
@@ -959,7 +957,6 @@ impl Worker {
                         Some(activity_result_v1::Status::Failed(x)) => Err(anyhow!("{:#?}", x)),
                         Some(activity_result_v1::Status::Cancelled(x)) => Err(anyhow!("{:#?}", x)),
                         Some(activity_result_v1::Status::Completed(y)) => {
-                            println!("Activity result: {:?}", y.result);
                             Ok(serde_json::from_slice(
                                 &y.result.ok_or(anyhow!("No payload"))?.data,
                             )?)
@@ -1045,7 +1042,6 @@ impl Worker {
                             result.1.clone(),
                             result.2.clone(),
                             {
-                                println!("source: {:?}", source);
                                 let mut f = Failure::application_failure_from_error(source, false);
                                 if let Some(d) = explicit_delay {
                                     if let Some(FailureInfo::ApplicationFailureInfo(fi)) =

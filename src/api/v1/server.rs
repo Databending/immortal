@@ -4,10 +4,16 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use immortal::models::{ActivitySchema, WfSchema};
+use chrono::{DateTime, Utc};
+use immortal::models::{
+    history::{ActivityHistory, Status, WorkflowHistory, WorkflowHistoryVersion},
+    ActivitySchema, WfSchema,
+};
+use o2o::o2o;
 use serde::{Deserialize, Serialize};
+// use serde_json::Value;
+use simd_json::OwnedValue;
 use std::collections::HashMap;
-
 #[derive(Debug, Clone, Default, Serialize)]
 struct Worker {
     id: String,
@@ -27,6 +33,41 @@ pub struct HistoryFilter {
     worker_id: Option<String>,
     task_queue: Option<String>,
 }
+
+#[derive(o2o, Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "version", content = "spec")]
+#[from_owned(WorkflowHistoryVersion)]
+enum ApiWorkflowHistoryVersion {
+    V1(#[from(~.into())] ApiWorkflowHistory),
+}
+
+#[derive(o2o, Debug, Clone, Serialize, Deserialize)]
+#[from_owned(WorkflowHistory)]
+struct ApiWorkflowHistory {
+    pub args: Vec<OwnedValue>,
+    pub workflow_id: String,
+    pub workflow_type: String,
+    #[from(~.into())]
+    pub status: ApiStatus,
+    pub activities: Vec<ActivityHistory>,
+    pub start_time: DateTime<Utc>,
+    pub end_time: Option<DateTime<Utc>>,
+    pub task_queue: Option<String>,
+    pub worker_id: Option<String>,
+    // pub status: Status,
+}
+
+#[derive(o2o, Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "spec")]
+#[from_owned(Status)]
+pub enum ApiStatus {
+    Running,
+    // #[serde(with = "serde_bytes")]
+    Completed(OwnedValue),
+    // Completed(#[from(simd_json::from_str::<OwnedValue>(&mut ~.clone()).unwrap().clone())] OwnedValue),
+    Failed(String),
+}
+
 pub async fn get_history(
     State(state): State<ImmortalService>,
 
@@ -38,7 +79,13 @@ pub async fn get_history(
         .get_workflows(Some(100), None, params.task_queue, params.worker_id)
         .await
     {
-        Ok(history) => Json(history),
+        Ok(history) => {
+            // let mut api_histories: Vec<ApiWorkflowHistoryVersion> = vec![];
+            // for x in history {
+            //     api_histories.push(x.into());
+            // }
+            Json(history)
+        }
         Err(e) => {
             println!("{:#?}", e);
             Json(vec![])
@@ -191,7 +238,6 @@ pub async fn running_calls(
     )
 }
 
-
 pub async fn running_activities(
     State(state): State<ImmortalService>,
     // this argument tells axum to parse the request body
@@ -203,7 +249,7 @@ pub async fn running_activities(
             .read()
             .await
             .iter()
-            .map(|f| (f.0.clone(), f.1.2.clone()))
+            .map(|f| (f.0.clone(), f.1 .2.clone()))
             .collect::<HashMap<_, _>>(),
     )
 }

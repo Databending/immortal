@@ -6,26 +6,27 @@ use bb8_redis::{
 use const_format::formatcp;
 
 use anyhow::Result;
-use chrono::NaiveDateTime;
+use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use redis::{AsyncCommands, ErrorKind, FromRedisValue, RedisError, RedisWrite, ToRedisArgs};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use simd_json::{BorrowedValue, OwnedValue};
 
 #[derive(Debug, Clone)]
-pub struct History(pub Vec<WorkflowHistory>, Pool<RedisConnectionManager>);
+pub struct History(Pool<RedisConnectionManager>);
 const BASE_REDIS_KEY: &str = "immortal:history";
 const WORKFLOW_BASE_REDIS_KEY: &str = formatcp!("{}:workflow", BASE_REDIS_KEY);
 impl History {
     pub fn new(pool: &Pool<RedisConnectionManager>) -> Self {
-        Self(Vec::new(), pool.clone())
+        Self(pool.clone())
     }
 
     async fn get_con(
         &self,
     ) -> std::result::Result<PooledConnection<'_, RedisConnectionManager>, RunError<RedisError>>
     {
-        self.1.get().await
+        self.0.get().await
     }
 
     pub async fn sync_workflow_index(&self) -> Result<()> {
@@ -144,7 +145,7 @@ impl History {
                 .map(|x| x.clone())
                 .collect();
         }
-        if let Some(worker_id) = worker_id{
+        if let Some(worker_id) = worker_id {
             workflows = workflows
                 .iter()
                 .filter(|f| match &f {
@@ -166,7 +167,6 @@ impl History {
     ) -> Result<()> {
         let mut con = self.get_con().await?;
         let key = format!("{WORKFLOW_BASE_REDIS_KEY}:{}", workflow_id);
-        println!("setting workflow_history :{:#?}", workflow);
         let _: () = con
             .set_ex(key, WorkflowHistoryVersion::V1(workflow), 259200)
             .await?;
@@ -221,7 +221,6 @@ impl History {
             .find(|a| a.activity_id == activity.activity_id)
             .ok_or(anyhow!("Activity does not exist"))?;
         *previous_activity = activity;
-        println!("setting: {:#?}", workflow);
         let _: () = con
             .set_ex(key, WorkflowHistoryVersion::V1(workflow), 259200)
             .await?;
@@ -282,13 +281,13 @@ impl FromRedisValue for WorkflowHistoryVersion {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowHistory {
-    pub args: Vec<Value>,
+    pub args: Vec<OwnedValue>,
     pub workflow_id: String,
     pub workflow_type: String,
     pub status: Status,
     pub activities: Vec<ActivityHistory>,
-    pub start_time: NaiveDateTime,
-    pub end_time: Option<NaiveDateTime>,
+    pub start_time: DateTime<Utc>,
+    pub end_time: Option<DateTime<Utc>>,
     pub task_queue: Option<String>,
     pub worker_id: Option<String>,
     // pub status: Status,
@@ -298,7 +297,7 @@ impl WorkflowHistory {
     pub fn new(
         workflow_type: String,
         workflow_id: String,
-        args: Vec<Value>,
+        args: Vec<OwnedValue>,
         task_queue: String,
         worker_id: String,
     ) -> Self {
@@ -308,7 +307,7 @@ impl WorkflowHistory {
             workflow_id,
             status: Status::Running,
             activities: Vec::new(),
-            start_time: chrono::Utc::now().naive_utc(),
+            start_time: chrono::Utc::now(),
             end_time: None,
             task_queue: Some(task_queue),
             worker_id: Some(worker_id),
@@ -320,9 +319,23 @@ impl WorkflowHistory {
 #[serde(tag = "type", content = "spec")]
 pub enum Status {
     Running,
-    Completed(Value),
+    // #[serde(with = "serde_bytes")]
+    Completed(OwnedValue),
+    // Completed(String),
+    // Completed(Value),
     Failed(String),
 }
+//
+// #[derive(Debug, Clone, Serialize, Deserialize)]
+// #[serde(tag = "type", content = "spec")]
+// enum Status2<'a> {
+//     Running,
+//     // #[serde(with = "serde_bytes")]
+//     Completed(BorrowedValue<'a>),
+//     // Completed(String),
+//     // Completed(Value),
+//     Failed(String),
+// }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivityHistory {
@@ -361,8 +374,8 @@ impl ActivityHistory {
 pub struct ActivityRun {
     pub run_id: String,
     pub status: Status,
-    pub start_time: NaiveDateTime,
-    pub end_time: Option<NaiveDateTime>,
+    pub start_time: DateTime<Utc>,
+    pub end_time: Option<DateTime<Utc>>,
 }
 
 impl ActivityRun {
@@ -370,7 +383,7 @@ impl ActivityRun {
         Self {
             run_id,
             status: Status::Running,
-            start_time: chrono::Utc::now().naive_utc(),
+            start_time: chrono::Utc::now(),
             end_time: None,
         }
     }

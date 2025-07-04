@@ -15,4 +15,6 @@ pub fn router() -> Router<ImmortalService> {
         .route("/workers", get(server::get_workers))
         .route("/workflow-queue", get(server::get_workflow_queue))
         .route("/activity-queue", get(server::get_activity_queue))
+        .route("/running-activities", get(server::running_activities))
+        .route("/running-calls", get(server::running_calls))
 }
