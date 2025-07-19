@@ -5,7 +5,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use immortal::models::{
+use crate::{
     history::{ActivityHistory, Status, WorkflowHistory, WorkflowHistoryVersion},
     ActivitySchema, WfSchema,
 };

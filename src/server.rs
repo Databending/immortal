@@ -5,6 +5,8 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+#[cfg(not(feature = "server"))]
+compile_error!("This binary crate requires `--features server`.");
 // easy break: run and didn't instantly die
 use chrono::DateTime;
 use chrono::Duration;
@@ -26,20 +28,20 @@ use ::immortal::immortal::ClientStartWorkflowOptionsV1;
 use ::immortal::immortal::NotifyVersion;
 use ::immortal::immortal::RequestStartActivityOptionsV1;
 use ::immortal::immortal::StartNotificationOptionsV1;
-use ::immortal::models::history::Status as HistoryStatus;
-use ::immortal::models::history::{ActivityHistory, ActivityRun, History, WorkflowHistory};
 use ::immortal::models::ActivitySchema;
 use ::immortal::models::CallSchema;
 use ::immortal::models::WfSchema;
 use axum;
 use bb8_redis::bb8::Pool;
 use dotenvy::dotenv;
+use history::Status as HistoryStatus;
+use history::{ActivityHistory, ActivityRun, History, WorkflowHistory};
 use rand::Rng;
 use redis::streams::{StreamId, StreamKey, StreamMaxlen, StreamReadOptions, StreamReadReply};
 use redis::AsyncCommands;
+use simd_json::prelude::ValueAsMutObject;
 // use bb8_redis::redis::AsyncCommands;
 use bb8_redis::{bb8, RedisConnectionManager};
-
 use immortal::immortal_server::{Immortal, ImmortalServer};
 use immortal::immortal_worker_action_v1::Action as WorkerAction;
 use immortal::{
@@ -52,7 +54,7 @@ use immortal::{
     WorkflowResultVersion,
 };
 use regex::Regex;
-use serde_json::Value;
+use simd_json::OwnedValue;
 use socketioxide::extract::{AckSender, State};
 use socketioxide::socket::DisconnectReason;
 use socketioxide::{
@@ -85,6 +87,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 pub mod api;
+pub mod history;
 pub mod models;
 
 #[derive(Clone, Debug, Serialize)]
@@ -483,8 +486,21 @@ impl ImmortalService {
                                 }))
                                 .await
                             {
-                                notify.notify_one();
-                                eprintln!("Failed to send call to worker {}: {:#?}", worker.0, e.0);
+                                if available_workers.len() > 1 {
+                                    notify.notify_one();
+                                }
+                                // match e.0 {
+                                //    Ok(_) => {
+                                //
+                                //    },
+                                //    Err(e) => match e {
+                                //        Status
+                                //
+                                //    }
+                                //
+                                // }
+                                eprintln!("Failed to send call to worker {}: {:#?}", worker.0, e);
+                                //TODO: need to go ahead, check the error, and then act accordingly
                                 println!("{:#?}", available_workers);
                             } else {
                                 // Remove the item from the actual call queue (not the snapshot)
@@ -765,11 +781,11 @@ impl ImmortalService {
                                 workflow_id.clone(),
                                 workflow_options
                                     .input
-                                    .as_ref()
-                                    .map(|i| {
+                                    .clone()
+                                    .map(|mut i| {
                                         i.payloads
-                                            .iter()
-                                            .filter_map(|f| serde_json::from_slice(&f.data).ok())
+                                            .iter_mut()
+                                            .filter_map(|f| simd_json::from_slice(&mut f.data).ok())
                                             .collect()
                                     })
                                     .unwrap_or_default(),
@@ -805,7 +821,7 @@ impl ImmortalService {
                                 }))
                                 .await
                             {
-                                eprintln!("Failed to send workflow to worker: {:?}", e);
+                                eprintln!("Failed to send workflow to worker: {:#?}", e);
                                 continue;
                             }
                             Self::adjust_capacity(
@@ -1107,7 +1123,7 @@ impl Immortal for ImmortalService {
             while let Some(Ok(action)) = stream.next().await {
                 match action.version {
                     Some(immortal_server_action_version::Version::V1(x)) => match x.action {
-                        Some(immortal_server_action_v1::Action::LogEvent(log)) => {
+                        Some(immortal_server_action_v1::Action::LogEvent(mut log)) => {
                             if let Some(when) = DateTime::from_timestamp(log.when, 0) {
                                 let when = when.to_string();
                                 let level = match log.level() {
@@ -1124,9 +1140,9 @@ impl Immortal for ImmortalService {
                                     ("level", &level),
                                 ];
                                 let metadata;
-                                if let Some(x) = log.metadata.as_ref() {
-                                    match serde_json::from_slice::<Value>(x) {
-                                        Ok(json_data) => match serde_json::to_string(&json_data) {
+                                if let Some(ref mut x) = &mut log.metadata {
+                                    match simd_json::from_slice::<OwnedValue>(x) {
+                                        Ok(json_data) => match simd_json::to_string(&json_data) {
                                             Ok(meta_str) => {
                                                 metadata = meta_str;
                                                 items.push(("metadata", &metadata));
@@ -1200,39 +1216,39 @@ impl Immortal for ImmortalService {
             println!("{:#?}", worker_ids);
             let registered_workflows = worker_details
                 .registered_workflows
-                .iter()
+                .iter_mut()
                 .map(|x| {
                     (
                         x.workflow_type.clone(),
                         WfSchema {
-                            args: serde_json::from_slice(&x.args).unwrap(),
-                            output: serde_json::from_slice(&x.output).unwrap(),
+                            args: simd_json::from_slice(&mut x.args).unwrap(),
+                            output: simd_json::from_slice(&mut x.output).unwrap(),
                         },
                     )
                 })
                 .collect();
             let registered_activities = worker_details
                 .registered_activities
-                .iter()
+                .iter_mut()
                 .map(|x| {
                     (
                         x.activity_type.clone(),
                         ActivitySchema {
-                            args: serde_json::from_slice(&x.args).unwrap(),
-                            output: serde_json::from_slice(&x.output).unwrap(),
+                            args: simd_json::from_slice(&mut x.args).unwrap(),
+                            output: simd_json::from_slice(&mut x.output).unwrap(),
                         },
                     )
                 })
                 .collect();
             let registered_calls = worker_details
                 .registered_calls
-                .iter()
+                .iter_mut()
                 .map(|x| {
                     (
                         x.call_type.clone(),
                         CallSchema {
-                            args: serde_json::from_slice(&x.args).unwrap(),
-                            output: serde_json::from_slice(&x.output).unwrap(),
+                            args: simd_json::from_slice(&mut x.args).unwrap(),
+                            output: simd_json::from_slice(&mut x.output).unwrap(),
                         },
                     )
                 })
@@ -1272,7 +1288,7 @@ impl Immortal for ImmortalService {
                 };
                 match tx.send(Ok(action)).await {
                     Ok(_) => {
-                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
                     Err(_) => {
                         break;
@@ -1571,9 +1587,8 @@ impl Immortal for ImmortalService {
                 match &mut x.result {
                     Some(ref mut result_data) => {
                         let mut x = result_data.data.clone();
-                        workflow.status = HistoryStatus::Completed(
-                            simd_json::to_owned_value(&mut x).unwrap(),
-                        );
+                        workflow.status =
+                            HistoryStatus::Completed(simd_json::to_owned_value(&mut x).unwrap());
                         // match serde_json::from_slice(&result_data.data) {
                         //     Ok(deserialized) => {
                         //         workflow.status = HistoryStatus::Completed(deserialized);
@@ -1718,7 +1733,7 @@ impl Immortal for ImmortalService {
 
 async fn on_connect(
     socket: SocketRef,
-    Data(_data): Data<Value>,
+    Data(_data): Data<OwnedValue>,
     pool: State<Pool<RedisConnectionManager>>,
     notification_tx: State<broadcast::Sender<Notification>>,
 ) {
@@ -1734,22 +1749,25 @@ async fn on_connect(
     //     .await
     //     .unwrap();
 
-    socket.on("message", |socket: SocketRef, Data::<Value>(data)| {
+    socket.on("message", |socket: SocketRef, Data::<OwnedValue>(data)| {
         info!("Received event: {:?}", data);
         socket.emit("message-back", &data).ok();
     });
 
-    socket.on("message-with-ack", |Data::<Value>(data), ack: AckSender| {
-        info!("Received event: {:?}", data);
-        ack.send(&data).ok();
-    });
+    socket.on(
+        "message-with-ack",
+        |Data::<OwnedValue>(data), ack: AckSender| {
+            info!("Received event: {:?}", data);
+            ack.send(&data).ok();
+        },
+    );
 
     {
         let tx = notification_tx.clone();
 
         socket.on(
             "history-notifications",
-            |socket: SocketRef, Data::<Value>(data), ack: AckSender| async move {
+            |socket: SocketRef, Data::<OwnedValue>(data), ack: AckSender| async move {
                 info!("Received event: {:?} ", data);
                 ack.send(&data).ok();
                 let s2 = socket.clone();
@@ -1758,7 +1776,7 @@ async fn on_connect(
                     while let Ok(z) = rx.recv().await {
                         s2.emit(
                             "history-update",
-                            &serde_json::to_value(z).unwrap_or(serde_json::json!({})),
+                            &simd_json::serde::to_owned_value(z).unwrap_or(simd_json::json!({})),
                         )
                         .ok();
                     }
@@ -1780,9 +1798,9 @@ async fn on_connect(
 
     socket.on(
         "fetch-logs",
-        |socket: SocketRef, Data::<Value>(data), ack: AckSender| {
+        |socket: SocketRef, Data::<OwnedValue>(data), ack: AckSender| {
             info!("Received event: {:?}", data);
-            let log_id: String = serde_json::from_value(data.clone()).unwrap();
+            let log_id: String = simd_json::serde::from_owned_value(data.clone()).unwrap();
             ack.send(&data).ok();
             let s2 = socket.clone();
             let handle = tokio::spawn(async move {
@@ -1801,17 +1819,25 @@ async fn on_connect(
                     for StreamKey { key: _, ids } in srr.keys {
                         for StreamId { id, map } in ids {
                             last_id = id.clone();
-                            let mut parsed_map = serde_json::json!({
+                            let mut parsed_map = simd_json::json!({
                                 "id": id.clone()
                             });
                             for (n, s) in map {
-                                if let redis::Value::BulkString(bytes) = s {
+                                if let redis::Value::BulkString(mut bytes) = s {
                                     if n == "metadata" {
-                                        parsed_map[n] =
-                                            serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                                        parsed_map
+                                            .as_object_mut() // Get a mutable reference to the underlying Map
+                                            .unwrap() // Panics if not an object, which we've initialized it to be
+                                            .insert(
+                                                n.to_owned(), // Convert String n to OwnedValue::String for the key, or use n.as_str()
+                                                simd_json::from_slice(&mut bytes)
+                                                    .unwrap_or(OwnedValue::default()),
+                                            );
                                     } else {
-                                        parsed_map[n] =
-                                            Value::String(String::from_utf8(bytes).unwrap());
+                                        parsed_map.as_object_mut().unwrap().insert(
+                                            n.to_owned(), // Convert String n to OwnedValue::String for the key
+                                            OwnedValue::String(String::from_utf8(bytes).unwrap()),
+                                        );
                                     }
                                 } else {
                                     panic!("Weird data")

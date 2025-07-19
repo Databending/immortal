@@ -2,7 +2,7 @@ use anyhow::{anyhow, Error};
 use async_stream::stream;
 use schemars::schema::RootSchema;
 use schemars::schema_for;
-use serde_json::{json, Value};
+use simd_json::{json, OwnedValue};
 use tokio::sync::broadcast::error::RecvError;
 use std::fmt::{Debug, Write};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -41,7 +41,7 @@ use tokio::task::JoinHandle;
 
 use super::call::{CallError, CallExitValue, CallFunction, IntoCallFunc};
 use super::notification::{IntoNotificationFunc, NotificationFunction};
-use super::serverless;
+// use super::serverless;
 use super::{
     activity::{
         ActExitValue, ActivityError, ActivityFunction, ActivityOptions, AppData, IntoActivityFunc,
@@ -81,15 +81,15 @@ pub struct Worker {
     pub client: ImmortalClient<Channel>,
     pub config: WorkerConfig,
     pub server_channel: tokio::sync::broadcast::Sender<ImmortalServerActionV1>,
-    pub workflow_sender: UnboundedSender<(String, Result<WfExitValue<Value>, Error>)>,
+    pub workflow_sender: UnboundedSender<(String, Result<WfExitValue<OwnedValue>, Error>)>,
     pub activity_sender: UnboundedSender<(
         String,
         String,
         String,
-        Result<ActExitValue<Value>, ActivityError>,
+        Result<ActExitValue<OwnedValue>, ActivityError>,
     )>,
 
-    pub call_sender: UnboundedSender<(String, String, Result<CallExitValue<Value>, CallError>)>,
+    pub call_sender: UnboundedSender<(String, String, Result<CallExitValue<OwnedValue>, CallError>)>,
     // pub client: Arc<dyn WorkerClient>,
     pub workery_key: String,
     pub registered_workflows: Arc<Mutex<HashMap<String, (WorkflowFunction, WfSchema)>>>,
@@ -233,7 +233,7 @@ where
                             activity_run_id: data.activity_run_id.clone(),
                             message: visitor.message.unwrap_or("".to_string()),
                             metadata: Some(
-                                serde_json::to_vec(&json!({
+                                simd_json::to_vec(&json!({
                                     "target": event.metadata().target().to_string(),
                                     "module_path": event.metadata().module_path().unwrap_or_default(),
                                     "line": event.metadata().line().unwrap_or_default(),
@@ -528,7 +528,7 @@ impl Worker {
                 .iter()
                 .map(|x| RegisteredNotification {
                     notification_type: x.0.clone(),
-                    args: serde_json::to_vec(&x.1 .1.args.clone()).unwrap(),
+                    args: simd_json::to_vec(&x.1 .1.args.clone()).unwrap(),
                 })
                 .collect(),
             registered_calls: self
@@ -538,8 +538,8 @@ impl Worker {
                 .iter()
                 .map(|x| RegisteredCall {
                     call_type: x.0.clone(),
-                    args: serde_json::to_vec(&x.1 .1.args.clone()).unwrap(),
-                    output: serde_json::to_vec(&x.1 .1.output.clone()).unwrap(),
+                    args: simd_json::to_vec(&x.1 .1.args.clone()).unwrap(),
+                    output: simd_json::to_vec(&x.1 .1.output.clone()).unwrap(),
                 })
                 .collect(),
             registered_activities: self
@@ -549,8 +549,8 @@ impl Worker {
                 .iter()
                 .map(|x| RegisteredActivity {
                     activity_type: x.0.clone(),
-                    args: serde_json::to_vec(&x.1 .1.args.clone()).unwrap(),
-                    output: serde_json::to_vec(&x.1 .1.output.clone()).unwrap(),
+                    args: simd_json::to_vec(&x.1 .1.args.clone()).unwrap(),
+                    output: simd_json::to_vec(&x.1 .1.output.clone()).unwrap(),
                 })
                 .collect(),
             registered_workflows: self
@@ -560,8 +560,8 @@ impl Worker {
                 .iter()
                 .map(|x| RegisteredWorkflow {
                     workflow_type: x.0.clone(),
-                    args: serde_json::to_vec(&x.1 .1.args.clone()).unwrap(),
-                    output: serde_json::to_vec(&x.1 .1.output.clone()).unwrap(),
+                    args: simd_json::to_vec(&x.1 .1.args.clone()).unwrap(),
+                    output: simd_json::to_vec(&x.1 .1.output.clone()).unwrap(),
                 })
                 .collect(),
         };
@@ -600,13 +600,13 @@ impl Worker {
         let serverless_mode = std::env::var("SERVERLESS_MODE").unwrap_or_default();
         if serverless_mode == "true" {
             println!("Starting serverless mode");
-            let safe_app_data = Arc::new(
+            let _safe_app_data = Arc::new(
                 self.app_data
                     .take()
                     .ok_or_else(|| anyhow!("app_data should exist on run"))
                     .unwrap(),
             );
-            let _ = serverless::main(self, safe_app_data).await;
+            // let _ = serverless::main(self, safe_app_data).await;
         } else {
             loop {
                 let _ = self.main_thread3(&rx).await;
@@ -690,7 +690,7 @@ impl Worker {
 
     pub fn workflow_thread(
         &mut self,
-        mut rx: UnboundedReceiver<(String, Result<WfExitValue<Value>, Error>)>,
+        mut rx: UnboundedReceiver<(String, Result<WfExitValue<OwnedValue>, Error>)>,
     ) {
         let mut client = self.client.clone();
         let running_workflows_arc = Arc::clone(&self.running_workflows);
@@ -760,7 +760,7 @@ impl Worker {
             String,
             String,
             String,
-            Result<ActExitValue<Value>, ActivityError>,
+            Result<ActExitValue<OwnedValue>, ActivityError>,
         )>,
     ) {
         let running_activities_arc = Arc::clone(&self.running_activities);
@@ -807,7 +807,7 @@ impl Worker {
                                 result.2.clone(),
                                 match details {
                                     Some(d) => {
-                                        if let Ok(x) = serde_json::to_vec(&d) {
+                                        if let Ok(x) = simd_json::to_vec(&d) {
                                             Some(vec![x])
                                         } else {
                                             None
@@ -843,7 +843,7 @@ impl Worker {
 
     pub fn call_thread(
         &mut self,
-        mut rx: UnboundedReceiver<(String, String, Result<CallExitValue<Value>, CallError>)>,
+        mut rx: UnboundedReceiver<(String, String, Result<CallExitValue<OwnedValue>, CallError>)>,
     ) {
         let running_calls_arc = Arc::clone(&self.running_calls);
 
@@ -879,7 +879,7 @@ impl Worker {
                             result.1.clone(),
                             match details {
                                 Some(d) => {
-                                    if let Ok(x) = serde_json::to_vec(&d) {
+                                    if let Ok(x) = simd_json::to_vec(&d) {
                                         Some(vec![x])
                                     } else {
                                         None
@@ -916,7 +916,7 @@ impl Worker {
         &mut self,
         workflow_id: String,
         activity_options: ActivityOptions,
-    ) -> anyhow::Result<Value> {
+    ) -> anyhow::Result<OwnedValue> {
         let mut temp = RequestStartActivityOptionsV1 {
             activity_id: activity_options
                 .activity_id
@@ -957,8 +957,8 @@ impl Worker {
                         Some(activity_result_v1::Status::Failed(x)) => Err(anyhow!("{:#?}", x)),
                         Some(activity_result_v1::Status::Cancelled(x)) => Err(anyhow!("{:#?}", x)),
                         Some(activity_result_v1::Status::Completed(y)) => {
-                            Ok(serde_json::from_slice(
-                                &y.result.ok_or(anyhow!("No payload"))?.data,
+                            Ok(simd_json::from_slice(
+                                &mut y.result.ok_or(anyhow!("No payload"))?.data,
                             )?)
                         }
 
@@ -1059,7 +1059,7 @@ impl Worker {
                                 result.1.clone(),
                                 result.2.clone(),
                                 match details {
-                                    Some(d) => Some(vec![serde_json::to_vec(&d).unwrap()]),
+                                    Some(d) => Some(vec![simd_json::to_vec(&d).unwrap()]),
                                     None => None,
                                 },
                             )

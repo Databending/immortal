@@ -1,3 +1,6 @@
+cargo.features = "all"
+
+
 [package]
 name = "immortal"
 version = "0.1.0"
@@ -7,43 +10,44 @@ edition = "2021"
 tonic = "0.13"
 prost = "0.13"
 tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "sync", "time"] }
-tokio-stream = {version = "0.1",features=["sync"]}
-prost-wkt = "0.6"
-prost-wkt-types = "0.6"
-async-stream = "0.3"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-rand = "0.9"
 anyhow = "1.0.98"
-thiserror = "2.0.12"
-futures = "0.3.31"
-tokio-util = "0.7.15"
-tracing = "0.1.41"
-tracing-subscriber = {version = "0.3.19", features=["env-filter"]}
-derive_builder = "0.20.2"
-tonic-health = "0.13.0"
-uuid = { version = "1.16.0", features = ["v4", "serde"] }
-prost-types = "0.13.5"
-axum = "0.8.4"
-socketioxide = { version = "0.16.2", features = ["state"] }
-tower-http = { version = "0.6.2", features = ["cors"] }
-bb8-redis = "0.22.0"
-redis = { version = "0.30", default-features = false, features = ["tokio-comp", "streams", "aio"] }
-chrono = {version = "0.4.41", features=["serde"]}
+simd-json = {version="0.15.1"}
+tracing = {version="0.1.41"}
+tokio-util = {version="0.7.15"}
+futures = {version="0.3.31"}
+uuid = { version = "1.16.0", features = ["v4", "serde"]}
 schemars = {version = "0.8.22", features=["uuid1"]}
-immortal-macros = { path = "immortal-macros" }
-itertools = "0.14.0"
-paste = "1.0.15"
-const_format = "0.2.34"
-tower = "0.5.2"
-regex = "1.11.1"
-dotenvy = "0.15.7"
-console-subscriber = "0.4.1"
-serde_bytes = "0.11.17"
-o2o = { version = "0.5.4", features = ["o2o-macros"] }
-simd-json = "0.15.1"
+
+paste = {version="1.0.15"}
+derive_builder = {version="0.20.2"}
+chrono = {version = "0.4.41", features=["serde"]}
+async-stream = {version="0.3"}
+tracing-subscriber = {version = "0.3.19", features=["env-filter"]}
+# server dependencies
+tokio-stream = {version = "0.1",features=["sync"], optional = true}
+prost-wkt = {version = "0.6", optional = true}
+prost-wkt-types = {version="0.6"}
+serde_json = {version="1.0", optional = true}
+rand = {version="0.9", optional = true}
+thiserror = {version="2.0.12", optional = true}
+tonic-health = {version="0.13.0", optional = true}
+prost-types = {version="0.13.5", optional = true}
+axum = {version="0.8.4", optional = true}
+socketioxide = { version = "0.16.2", features = ["state"] , optional = true}
+tower-http = { version = "0.6.2", features = ["cors"] , optional = true}
+bb8-redis = {version="0.22.0", optional = true}
+redis = { version = "0.30", default-features = false, features = ["tokio-comp", "streams", "aio"] , optional = true}
+immortal-macros = { path = "immortal-macros" , optional = true}
+itertools = {version="0.14.0", optional = true}
+const_format = {version="0.2.34", optional = true}
+tower = {version="0.5.2", optional = true}
+regex = {version="1.11.1", optional = true}
+dotenvy = {version="0.15.7", optional = true}
+console-subscriber = {version="0.4.1", optional = true}
+o2o = { version = "0.5.4", features = ["o2o-macros"] , optional = true}
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = {version = "0.6", features = ["profiling"] }
+tikv-jemallocator = {version = "0.6", features = ["profiling"], optional=true }
 [build-dependencies]
 tonic-build = "0.13"
 prost-wkt-build = "0.6"
@@ -51,14 +55,20 @@ prost-wkt-build = "0.6"
 [[bin]]
 name = "server"
 path = "src/server.rs"
+required-features = ["server"]
 
 
 
 [[bin]]
 name = "worker"
 path = "src/worker.rs"
+required-features = ["worker"]
+#
+# [[bin]]
+# name = "client"
+# path = "src/client.rs"
 
-[[bin]]
-name = "client"
-path = "src/client.rs"
 
+[features]
+server=["dep:tokio-stream", "dep:immortal-macros", "dep:dotenvy", "dep:immortal-macros", "dep:axum", "dep:o2o", "dep:redis", "dep:bb8-redis" ,"dep:rand","dep:regex", "dep:socketioxide", "dep:tower", "dep:tower-http", "dep:itertools", "dep:const_format", "dep:console-subscriber", "dep:tikv-jemallocator"]
+worker=["dep:immortal-macros", "dep:dotenvy"]

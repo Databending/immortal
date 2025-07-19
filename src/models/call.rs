@@ -4,7 +4,7 @@ use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use simd_json::OwnedValue;
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::time::SystemTime;
@@ -90,7 +90,7 @@ impl<T: Serialize> From<T> for CallExitValue<T> {
 }
 
 type BoxCallFn = Arc<
-    dyn Fn(CallContext, Payload) -> BoxFuture<'static, Result<CallExitValue<Value>, CallError>>
+    dyn Fn(CallContext, Payload) -> BoxFuture<'static, Result<CallExitValue<OwnedValue>, CallError>>
         + Send
         + Sync,
 >;
@@ -110,7 +110,7 @@ impl CallFunction {
         app_data: Arc<AppData>,
         call_type: String,
         call_id: String,
-    ) -> Pin<Box<dyn Future<Output = Result<CallExitValue<Value>, CallError>> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = Result<CallExitValue<OwnedValue>, CallError>> + Send>> {
         let span = info_span!(
             "RunActivity",
             "otel.kind" = "server",
@@ -149,7 +149,7 @@ pub enum CallError {
     /// Return this error to indicate your activity is cancelling
     Cancelled {
         /// Some data to save as the cancellation reason
-        details: Option<Value>,
+        details: Option<OwnedValue>,
     },
     /// Return this error to indicate that your activity non-retryable
     /// this is a transparent wrapper around anyhow Error so essentially any type of error
@@ -191,15 +191,15 @@ where
     O: Serialize,
 {
     fn into_call_fn(self) -> BoxCallFn {
-        let wrapper = move |ctx: CallContext, input: Payload| {
-            match serde_json::from_slice(&input.data) {
+        let wrapper = move |ctx: CallContext, mut input: Payload| {
+            match simd_json::from_slice(&mut input.data) {
                 Ok(x) => self(ctx, x)
                     .map(|r| {
                         r.and_then(|r| {
                             let exit_val: CallExitValue<O> = r.into();
                             match exit_val {
                                 // ActExitValue::WillCompleteAsync => Ok(ActExitValue::WillCompleteAsync),
-                                CallExitValue::Normal(x) => match serde_json::to_value(x) {
+                                CallExitValue::Normal(x) => match simd_json::serde::to_owned_value(x) {
                                     Ok(v) => Ok(CallExitValue::Normal(v)),
                                     Err(e) => Err(CallError::NonRetryable(e.into())),
                                 },
@@ -226,9 +226,9 @@ pub struct CallContext {
     // worker: Arc<dyn Worker>,
     app_data: Arc<AppData>,
     cancellation_token: CancellationToken,
-    input: Vec<Value>,
-    heartbeat_details: Vec<Value>,
-    header_fields: HashMap<String, Value>,
+    input: Vec<OwnedValue>,
+    heartbeat_details: Vec<OwnedValue>,
+    header_fields: HashMap<String, OwnedValue>,
     info: CallInfo,
 }
 //
@@ -267,11 +267,11 @@ pub(crate) struct _Start {
     pub notification_id: String,
     // The activity's type name or function identifier
     pub notification_type: String,
-    pub header_fields: HashMap<String, Value>,
+    pub header_fields: HashMap<String, OwnedValue>,
     // Arguments to the activity
-    pub input: Vec<Value>,
+    pub input: Vec<OwnedValue>,
     // The last details that were recorded by a heartbeat when this task was generated
-    pub heartbeat_details: Vec<Value>,
+    pub heartbeat_details: Vec<OwnedValue>,
     // When the task was *first* scheduled
     pub scheduled_time: Option<SystemTime>,
     // When this current attempt at the task was scheduled
@@ -306,7 +306,7 @@ impl CallContext {
         task_queue: String,
         task_token: Vec<u8>,
         task: _Start,
-    ) -> (Self, Value) {
+    ) -> (Self, OwnedValue) {
         let _Start {
             namespace,
             notification_id,
@@ -374,17 +374,17 @@ impl CallContext {
     /// Retrieve extra parameters to the Activity. The first input is always popped and passed to
     /// the Activity function for the currently executing activity. However, if more parameters are
     /// passed, perhaps from another language's SDK, explicit access is available from extra_inputs
-    pub fn extra_inputs(&mut self) -> &mut [Value] {
+    pub fn extra_inputs(&mut self) -> &mut [OwnedValue] {
         &mut self.input
     }
 
     /// Extract heartbeat details from last failed attempt. This is used in combination with retry policy.
-    pub fn get_heartbeat_details(&self) -> &[Value] {
+    pub fn get_heartbeat_details(&self) -> &[OwnedValue] {
         &self.heartbeat_details
     }
 
     /// RecordHeartbeat sends heartbeat for the currently executing activity
-    pub fn record_heartbeat(&self, _details: Vec<Value>) {
+    pub fn record_heartbeat(&self, _details: Vec<OwnedValue>) {
         // self.worker.record_activity_heartbeat(ActivityHeartbeat {
         //     task_token: self.info.task_token.clone(),
         //     details,
@@ -397,7 +397,7 @@ impl CallContext {
     }
 
     /// Get headers attached to this activity
-    pub fn headers(&self) -> &HashMap<String, Value> {
+    pub fn headers(&self) -> &HashMap<String, OwnedValue> {
         &self.header_fields
     }
 

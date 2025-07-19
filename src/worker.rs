@@ -6,6 +6,8 @@ use ::immortal::register_workflow;
 pub mod activities;
 pub mod models;
 pub mod workflows;
+#[cfg(not(feature = "worker"))]
+compile_error!("This binary crate requires `--features worker`.");
 // use crate::activities::ActivityData;
 
 use activities::test::ActivityData;

@@ -14,7 +14,7 @@ use anyhow::{anyhow, Error};
 use futures::future::{BoxFuture, FutureExt};
 use serde::Deserialize;
 use serde::{de::DeserializeOwned, Serialize};
-use serde_json::Value;
+use simd_json::OwnedValue;
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 use tonic::transport::Channel;
 use tracing::info_span;
@@ -28,7 +28,7 @@ pub struct Workflow {
     pub name: String,
     pub default_options: WorkflowOptions,
     pub fn_name: String,
-    pub fn_args: Vec<Value>,
+    pub fn_args: Vec<OwnedValue>,
 }
 
 #[derive(Clone)]
@@ -84,7 +84,7 @@ impl WfContext {
                     Some(Status::Cancelled(x)) => Err(anyhow!("{:#?}", x)),
                     Some(Status::Completed(y)) => {
                         match y.result {
-                            Some(x) => Ok(x.to()?),
+                            Some(mut x) => Ok(x.to()?),
                             None => Err(anyhow!("Paylaod empty"))
                         }
                         // let result: ActExitValue<T> = serde_json::from_slice(&y.result.unwrap().data)?;
@@ -149,7 +149,7 @@ pub struct WorkflowOptions {
     pub retry_policy: Option<RetryPolicy>,
 }
 
-type WfFunc = dyn Fn(WfContext) -> BoxFuture<'static, Result<WfExitValue<Value>, anyhow::Error>>
+type WfFunc = dyn Fn(WfContext) -> BoxFuture<'static, Result<WfExitValue<OwnedValue>, anyhow::Error>>
     + Send
     + Sync
     + 'static;
@@ -207,7 +207,7 @@ impl WorkflowFunction {
                                 WfExitValue::Cancelled => WfExitValue::Cancelled,
                                 WfExitValue::Evicted => WfExitValue::Evicted,
                                 WfExitValue::Normal(o) => {
-                                    WfExitValue::Normal(serde_json::to_value(o)?)
+                                    WfExitValue::Normal(simd_json::serde::to_owned_value(o)?)
                                 }
                             })
                         })
@@ -225,7 +225,7 @@ impl WorkflowFunction {
         workflow_id: String,
         namespace: String,
         task_queue: String,
-    ) -> Instrumented<Pin<Box<dyn Future<Output = Result<WfExitValue<Value>, Error>> + Send>>> {
+    ) -> Instrumented<Pin<Box<dyn Future<Output = Result<WfExitValue<OwnedValue>, Error>> + Send>>> {
         let span = info_span!(
             "RunWorkflow",
             "otel.name" = workflow_type,

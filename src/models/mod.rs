@@ -4,10 +4,10 @@ use serde::Serialize;
 pub mod activity;
 pub mod call;
 pub mod client;
-pub mod history;
+// pub mod history;
 pub mod worker;
 
-pub mod serverless;
+// pub mod serverless;
 pub mod notification;
 // mod worker;
 pub mod workflow;

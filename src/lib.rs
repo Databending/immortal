@@ -153,7 +153,7 @@ impl Client {
             immortal::call_result_version::Version::V1(v1) => match v1.status {
                 Some(x) => match x {
                     call_result_v1::Status::Completed(x) => {
-                        if let Some(result) = x.result {
+                        if let Some(mut result) = x.result {
                             Ok(Some(result.to()?))
                         } else {
                             Ok(None)
@@ -209,12 +209,12 @@ pub mod immortal {
                 payloads: data.iter().map(|d| Payload::new(d)).collect(),
             }
         }
-        pub fn to<O>(&self) -> anyhow::Result<Vec<O>>
+        pub fn to<O>(&mut self) -> anyhow::Result<Vec<O>>
         where
             O: DeserializeOwned + Clone + Serialize,
         {
             let mut data = vec![];
-            for payload in &self.payloads {
+            for payload in &mut self.payloads {
                 let serialized: O = payload.to()?;
                 data.push(serialized);
             }
@@ -228,15 +228,15 @@ pub mod immortal {
             O: Serialize,
         {
             Self {
-                data: serde_json::to_vec(data).unwrap(),
+                data: simd_json::to_vec(data).unwrap(),
                 metadata: Default::default(),
             }
         }
-        pub fn to<O>(&self) -> anyhow::Result<O>
+        pub fn to<O>(&mut self) -> anyhow::Result<O>
         where
             O: DeserializeOwned,
         {
-            Ok(serde_json::from_slice(&self.data)?)
+            Ok(simd_json::from_slice(&mut self.data)?)
         }
     }
 

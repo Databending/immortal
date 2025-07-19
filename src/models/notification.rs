@@ -3,7 +3,7 @@ use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use simd_json::OwnedValue;
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::{collections::HashMap, future::Future, sync::Arc};
@@ -117,8 +117,8 @@ where
     Rf: Future<Output = Result<(), anyhow::Error>> + Send + 'static,
 {
     fn into_notification_fn(self) -> BoxNotificationFn {
-        let wrapper = move |ctx: NotificationContext, input: Payload| {
-            let result = serde_json::from_slice(&input.data);
+        let wrapper = move |ctx: NotificationContext, mut input: Payload| {
+            let result = simd_json::from_slice(&mut input.data);
 
             let fut = match result {
                 Ok(deserialized) => {
@@ -159,9 +159,9 @@ pub struct NotificationContext {
     // worker: Arc<dyn Worker>,
     app_data: Arc<AppData>,
     //cancellation_token: CancellationToken,
-    input: Vec<Value>,
+    input: Vec<OwnedValue>,
     // heartbeat_details: Vec<Value>,
-    header_fields: HashMap<String, Value>,
+    header_fields: HashMap<String, OwnedValue>,
     info: NotificationInfo,
 }
 //
@@ -207,9 +207,9 @@ pub struct Start {
     // The activity's ID
     pub notification_id: String,
     // The activity's type name or function identifier
-    pub header_fields: HashMap<String, Value>,
+    pub header_fields: HashMap<String, OwnedValue>,
     // Arguments to the activity
-    pub input: Vec<Value>,
+    pub input: Vec<OwnedValue>,
     // The last details that were recorded by a heartbeat when this task was generated
     // When the task was *first* scheduled
     // When this current attempt at the task was scheduled
@@ -235,7 +235,7 @@ impl NotificationContext {
         task_queue: String,
         task_token: Vec<u8>,
         task: Start,
-    ) -> (Self, Value) {
+    ) -> (Self, OwnedValue) {
         let Start {
             header_fields,
             mut input,
@@ -279,7 +279,7 @@ impl NotificationContext {
     /// Retrieve extra parameters to the Activity. The first input is always popped and passed to
     /// the Activity function for the currently executing activity. However, if more parameters are
     /// passed, perhaps from another language's SDK, explicit access is available from extra_inputs
-    pub fn extra_inputs(&mut self) -> &mut [Value] {
+    pub fn extra_inputs(&mut self) -> &mut [OwnedValue] {
         &mut self.input
     }
 
@@ -302,7 +302,7 @@ impl NotificationContext {
     }
 
     /// Get headers attached to this activity
-    pub fn headers(&self) -> &HashMap<String, Value> {
+    pub fn headers(&self) -> &HashMap<String, OwnedValue> {
         &self.header_fields
     }
 
