@@ -3,3 +3,4 @@ immortal-macros/target
 .env
 dump.rdb
 .nvim.lua
+errors.log

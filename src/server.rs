@@ -318,8 +318,13 @@ impl ImmortalService {
                         let now = Utc::now();
                         let max_time = running_activity.2.timeout;
                         if now > max_time {
-                            let workers = workers.read().await;
-                            if let Some(worker) = workers.get(&running_activity.2.worker_id) {
+                            let available_workers = {
+                                let workers = workers.read().await;
+                                workers.get(&worker_id).cloned()
+                            };
+                            if let Some(worker) =
+                                available_workers.get(&running_activity.2.worker_id)
+                            {
                                 if let Err(e) = worker
                                     .tx
                                     .send(Ok(ImmortalWorkerActionVersion {
@@ -374,8 +379,11 @@ impl ImmortalService {
                         let now = Utc::now();
                         let max_time = running_call.1.timeout;
                         if now > max_time {
-                            let workers = workers.read().await;
-                            if let Some(worker) = workers.get(&running_call.1.worker_id) {
+                            let available_workers = {
+                                let workers = workers.read().await;
+                                workers.get(&worker_id).cloned()
+                            };
+                            if let Some(worker) = available_workers.get(&running_call.1.worker_id) {
                                 if let Err(e) = worker
                                     .tx
                                     .send(Ok(ImmortalWorkerActionVersion {
@@ -1197,13 +1205,12 @@ impl Immortal for ImmortalService {
         let (tx, rx) = mpsc::channel(100);
         let worker_id;
         {
-            // sometimes immortal freezes here, not sure why
-            println!("waiting to receive workers write handle");
-            let mut workers = self.workers.write().await;
-
             let mut worker_details = worker_details.ok_or(tonic::Status::invalid_argument(
                 "Worker details never provided",
             ))?;
+            // sometimes immortal freezes here, not sure why
+            println!("waiting to receive workers write handle");
+            let mut workers = self.workers.write().await;
 
             worker_id = worker_details.worker_id.clone();
             let worker_ids = workers.iter().map(|f| f.0.clone()).collect::<Vec<_>>();
