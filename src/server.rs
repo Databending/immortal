@@ -86,9 +86,29 @@ use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
+use tokio::io::AsyncReadExt;
+use std::path::Path;
+use crate::state::JwtPublicBytes;
+use crate::state::AppState;
 pub mod api;
+pub mod error;
 pub mod history;
 pub mod models;
+pub mod state;
+
+pub async fn get_file_as_byte_vec() -> JwtPublicBytes {
+    let filename = Path::new("jwt.pem").to_str().unwrap();
+    let mut f = tokio::fs::File::open(&filename)
+        .await
+        .expect("no file found");
+    let metadata = tokio::fs::metadata(&filename)
+        .await
+        .expect("unable to read metadata");
+    let mut buffer = vec![0; metadata.len() as usize];
+    f.read(&mut buffer).await.expect("buffer overflow");
+
+    JwtPublicBytes(buffer)
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub enum Notification {
@@ -318,15 +338,15 @@ impl ImmortalService {
                         let now = Utc::now();
                         let max_time = running_activity.2.timeout;
                         if now > max_time {
-                            let available_workers = {
+                            let available_worker = {
                                 let workers = workers.read().await;
-                                workers.get(&worker_id).cloned()
+                                workers
+                                    .get(&running_activity.2.worker_id)
+                                    .map(|worker| (worker.worker_id.clone(), worker.tx.clone()))
                             };
-                            if let Some(worker) =
-                                available_workers.get(&running_activity.2.worker_id)
-                            {
+                            if let Some(worker) = available_worker {
                                 if let Err(e) = worker
-                                    .tx
+                                    .1
                                     .send(Ok(ImmortalWorkerActionVersion {
                                         version: Some(immortal_worker_action_version::Version::V1(
                                             ImmortalWorkerActionV1 {
@@ -379,13 +399,15 @@ impl ImmortalService {
                         let now = Utc::now();
                         let max_time = running_call.1.timeout;
                         if now > max_time {
-                            let available_workers = {
+                            let available_worker = {
                                 let workers = workers.read().await;
-                                workers.get(&worker_id).cloned()
+                                workers
+                                    .get(&running_call.1.worker_id)
+                                    .map(|worker| (worker.worker_id.clone(), worker.tx.clone()))
                             };
-                            if let Some(worker) = available_workers.get(&running_call.1.worker_id) {
+                            if let Some(worker) = available_worker {
                                 if let Err(e) = worker
-                                    .tx
+                                    .1
                                     .send(Ok(ImmortalWorkerActionVersion {
                                         version: Some(immortal_worker_action_version::Version::V1(
                                             ImmortalWorkerActionV1 {
@@ -1960,7 +1982,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .layer(CorsLayer::permissive())
                     .layer(layer),
             )
-            .with_state(immortal_service);
+            .with_state(AppState {
+                without_validation_arguments: (),
+                pub_key: get_file_as_byte_vec().await,
+                immortal_service
+
+            });
 
         let listener = tokio::net::TcpListener::bind("0.0.0.0:3001").await.unwrap();
         tokio::spawn(async move {

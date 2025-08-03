@@ -3,11 +3,11 @@ use axum::{
     Router,
 };
 
-use crate::ImmortalService;
+use crate::AppState;
 pub mod run;
 pub mod server;
 
-pub fn router() -> Router<ImmortalService> {
+pub fn router() -> Router<AppState> {
     Router::new()
         .route("/run/workflow", post(run::run_workflow))
         .route("/run/activity", post(run::run_activity))

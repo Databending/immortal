@@ -1,14 +1,14 @@
-use crate::ImmortalService;
+use crate::state::AppState;
+use crate::{
+    history::{ActivityHistory, Status, WorkflowHistory, WorkflowHistoryVersion},
+    ActivitySchema, WfSchema,
+};
 use axum::{
     extract::{Query, State},
     response::IntoResponse,
     Json,
 };
 use chrono::{DateTime, Utc};
-use crate::{
-    history::{ActivityHistory, Status, WorkflowHistory, WorkflowHistoryVersion},
-    ActivitySchema, WfSchema,
-};
 use o2o::o2o;
 use serde::{Deserialize, Serialize};
 // use serde_json::Value;
@@ -69,12 +69,13 @@ pub enum ApiStatus {
 }
 
 pub async fn get_history(
-    State(state): State<ImmortalService>,
+    State(state): State<AppState>,
 
     Query(params): Query<HistoryFilter>, // this argument tells axum to parse the request body
                                          // as JSON into a `CreateUser` type
 ) -> impl IntoResponse {
     match state
+        .immortal_service
         .history
         .get_workflows(Some(100), None, params.task_queue, params.worker_id)
         .await
@@ -97,11 +98,11 @@ pub async fn get_history(
 }
 
 pub async fn get_workers(
-    State(state): State<ImmortalService>,
+    State(state): State<AppState>,
     // this argument tells axum to parse the request body
     // as JSON into a `CreateUser` type
 ) -> impl IntoResponse {
-    let workers = state.workers.read().await;
+    let workers = state.immortal_service.workers.read().await;
     let mut registered_workers = Vec::new();
     for (worker_id, worker) in workers.iter() {
         registered_workers.push(Worker {
@@ -154,12 +155,13 @@ pub async fn get_workers(
 //
 
 pub async fn get_workflow_queue(
-    State(state): State<ImmortalService>,
+    State(state): State<AppState>,
     // this argument tells axum to parse the request body
     // as JSON into a `CreateUser` type
 ) -> impl IntoResponse {
     Json(
         state
+            .immortal_service
             .workflow_queue
             .lock()
             .await
@@ -177,12 +179,13 @@ pub async fn get_workflow_queue(
 }
 
 pub async fn get_activity_queue(
-    State(state): State<ImmortalService>,
+    State(state): State<AppState>,
     // this argument tells axum to parse the request body
     // as JSON into a `CreateUser` type
 ) -> impl IntoResponse {
     Json(
         state
+            .immortal_service
             .activity_queue
             .lock()
             .await
@@ -200,12 +203,13 @@ pub async fn get_activity_queue(
 }
 
 pub async fn get_call_queue(
-    State(state): State<ImmortalService>,
+    State(state): State<AppState>,
     // this argument tells axum to parse the request body
     // as JSON into a `CreateUser` type
 ) -> impl IntoResponse {
     Json(
         state
+            .immortal_service
             .call_queue
             .lock()
             .await
@@ -223,12 +227,13 @@ pub async fn get_call_queue(
 }
 
 pub async fn running_calls(
-    State(state): State<ImmortalService>,
+    State(state): State<AppState>,
     // this argument tells axum to parse the request body
     // as JSON into a `CreateUser` type
 ) -> impl IntoResponse {
     Json(
         state
+            .immortal_service
             .running_calls
             .read()
             .await
@@ -239,12 +244,13 @@ pub async fn running_calls(
 }
 
 pub async fn running_activities(
-    State(state): State<ImmortalService>,
+    State(state): State<AppState>,
     // this argument tells axum to parse the request body
     // as JSON into a `CreateUser` type
 ) -> impl IntoResponse {
     Json(
         state
+            .immortal_service
             .running_activities
             .read()
             .await

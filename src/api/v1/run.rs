@@ -1,10 +1,10 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use immortal::immortal::CallVersion;
 
-use crate::{immortal::ClientStartWorkflowOptionsVersion, ImmortalService};
+use crate::{immortal::ClientStartWorkflowOptionsVersion, state::AppState};
 
 pub async fn run_workflow(
-    State(state): State<ImmortalService>,
+    State(state): State<AppState>,
     // this argument tells axum to parse the request body
     // as JSON into a `CreateUser` type
     Json(workflow_options): Json<ClientStartWorkflowOptionsVersion>,
@@ -14,6 +14,7 @@ pub async fn run_workflow(
         workflow_options
     );
     state
+        .immortal_service
         .start_workflow_internal(workflow_options, None)
         .await
         .unwrap();
@@ -24,7 +25,7 @@ pub async fn run_workflow(
 }
 
 pub async fn run_activity(
-    State(state): State<ImmortalService>,
+    State(state): State<AppState>,
     // this argument tells axum to parse the request body
     // as JSON into a `CreateUser` type
     Json(workflow_options): Json<CallVersion>,
@@ -34,6 +35,7 @@ pub async fn run_activity(
         workflow_options
     );
     state
+        .immortal_service
         .start_activity_internal(workflow_options)
         .await
         .unwrap();

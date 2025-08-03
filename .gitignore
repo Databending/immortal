@@ -4,3 +4,4 @@ immortal-macros/target
 dump.rdb
 .nvim.lua
 errors.log
+jwt.pem
