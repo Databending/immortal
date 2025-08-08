@@ -29,6 +29,8 @@ pub struct NotificationOptions {
     ///
     /// If `None`, use the same task queue as the parent workflow.
     pub task_queue: Option<String>,
+
+    pub stackable: Option<bool>,
 }
 
 // #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]

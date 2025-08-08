@@ -82,14 +82,14 @@ use uuid::Uuid;
 // use routeguide::worker_action::Action;
 // use routeguide::{Feature, Point, Rectangle, RouteNote, RouteSummary};
 
+use crate::state::AppState;
+use crate::state::JwtPublicBytes;
 use serde::Serialize;
+use std::path::Path;
+use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
-use tokio::io::AsyncReadExt;
-use std::path::Path;
-use crate::state::JwtPublicBytes;
-use crate::state::AppState;
 pub mod api;
 pub mod error;
 pub mod history;
@@ -194,7 +194,7 @@ pub enum WorkflowStatus {
 //     }
 // }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 struct CallOptions {
     call_type: String,
     input: Option<Payload>,
@@ -992,13 +992,26 @@ impl Immortal for ImmortalService {
                     let mut queue = self.call_queue.lock().await;
                     match queue.get_mut(&call.call_type) {
                         Some(queue) => {
-                            queue.push_back(Box::new((
-                                Uuid::new_v4().to_string(),
-                                CallOptions {
+                            // check if call is already in the queue and if it is stackable
+                            if call.stackable.unwrap_or(false) {
+                                let existing_calls_in_queue =
+                                    queue.iter().map(|f| f.1.clone()).collect::<Vec<_>>();
+                                let call_options = CallOptions {
                                     call_type: call.call_type.clone(),
                                     input: call.input,
                                     task_queue: call.task_queue.clone(),
-                                },
+                                };
+                                for existing_call_in_queue in existing_calls_in_queue {
+                                    if existing_call_in_queue == call_options {
+                                        self.call_notify.notify_one();
+                                        return Ok(Response::new(()));
+                                    }
+                                }
+                            }
+
+                            queue.push_back(Box::new((
+                                Uuid::new_v4().to_string(),
+                                call_options,
                                 None,
                             )));
                         }
@@ -1041,23 +1054,34 @@ impl Immortal for ImmortalService {
     ) -> Result<Response<CallResultVersion>, Status> {
         match request.into_inner().version {
             Some(call_version::Version::V1(call)) => {
-                let (tx, mut rx) = mpsc::channel::<CallResultV1>(10);
-
-                {
+                let mut rx = {
                     let mut queue = self.call_queue.lock().await;
                     match queue.get_mut(&call.call_type) {
                         Some(queue) => {
+                            let (tx, rx) = mpsc::channel::<CallResultV1>(10);
+                            // need to switch from mpsc to broadcast
+                            // let existing_calls_in_queue =
+                            //     queue.iter().map(|f| f.1.clone()).collect::<Vec<_>>();
+                            // let call_options = CallOptions {
+                            //     call_type: call.call_type.clone(),
+                            //     input: call.input,
+                            //     task_queue: call.task_queue.clone(),
+                            // };
+                            // for existing_call_in_queue in existing_calls_in_queue {
+                            //     if existing_call_in_queue == call_options {
+                            //         self.call_notify.notify_one();
+                            //         // return Response::new(());
+                            //     }
+                            // }
                             queue.push_back(Box::new((
                                 Uuid::new_v4().to_string(),
-                                CallOptions {
-                                    call_type: call.call_type.clone(),
-                                    input: call.input,
-                                    task_queue: call.task_queue.clone(),
-                                },
+                                call_options,
                                 Some(tx),
                             )));
+                            rx
                         }
                         None => {
+                            let (tx, rx) = mpsc::channel::<CallResultV1>(10);
                             let mut queue2 = VecDeque::new();
                             queue2.push_back(Box::new((
                                 Uuid::new_v4().to_string(),
@@ -1069,9 +1093,10 @@ impl Immortal for ImmortalService {
                                 Some(tx),
                             )));
                             queue.insert(call.call_type.clone(), queue2);
+                            rx
                         }
                     }
-                }
+                };
 
                 self.call_notify.notify_one();
                 // queue.get_mut(&call.call_type).unwrap().push_back((
@@ -1225,7 +1250,7 @@ impl Immortal for ImmortalService {
         });
 
         let (tx, rx) = mpsc::channel(100);
-        let worker_id;
+        let mut worker_id;
         {
             let mut worker_details = worker_details.ok_or(tonic::Status::invalid_argument(
                 "Worker details never provided",
@@ -1240,9 +1265,10 @@ impl Immortal for ImmortalService {
             if worker_ids.contains(&worker_details.worker_id) {
                 worker_details.worker_id =
                     format!("{}-{}", worker_details.worker_id, Uuid::new_v4());
+                worker_id = worker_details.worker_id.clone();
             }
 
-            println!("{:#?}", worker_ids);
+            println!("WORKER IDS: {:#?}", worker_ids);
             let registered_workflows = worker_details
                 .registered_workflows
                 .iter_mut()
@@ -1327,10 +1353,15 @@ impl Immortal for ImmortalService {
 
             {
                 let mut workers = workers.write().await;
-                workers.remove(&worker_id);
-            }
+                let x = workers.remove(&worker_id);
 
-            println!("Stream ended");
+                if let Some(x) = x {
+                    println!("Stream ended and removed {:?}", x.worker_id);
+                } else {
+                    error!("Stream ended NO WORKER REMOVED {}", worker_id);
+                    println!("Stream ended NO WORKER REMOVED {}", worker_id);
+                }
+            }
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -1985,8 +2016,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_state(AppState {
                 without_validation_arguments: (),
                 pub_key: get_file_as_byte_vec().await,
-                immortal_service
-
+                immortal_service,
             });
 
         let listener = tokio::net::TcpListener::bind("0.0.0.0:3001").await.unwrap();

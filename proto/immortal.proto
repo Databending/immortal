@@ -367,6 +367,7 @@ message CallV1 {
   string call_version = 2;
   common.Payload input = 3;
   string task_queue = 4;
+  optional bool stackable = 5;
 }
 
 message WorkerCallVersion {

@@ -58,6 +58,8 @@ pub struct CallOptions {
     pub cancellation_type: immortal::ActivityCancellationType,
     /// Activity retry policy
     pub retry_policy: Option<immortal::RetryPolicy>,
+
+    pub stackable: Option<bool>,
 }
 
 // #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
