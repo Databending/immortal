@@ -992,15 +992,16 @@ impl Immortal for ImmortalService {
                     let mut queue = self.call_queue.lock().await;
                     match queue.get_mut(&call.call_type) {
                         Some(queue) => {
+                            let call_options = CallOptions {
+                                call_type: call.call_type.clone(),
+                                input: call.input,
+                                task_queue: call.task_queue.clone(),
+                            };
                             // check if call is already in the queue and if it is stackable
                             if call.stackable.unwrap_or(false) {
                                 let existing_calls_in_queue =
                                     queue.iter().map(|f| f.1.clone()).collect::<Vec<_>>();
-                                let call_options = CallOptions {
-                                    call_type: call.call_type.clone(),
-                                    input: call.input,
-                                    task_queue: call.task_queue.clone(),
-                                };
+
                                 for existing_call_in_queue in existing_calls_in_queue {
                                     if existing_call_in_queue == call_options {
                                         self.call_notify.notify_one();
@@ -1062,11 +1063,11 @@ impl Immortal for ImmortalService {
                             // need to switch from mpsc to broadcast
                             // let existing_calls_in_queue =
                             //     queue.iter().map(|f| f.1.clone()).collect::<Vec<_>>();
-                            // let call_options = CallOptions {
-                            //     call_type: call.call_type.clone(),
-                            //     input: call.input,
-                            //     task_queue: call.task_queue.clone(),
-                            // };
+                            let call_options = CallOptions {
+                                call_type: call.call_type.clone(),
+                                input: call.input,
+                                task_queue: call.task_queue.clone(),
+                            };
                             // for existing_call_in_queue in existing_calls_in_queue {
                             //     if existing_call_in_queue == call_options {
                             //         self.call_notify.notify_one();
