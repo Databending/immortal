@@ -1,5 +1,8 @@
+use std::collections::HashMap;
+
 use bb8_redis::RedisConnectionManager;
 use redis::AsyncCommands;
+use serde::Deserialize;
 use simd_json::OwnedValue;
 use socketioxide::extract::{AckSender, State};
 use socketioxide::extract::{Data, SocketRef};
@@ -7,12 +10,19 @@ use socketioxide::socket::DisconnectReason;
 
 use bb8_redis::bb8::Pool;
 use simd_json::prelude::ValueAsMutObject;
+use tokio::sync::broadcast::Sender;
 use tokio::sync::{broadcast, watch};
 use tracing::info;
 
+use crate::{ImmortalService, Notification};
 use immortal_worker_lib::metrics::Metrics;
-use crate::Notification;
 use redis::streams::{StreamId, StreamKey, StreamReadOptions, StreamReadReply};
+
+#[derive(Deserialize)]
+struct MetricsRequest {
+    pub workers: Vec<String>,
+}
+
 pub async fn on_connect(
     socket: SocketRef,
     Data(_data): Data<OwnedValue>,
@@ -20,6 +30,7 @@ pub async fn on_connect(
     notification_tx: State<broadcast::Sender<Notification>>,
     _latest_rx: State<watch::Receiver<Metrics>>,
     stream_tx: State<broadcast::Sender<Metrics>>,
+    immortal_service: State<ImmortalService>,
 ) {
     info!("Socket.IO connected: {:?} {:?}", socket.ns(), socket.id);
     // println!("Data = {:?}", data);
@@ -30,25 +41,60 @@ pub async fn on_connect(
 
     {
         let stream_tx = stream_tx.clone();
+        let workers;
+        {
+            let workers_temp = immortal_service.workers.read().await;
+            workers = (*workers_temp)
+                .iter()
+                .map(|f| (f.0.clone(), f.1.metrics_stream.clone()))
+                .collect::<HashMap<String, Sender<Metrics>>>();
+        }
 
-        socket.on("metrics", |socket: SocketRef| async move {
-            println!("here");
-            let mut sub = stream_tx.subscribe();
-            while let Ok(sample) = sub.recv().await {
-                match socket.emit("metrics-back", &serde_json::to_value(sample).unwrap()) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        println!("{:#?}", e);
-                        break;
+        socket.on(
+            "metrics",
+            |socket: SocketRef, Data::<OwnedValue>(data)| async move {
+                println!("here");
+                let metrics_request: MetricsRequest =
+                    simd_json::serde::from_owned_value(data.clone()).unwrap();
+                if metrics_request.workers.contains(&"server".to_string()) {
+                    tokio::spawn(async move {
+                        let mut sub = stream_tx.subscribe();
+                        while let Ok(sample) = sub.recv().await {
+                            match socket
+                                .emit("metrics-back", &serde_json::to_value(sample).unwrap())
+                            {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    println!("{:#?}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                } else {
+                    for worker in metrics_request.workers {
+                        if let Some(sender) = workers.get(&worker) {
+                            let mut sub = sender.subscribe();
+                            let socket = socket.clone();
+                            tokio::spawn(async move {
+                                while let Ok(sample) = sub.recv().await {
+                                    match socket.emit(
+                                        "metrics-back",
+                                        &serde_json::to_value(sample).unwrap(),
+                                    ) {
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            println!("{:#?}", e);
+                                            break;
+                                        }
+                                    }
+                                }
+                            });
+                        }
                     }
                 }
-                // Ok(sample) => {
-                // stop if emit fails (socket gone)
-                // if socket.emit("metrics-back", &sample).is_err() {
-                //     break;
-                // }
-            }
-        });
+            },
+        );
     }
 
     // let a: () = con

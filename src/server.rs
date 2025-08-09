@@ -76,11 +76,11 @@ use uuid::Uuid;
 // use routeguide::worker_action::Action;
 // use routeguide::{Feature, Point, Rectangle, RouteNote, RouteSummary};
 
-use immortal_worker_lib::metrics::sampler;
-use immortal_worker_lib::metrics::Metrics;
 use crate::state::AppState;
 use crate::state::JwtPublicBytes;
 use crate::ws::on_connect;
+use immortal_worker_lib::metrics::sampler;
+use immortal_worker_lib::metrics::Metrics;
 use serde::Serialize;
 use std::path::Path;
 use tokio::io::AsyncReadExt;
@@ -130,6 +130,7 @@ struct RegisteredWorker {
     worker_id: String,
 
     task_queue: String,
+    metrics_stream: broadcast::Sender<Metrics>,
     _incoming: JoinHandle<()>,
     tx: Sender<Result<ImmortalWorkerActionVersion, Status>>,
     registered_workflows: HashMap<String, WfSchema>,
@@ -1174,10 +1175,21 @@ impl Immortal for ImmortalService {
         println!("received worker details");
         let redis_pool = self.redis_pool.clone(); // clone the pool handle before spawning
 
+        let (metrics_stream, _) = broadcast::channel(10);
+        let metrics_stream_sender = metrics_stream.clone();
         let handle = tokio::spawn(async move {
             while let Some(Ok(action)) = stream.next().await {
                 match action.version {
                     Some(immortal_server_action_version::Version::V1(x)) => match x.action {
+                        Some(immortal_server_action_v1::Action::Metrics(metrics)) => {
+                            metrics_stream_sender
+                                .send(Metrics {
+                                    cpu_pct: metrics.cput_pct,
+                                    mem_used: metrics.mem_used,
+                                    mem_total: metrics.mem_total,
+                                })
+                                .ok();
+                        }
                         Some(immortal_server_action_v1::Action::LogEvent(mut log)) => {
                             if let Some(when) = DateTime::from_timestamp(log.when, 0) {
                                 let when = when.to_string();
@@ -1250,6 +1262,7 @@ impl Immortal for ImmortalService {
         });
 
         let (tx, rx) = mpsc::channel(100);
+
         let mut worker_id;
         {
             let mut worker_details = worker_details.ok_or(tonic::Status::invalid_argument(
@@ -1311,6 +1324,7 @@ impl Immortal for ImmortalService {
             workers.insert(
                 worker_details.worker_id.clone(),
                 RegisteredWorker {
+                    metrics_stream,
                     activity_capacity: worker_details.activity_capacity,
                     task_queue: worker_details.task_queue,
                     workflow_capacity: worker_details.workflow_capacity,
@@ -1872,6 +1886,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_state(notification_tx)
             .with_state(latest_rx)
             .with_state(stream_tx)
+            .with_state(immortal_service.clone())
             .build_layer();
         io.ns("/", on_connect);
         let app = axum::Router::new()

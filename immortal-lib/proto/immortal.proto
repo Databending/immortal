@@ -335,7 +335,15 @@ message ImmortalServerActionV1 {
     int32 activity_heartbeat = 3;
     Log log_event = 4;
     int32 heartbeat = 5;
+    Metrics metrics = 6;
   }
+}
+
+message Metrics {
+  float cput_pct = 1;
+  uint64 mem_used = 2;
+  uint64 mem_total = 3;
+
 }
 
 message ImmortalServerActionVersion {

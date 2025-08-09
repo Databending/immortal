@@ -1,54 +1,56 @@
-use anyhow::{anyhow, Error};
+use anyhow::{Error, anyhow};
 use async_stream::stream;
 use schemars::schema::RootSchema;
 use schemars::schema_for;
-use simd_json::{json, OwnedValue};
-use tokio::sync::broadcast::error::RecvError;
+use simd_json::{OwnedValue, json};
+use std::collections::VecDeque;
 use std::fmt::{Debug, Write};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::broadcast::Receiver;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{
-    broadcast,
+    Mutex, broadcast,
     mpsc::{self, UnboundedReceiver, UnboundedSender},
-    Mutex,
 };
+use tokio::sync::{RwLock, watch};
 use tonic::transport::Channel;
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id};
 use tracing::{Event, Subscriber};
-use tracing_subscriber::{layer::Context, layer::SubscriberExt, Layer};
 use tracing_subscriber::{EnvFilter, Registry};
+use tracing_subscriber::{Layer, layer::Context, layer::SubscriberExt};
 use uuid::Uuid;
 
 use immortal_lib::common::{Payload, Payloads};
-use immortal_lib::failure::failure::FailureInfo;
 use immortal_lib::failure::Failure;
+use immortal_lib::failure::failure::FailureInfo;
 use immortal_lib::immortal::{
-    self, call_result_version, workflow_result_v1, workflow_result_version, CallResultV1,
-    CallResultVersion, Failure as ImmortalFailure, RegisteredActivity, RegisteredCall,
-    RegisteredNotification, RegisteredWorkflow, RequestStartActivityOptionsV1,
+    self, CallResultV1, CallResultVersion, Failure as ImmortalFailure, RegisteredActivity,
+    RegisteredCall, RegisteredNotification, RegisteredWorkflow, RequestStartActivityOptionsV1,
     RequestStartActivityOptionsVersion, Success as ImmortalSuccess, WorkflowResultV1,
-    WorkflowResultVersion,
+    WorkflowResultVersion, call_result_version, workflow_result_v1, workflow_result_version,
 };
 use immortal_lib::immortal::{
-    activity_result_v1, activity_result_version, immortal_client::ImmortalClient,
-    immortal_server_action_v1, immortal_server_action_version, immortal_worker_action_v1::Action,
-    immortal_worker_action_version, request_start_activity_options_version, ActivityResultV1,
-    ActivityResultVersion, ImmortalServerActionV1, ImmortalServerActionVersion, Log,
-    RegisterImmortalWorkerV1, StartWorkflowOptionsV1,
+    ActivityResultV1, ActivityResultVersion, ImmortalServerActionV1, ImmortalServerActionVersion,
+    Log, RegisterImmortalWorkerV1, StartWorkflowOptionsV1, activity_result_v1,
+    activity_result_version, immortal_client::ImmortalClient, immortal_server_action_v1,
+    immortal_server_action_version, immortal_worker_action_v1::Action,
+    immortal_worker_action_version, request_start_activity_options_version,
 };
 use tokio::task::JoinHandle;
+
+use crate::metrics::{Metrics, sampler};
 
 use super::call::{CallError, CallExitValue, CallFunction, IntoCallFunc};
 use super::notification::{IntoNotificationFunc, NotificationFunction};
 // use super::serverless;
+use super::{ActivitySchema, CallSchema, NotificationSchema, WfSchema};
 use super::{
     activity::{
         ActExitValue, ActivityError, ActivityFunction, ActivityOptions, AppData, IntoActivityFunc,
     },
     workflow::{WfExitValue, WorkflowFunction},
 };
-use super::{ActivitySchema, CallSchema, NotificationSchema, WfSchema};
 
 pub struct RunningWorkflow {
     pub workflow_id: String,
@@ -89,7 +91,8 @@ pub struct Worker {
         Result<ActExitValue<OwnedValue>, ActivityError>,
     )>,
 
-    pub call_sender: UnboundedSender<(String, String, Result<CallExitValue<OwnedValue>, CallError>)>,
+    pub call_sender:
+        UnboundedSender<(String, String, Result<CallExitValue<OwnedValue>, CallError>)>,
     // pub client: Arc<dyn WorkerClient>,
     pub workery_key: String,
     pub registered_workflows: Arc<Mutex<HashMap<String, (WorkflowFunction, WfSchema)>>>,
@@ -528,7 +531,7 @@ impl Worker {
                 .iter()
                 .map(|x| RegisteredNotification {
                     notification_type: x.0.clone(),
-                    args: simd_json::to_vec(&x.1 .1.args.clone()).unwrap(),
+                    args: simd_json::to_vec(&x.1.1.args.clone()).unwrap(),
                 })
                 .collect(),
             registered_calls: self
@@ -538,8 +541,8 @@ impl Worker {
                 .iter()
                 .map(|x| RegisteredCall {
                     call_type: x.0.clone(),
-                    args: simd_json::to_vec(&x.1 .1.args.clone()).unwrap(),
-                    output: simd_json::to_vec(&x.1 .1.output.clone()).unwrap(),
+                    args: simd_json::to_vec(&x.1.1.args.clone()).unwrap(),
+                    output: simd_json::to_vec(&x.1.1.output.clone()).unwrap(),
                 })
                 .collect(),
             registered_activities: self
@@ -549,8 +552,8 @@ impl Worker {
                 .iter()
                 .map(|x| RegisteredActivity {
                     activity_type: x.0.clone(),
-                    args: simd_json::to_vec(&x.1 .1.args.clone()).unwrap(),
-                    output: simd_json::to_vec(&x.1 .1.output.clone()).unwrap(),
+                    args: simd_json::to_vec(&x.1.1.args.clone()).unwrap(),
+                    output: simd_json::to_vec(&x.1.1.output.clone()).unwrap(),
                 })
                 .collect(),
             registered_workflows: self
@@ -560,8 +563,8 @@ impl Worker {
                 .iter()
                 .map(|x| RegisteredWorkflow {
                     workflow_type: x.0.clone(),
-                    args: simd_json::to_vec(&x.1 .1.args.clone()).unwrap(),
-                    output: simd_json::to_vec(&x.1 .1.output.clone()).unwrap(),
+                    args: simd_json::to_vec(&x.1.1.args.clone()).unwrap(),
+                    output: simd_json::to_vec(&x.1.1.output.clone()).unwrap(),
                 })
                 .collect(),
         };
@@ -572,6 +575,43 @@ impl Worker {
                 .ok_or_else(|| anyhow!("app_data should exist on run"))
                 .unwrap(),
         );
+
+        let (latest_tx, _latest_rx) = watch::channel(Metrics {
+            // ts_ms: 0,
+            cpu_pct: 0.0,
+            mem_used: 0,
+            mem_total: 0,
+        });
+        let (stream_tx, _) = broadcast::channel::<Metrics>(1024);
+
+        // optional history buffer (e.g., last 120 samples)
+        let history = Arc::new(RwLock::new(VecDeque::with_capacity(120)));
+
+        let server_sender = self.server_channel.clone();
+        tokio::spawn(sampler(latest_tx, stream_tx.clone(), history.clone()));
+
+        tokio::spawn(async move {
+            let mut sub = stream_tx.subscribe();
+            while let Ok(x) = sub.recv().await {
+                if let Err(e) = server_sender.send(ImmortalServerActionV1 {
+                    action: Some(
+                        immortal_lib::immortal::immortal_server_action_v1::Action::Metrics(
+                            immortal::Metrics {
+                                cput_pct: x.cpu_pct,
+                                mem_used: x.mem_used,
+                                mem_total: x.mem_total,
+                            },
+                        ),
+                    ),
+                }) {
+                    println!("ERROR: {:#?}", e);
+                    break;
+
+                }
+
+            }
+        });
+
         match self
             .main_thread2(rx, register_immortal_worker, &safe_app_data)
             .await
@@ -1250,7 +1290,7 @@ impl Worker {
                             crid.to_string(),
                             match res {
                                 Ok(x) => Ok(match x {
-                                    ActExitValue::Normal(y) => CallExitValue::Normal(y)
+                                    ActExitValue::Normal(y) => CallExitValue::Normal(y),
                                 }),
                                 Err(e) => Err(match e {
                                     ActivityError::Retryable {
