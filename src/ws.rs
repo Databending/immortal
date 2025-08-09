@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use bb8_redis::RedisConnectionManager;
 use redis::AsyncCommands;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use simd_json::OwnedValue;
 use socketioxide::extract::{AckSender, State};
 use socketioxide::extract::{Data, SocketRef};
@@ -21,6 +21,14 @@ use redis::streams::{StreamId, StreamKey, StreamReadOptions, StreamReadReply};
 #[derive(Deserialize)]
 struct MetricsRequest {
     pub workers: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct MetricsResponse {
+    pub worker_id: String,
+    pub cpu_pct: f32,
+    pub mem_used: u64,
+    pub mem_total: u64,
 }
 
 pub async fn on_connect(
@@ -57,12 +65,19 @@ pub async fn on_connect(
                 let metrics_request: MetricsRequest =
                     simd_json::serde::from_owned_value(data.clone()).unwrap();
                 if metrics_request.workers.contains(&"server".to_string()) {
+                    let socket = socket.clone();
                     tokio::spawn(async move {
                         let mut sub = stream_tx.subscribe();
                         while let Ok(sample) = sub.recv().await {
-                            match socket
-                                .emit("metrics-back", &serde_json::to_value(sample).unwrap())
-                            {
+                            match socket.emit(
+                                "metrics-back",
+                                &MetricsResponse {
+                                    worker_id: "server".to_string(),
+                                    cpu_pct: sample.cpu_pct,
+                                    mem_used: sample.mem_used,
+                                    mem_total: sample.mem_total,
+                                },
+                            ) {
                                 Ok(_) => {}
                                 Err(e) => {
                                     println!("{:#?}", e);
@@ -71,26 +86,30 @@ pub async fn on_connect(
                             }
                         }
                     });
-                } else {
-                    for worker in metrics_request.workers {
-                        if let Some(sender) = workers.get(&worker) {
-                            let mut sub = sender.subscribe();
-                            let socket = socket.clone();
-                            tokio::spawn(async move {
-                                while let Ok(sample) = sub.recv().await {
-                                    match socket.emit(
-                                        "metrics-back",
-                                        &serde_json::to_value(sample).unwrap(),
-                                    ) {
-                                        Ok(_) => {}
-                                        Err(e) => {
-                                            println!("{:#?}", e);
-                                            break;
-                                        }
+                }
+                for worker in metrics_request.workers {
+                    if let Some(sender) = workers.get(&worker) {
+                        let mut sub = sender.subscribe();
+                        let socket = socket.clone();
+                        tokio::spawn(async move {
+                            while let Ok(sample) = sub.recv().await {
+                                match socket.emit(
+                                    "metrics-back",
+                                    &MetricsResponse {
+                                        worker_id: worker.to_string(),
+                                        cpu_pct: sample.cpu_pct,
+                                        mem_used: sample.mem_used,
+                                        mem_total: sample.mem_total,
+                                    },
+                                ) {
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        println!("{:#?}", e);
+                                        break;
                                     }
                                 }
-                            });
-                        }
+                            }
+                        });
                     }
                 }
             },

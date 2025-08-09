@@ -514,7 +514,9 @@ impl Worker {
     async fn main_thread3(
         &mut self,
         rx: &broadcast::Receiver<ImmortalServerActionV1>,
+        stream_tx: &broadcast::Sender<Metrics>,
     ) -> anyhow::Result<()> {
+        let mut sub = stream_tx.subscribe();
         // let (tx, mut rx) = broadcast::channel(100);
         let rx = rx.resubscribe();
 
@@ -576,22 +578,8 @@ impl Worker {
                 .unwrap(),
         );
 
-        let (latest_tx, _latest_rx) = watch::channel(Metrics {
-            // ts_ms: 0,
-            cpu_pct: 0.0,
-            mem_used: 0,
-            mem_total: 0,
-        });
-        let (stream_tx, _) = broadcast::channel::<Metrics>(1024);
-
-        // optional history buffer (e.g., last 120 samples)
-        let history = Arc::new(RwLock::new(VecDeque::with_capacity(120)));
-
         let server_sender = self.server_channel.clone();
-        tokio::spawn(sampler(latest_tx, stream_tx.clone(), history.clone()));
-
-        tokio::spawn(async move {
-            let mut sub = stream_tx.subscribe();
+        let handle  =tokio::spawn(async move {
             while let Ok(x) = sub.recv().await {
                 if let Err(e) = server_sender.send(ImmortalServerActionV1 {
                     action: Some(
@@ -606,9 +594,7 @@ impl Worker {
                 }) {
                     println!("ERROR: {:#?}", e);
                     break;
-
                 }
-
             }
         });
 
@@ -619,6 +605,8 @@ impl Worker {
             Ok(_) => {}
             Err(_) => {}
         }
+        // we can probably just move this up a level instead of spawning and canceling
+        handle.abort();
         // let temp_stream = BroadcastStream::new(rx)
         //     .filter_map(|item| async move {
         //         // ignore receive errors
@@ -648,8 +636,21 @@ impl Worker {
             );
             // let _ = serverless::main(self, safe_app_data).await;
         } else {
+            let (latest_tx, _latest_rx) = watch::channel(Metrics {
+                // ts_ms: 0,
+                cpu_pct: 0.0,
+                mem_used: 0,
+                mem_total: 0,
+            });
+            let (stream_tx, _) = broadcast::channel::<Metrics>(1024);
+
+            // optional history buffer (e.g., last 120 samples)
+            let history = Arc::new(RwLock::new(VecDeque::with_capacity(120)));
+
+            tokio::spawn(sampler(latest_tx, stream_tx.clone(), history.clone()));
+
             loop {
-                let _ = self.main_thread3(&rx).await;
+                let _ = self.main_thread3(&rx, &stream_tx).await;
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 println!("Main thread loop. Reconnecting...");
             }
