@@ -1,13 +1,9 @@
-// pub mod immortal {
-//     tonic::include_proto!("immortal");
-// }
-
-use crate::common::Payloads;
-use crate::immortal::{
+use immortal_lib::common::Payloads;
+use immortal_lib::immortal::{
     activity_result_v1::Status, activity_result_version, immortal_client::ImmortalClient,
     request_start_activity_options_version,
 };
-use crate::immortal::{
+use immortal_lib::immortal::{
     RequestStartActivityOptionsV1, RequestStartActivityOptionsVersion, RetryPolicy,
 };
 use anyhow::{anyhow, Error};

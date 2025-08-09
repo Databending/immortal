@@ -1,13 +1,12 @@
 use crate::models::worker::WorkerConfigBuilder;
-use ::immortal::common;
-use ::immortal::failure;
-use ::immortal::immortal;
-use ::immortal::register_workflow;
+use immortal_lib::common;
+use immortal_lib::failure;
+use immortal_lib::immortal;
+use immortal_lib::register_workflow;
 pub mod activities;
 pub mod models;
 pub mod workflows;
-#[cfg(not(feature = "worker"))]
-compile_error!("This binary crate requires `--features worker`.");
+
 // use crate::activities::ActivityData;
 
 use activities::test::ActivityData;

@@ -1,0 +1,24 @@
+[package]
+name = "immortal-worker-lib"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+immortal-macros = { path = "../immortal-macros" }
+immortal-lib = { path = "../immortal-lib" }
+tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
+serde = { version = "1.0", features = ["derive"] }
+anyhow = "1.0.98"
+simd-json = {version="0.15.1"}
+tonic = "0.13"
+tracing-subscriber = {version = "0.3.19", features=["env-filter"]}
+sysinfo = "0.36.1"
+schemars = {version = "0.8.22", features=["uuid1"]}
+derive_builder = {version="0.20.2"}
+tracing = {version="0.1.41"}
+uuid = { version = "1.16.0", features = ["v4", "serde"]}
+
+chrono = {version = "0.4.41", features=["serde"]}
+async-stream = {version="0.3"}
+futures = {version="0.3.31"}
+tokio-util = {version="0.7.15"}

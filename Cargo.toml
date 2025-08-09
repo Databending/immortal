@@ -19,59 +19,56 @@ tokio-util = {version="0.7.15"}
 futures = {version="0.3.31"}
 uuid = { version = "1.16.0", features = ["v4", "serde"]}
 schemars = {version = "0.8.22", features=["uuid1"]}
-
-paste = {version="1.0.15"}
+# paste = {version="1.0.15"}
 derive_builder = {version="0.20.2"}
 chrono = {version = "0.4.41", features=["serde"]}
 async-stream = {version="0.3"}
 tracing-subscriber = {version = "0.3.19", features=["env-filter"]}
 # server dependencies
-tokio-stream = {version = "0.1",features=["sync"], optional = true}
-prost-wkt = {version = "0.6", optional = true}
+tokio-stream = {version = "0.1",features=["sync"]}
+prost-wkt = {version = "0.6"}
 prost-wkt-types = {version="0.6"}
-serde_json = {version="1.0", optional = true}
-rand = {version="0.9", optional = true}
-thiserror = { version = "2.0.12", optional = true }
-tonic-health = {version="0.13.0", optional = true}
-prost-types = {version="0.13.5", optional = true}
-axum = {version="0.8.4", optional = true, features = ["macros"]}
-socketioxide = { version = "0.16.2", features = ["state"] , optional = true}
-tower-http = { version = "0.6.2", features = ["cors"] , optional = true}
-bb8-redis = {version="0.22.0", optional = true}
-redis = { version = "0.30", default-features = false, features = ["tokio-comp", "streams", "aio"] , optional = true}
-immortal-macros = { path = "immortal-macros" , optional = true}
-itertools = {version="0.14.0", optional = true}
-const_format = {version="0.2.34", optional = true}
-tower = {version="0.5.2", optional = true}
-regex = {version="1.11.1", optional = true}
-dotenvy = {version="0.15.7", optional = true}
-console-subscriber = {version="0.4.1", optional = true}
-o2o = { version = "0.5.4", features = ["o2o-macros"] , optional = true}
-strum = { version = "0.27.2", optional = true, features=["derive"] }
-garde = { version = "0.22.0", optional = true }
+serde_json = {version="1.0"}
+rand = {version="0.9"}
+thiserror = { version = "2.0.12"}
+# tonic-health = {version="0.13.0"}
+prost-types = {version="0.13.5"}
+axum = {version="0.8.4", features = ["macros"]}
+socketioxide = { version = "0.16.2", features = ["state"]}
+tower-http = { version = "0.6.2", features = ["cors"]}
+bb8-redis = {version="0.22.0"}
+redis = { version = "0.30", default-features = false, features = ["tokio-comp", "streams", "aio"]}
+# immortal-macros = { path = "immortal-macros" }
+immortal-lib = { path = "immortal-lib" }
+immortal-worker-lib = { path = "immortal-worker-lib" }
+itertools = {version="0.14.0"}
+const_format = {version="0.2.34"}
+tower = {version="0.5.2"}
+regex = {version="1.11.1"}
+dotenvy = {version="0.15.7"}
+console-subscriber = {version="0.4.1"}
+o2o = { version = "0.5.4", features = ["o2o-macros"] }
+strum = { version = "0.27.2", features=["derive"] }
+garde = { version = "0.22.0" }
+sysinfo = "0.36.1"
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = {version = "0.6", features = ["profiling"], optional=true }
-[build-dependencies]
-tonic-build = "0.13"
-prost-wkt-build = "0.6"
+tikv-jemallocator = {version = "0.6", features = ["profiling"]}
 
 [[bin]]
 name = "server"
 path = "src/server.rs"
-required-features = ["server"]
 
 
-
-[[bin]]
-name = "worker"
-path = "src/worker.rs"
-required-features = ["worker"]
+#
+# [[bin]]
+# name = "worker"
+# path = "src/worker.rs"
 #
 # [[bin]]
 # name = "client"
 # path = "src/client.rs"
 
-
-[features]
-server=["dep:tokio-stream", "dep:immortal-macros", "dep:dotenvy", "dep:immortal-macros", "dep:axum", "dep:o2o", "dep:redis", "dep:bb8-redis" ,"dep:rand","dep:regex", "dep:socketioxide", "dep:tower", "dep:tower-http", "dep:itertools", "dep:const_format", "dep:console-subscriber", "dep:tikv-jemallocator", "dep:thiserror", "dep:strum", "dep:garde"]
-worker=["dep:immortal-macros", "dep:dotenvy"]
+#
+# [features]
+# server=["dep:tokio-stream", "dep:immortal-macros", "dep:dotenvy", "dep:immortal-macros", "dep:axum", "dep:o2o", "dep:redis", "dep:bb8-redis" ,"dep:rand","dep:regex", "dep:socketioxide", "dep:tower", "dep:tower-http", "dep:itertools", "dep:const_format", "dep:console-subscriber", "dep:tikv-jemallocator", "dep:thiserror", "dep:strum", "dep:garde"]
+# worker=["dep:immortal-macros", "dep:dotenvy"]

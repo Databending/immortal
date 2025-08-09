@@ -1,5 +1,5 @@
 use std::ops::Deref;
-use immortal::common::Payload;
+use immortal_lib::common::Payload;
 use immortal_macros::wf;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

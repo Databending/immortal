@@ -1,4 +1,4 @@
-use crate::common::Payload;
+use immortal_lib::common::Payload;
 use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use serde::de::DeserializeOwned;

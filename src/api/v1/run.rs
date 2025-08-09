@@ -1,5 +1,5 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
-use immortal::immortal::CallVersion;
+use immortal_lib::immortal::CallVersion;
 
 use crate::{immortal::ClientStartWorkflowOptionsVersion, state::AppState};
 

@@ -1,0 +1,21 @@
+[package]
+name = "immortal-lib"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+serde = {version = "1.0.219", features=["derive"]}
+tonic = "0.13"
+# immortal-macros = { path = "../immortal-macros" }
+simd-json = {version="0.15.1"}
+prost-wkt = "0.6"
+prost-wkt-types = "0.6"
+prost-types = "0.13.5"
+prost = "0.13.1"
+# tonic-prost = "0.14.1"
+
+[build-dependencies]
+tonic-build = "0.13.1"
+prost-wkt-build = "0.6"
+# tonic-prost-build = "0.14.1"

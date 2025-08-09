@@ -1,2 +1,9 @@
 [build]
-rustflags = ["--cfg", 'feature="server"']
+rustflags = [
+    "--cfg", 'feature="server"',
+    "--cfg", 'feature="worker"',
+]
+
+[check]
+bin = "server"
+features = ["server", "worker"]

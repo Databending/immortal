@@ -1,5 +1,7 @@
 /target
 immortal-macros/target
+immortal-lib/target
+immortal-worker-lib/target
 .env
 dump.rdb
 .nvim.lua

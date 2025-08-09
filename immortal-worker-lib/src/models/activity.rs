@@ -1,5 +1,5 @@
-use crate::common::Payload;
-use crate::immortal;
+use immortal_lib::common::Payload;
+use immortal_lib::immortal;
 use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use serde::de::DeserializeOwned;

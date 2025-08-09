@@ -1,39 +1,37 @@
-use schemars::schema::RootSchema;
-use serde::Serialize;
 
-pub mod activity;
-pub mod call;
+// pub mod activity;
+// pub mod call;
 pub mod client;
 // pub mod history;
-pub mod worker;
+// pub mod worker;
 
 // pub mod serverless;
-pub mod notification;
+// pub mod notification;
 // mod worker;
-pub mod workflow;
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct WfSchema {
-    pub args: Vec<RootSchema>,
-    pub output: RootSchema,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct ActivitySchema {
-    pub args: RootSchema,
-    pub output: RootSchema,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct CallSchema {
-    pub args: RootSchema,
-    pub output: RootSchema,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct NotificationSchema {
-    pub args: RootSchema,
-}
+// pub mod workflow;
+//
+// #[derive(Debug, Clone, Default, Serialize)]
+// pub struct WfSchema {
+//     pub args: Vec<RootSchema>,
+//     pub output: RootSchema,
+// }
+//
+// #[derive(Debug, Clone, Default, Serialize)]
+// pub struct ActivitySchema {
+//     pub args: RootSchema,
+//     pub output: RootSchema,
+// }
+//
+// #[derive(Debug, Clone, Default, Serialize)]
+// pub struct CallSchema {
+//     pub args: RootSchema,
+//     pub output: RootSchema,
+// }
+//
+// #[derive(Debug, Clone, Default, Serialize)]
+// pub struct NotificationSchema {
+//     pub args: RootSchema,
+// }
 //
 // #[derive(Debug, Clone, Default)]
 // pub struct RetryPolicy {

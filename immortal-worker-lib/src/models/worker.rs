@@ -20,17 +20,17 @@ use tracing_subscriber::{layer::Context, layer::SubscriberExt, Layer};
 use tracing_subscriber::{EnvFilter, Registry};
 use uuid::Uuid;
 
-use crate::common::{Payload, Payloads};
-use crate::failure::failure::FailureInfo;
-use crate::failure::Failure;
-use crate::immortal::{
+use immortal_lib::common::{Payload, Payloads};
+use immortal_lib::failure::failure::FailureInfo;
+use immortal_lib::failure::Failure;
+use immortal_lib::immortal::{
     self, call_result_version, workflow_result_v1, workflow_result_version, CallResultV1,
     CallResultVersion, Failure as ImmortalFailure, RegisteredActivity, RegisteredCall,
     RegisteredNotification, RegisteredWorkflow, RequestStartActivityOptionsV1,
     RequestStartActivityOptionsVersion, Success as ImmortalSuccess, WorkflowResultV1,
     WorkflowResultVersion,
 };
-use crate::immortal::{
+use immortal_lib::immortal::{
     activity_result_v1, activity_result_version, immortal_client::ImmortalClient,
     immortal_server_action_v1, immortal_server_action_version, immortal_worker_action_v1::Action,
     immortal_worker_action_version, request_start_activity_options_version, ActivityResultV1,

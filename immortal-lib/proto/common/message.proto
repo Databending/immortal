@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package common;
+// See `Payload`
+message Payloads {
+    repeated Payload payloads = 1;
+}
+
+// Represents some binary (byte array) data (ex: activity input parameters or workflow result) with
+// metadata which describes this binary data (format, encoding, encryption, etc). Serialization
+// of the data may be user-defined.
+message Payload {
+    map<string,bytes> metadata = 1;
+    bytes data = 2;
+}
+
+
+// Identifies a specific workflow within a namespace. Practically speaking, because run_id is a
+// uuid, a workflow execution is globally unique. Note that many commands allow specifying an empty
+// run id as a way of saying "target the latest run of the workflow".
+message WorkflowExecution {
+    string workflow_id = 1;
+    string run_id = 2;
+}
+
+// Represents the identifier used by a workflow author to define the workflow. Typically, the
+// name of a function. This is sometimes referred to as the workflow's "name"
+message WorkflowType {
+    string name = 1;
+}
+
+// Represents the identifier used by a activity author to define the activity. Typically, the
+// name of a function. This is sometimes referred to as the activity's "name"
+message ActivityType {
+    string name = 1;
+}

@@ -1,3 +1,4 @@
+use socketioxide::SocketIo;
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
 
@@ -5,8 +6,8 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-#[cfg(not(feature = "server"))]
-compile_error!("This binary crate requires `--features server`.");
+// #[cfg(not(feature = "server"))]
+// compile_error!("This binary crate requires `--features server`.");
 // easy break: run and didn't instantly die
 use chrono::DateTime;
 use chrono::Duration;
@@ -14,32 +15,30 @@ use chrono::Utc;
 // pub mod immortal {
 //     tonic::include_proto!("immortal");
 // }
-use ::immortal::common;
-use ::immortal::common::Payload;
-use ::immortal::failure;
-use ::immortal::immortal;
-use ::immortal::immortal::call_result_version;
-use ::immortal::immortal::call_version;
-use ::immortal::immortal::notify_version;
-use ::immortal::immortal::CallResultV1;
-use ::immortal::immortal::CallResultVersion;
-use ::immortal::immortal::CallVersion;
-use ::immortal::immortal::ClientStartWorkflowOptionsV1;
-use ::immortal::immortal::NotifyVersion;
-use ::immortal::immortal::RequestStartActivityOptionsV1;
-use ::immortal::immortal::StartNotificationOptionsV1;
-use ::immortal::models::ActivitySchema;
-use ::immortal::models::CallSchema;
-use ::immortal::models::WfSchema;
 use axum;
-use bb8_redis::bb8::Pool;
 use dotenvy::dotenv;
 use history::Status as HistoryStatus;
 use history::{ActivityHistory, ActivityRun, History, WorkflowHistory};
+// use immortal_lib::common;
+use immortal_lib::common::Payload;
+use immortal_lib::failure;
+use immortal_lib::immortal;
+use immortal_lib::immortal::call_result_version;
+use immortal_lib::immortal::call_version;
+use immortal_lib::immortal::notify_version;
+use immortal_lib::immortal::CallResultV1;
+use immortal_lib::immortal::CallResultVersion;
+use immortal_lib::immortal::CallVersion;
+use immortal_lib::immortal::ClientStartWorkflowOptionsV1;
+use immortal_lib::immortal::NotifyVersion;
+use immortal_lib::immortal::RequestStartActivityOptionsV1;
+use immortal_lib::immortal::StartNotificationOptionsV1;
+use immortal_worker_lib::models::ActivitySchema;
+use immortal_worker_lib::models::CallSchema;
+use immortal_worker_lib::models::WfSchema;
 use rand::Rng;
-use redis::streams::{StreamId, StreamKey, StreamMaxlen, StreamReadOptions, StreamReadReply};
+use redis::streams::StreamMaxlen;
 use redis::AsyncCommands;
-use simd_json::prelude::ValueAsMutObject;
 // use bb8_redis::redis::AsyncCommands;
 use bb8_redis::{bb8, RedisConnectionManager};
 use immortal::immortal_server::{Immortal, ImmortalServer};
@@ -55,12 +54,7 @@ use immortal::{
 };
 use regex::Regex;
 use simd_json::OwnedValue;
-use socketioxide::extract::{AckSender, State};
-use socketioxide::socket::DisconnectReason;
-use socketioxide::{
-    extract::{Data, SocketRef},
-    SocketIo,
-};
+
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -73,7 +67,7 @@ use tonic::transport::Server;
 // use tonic_health::server::HealthReporter;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
-use tracing::{error, info};
+use tracing::error;
 // use tracing_subscriber::FmtSubscriber;
 use uuid::Uuid;
 // use immortal::immortal_s
@@ -82,8 +76,11 @@ use uuid::Uuid;
 // use routeguide::worker_action::Action;
 // use routeguide::{Feature, Point, Rectangle, RouteNote, RouteSummary};
 
+use immortal_worker_lib::metrics::sampler;
+use immortal_worker_lib::metrics::Metrics;
 use crate::state::AppState;
 use crate::state::JwtPublicBytes;
+use crate::ws::on_connect;
 use serde::Serialize;
 use std::path::Path;
 use tokio::io::AsyncReadExt;
@@ -93,8 +90,10 @@ use tonic::{Request, Response, Status, Streaming};
 pub mod api;
 pub mod error;
 pub mod history;
+// pub mod metrics;
 pub mod models;
 pub mod state;
+pub mod ws;
 
 pub async fn get_file_as_byte_vec() -> JwtPublicBytes {
     let filename = Path::new("jwt.pem").to_str().unwrap();
@@ -1792,152 +1791,6 @@ impl Immortal for ImmortalService {
 //         .await;
 // }
 
-async fn on_connect(
-    socket: SocketRef,
-    Data(_data): Data<OwnedValue>,
-    pool: State<Pool<RedisConnectionManager>>,
-    notification_tx: State<broadcast::Sender<Notification>>,
-) {
-    info!("Socket.IO connected: {:?} {:?}", socket.ns(), socket.id);
-    // println!("Data = {:?}", data);
-    // socket.emit("auth", data).ok();
-    // let pool = pool.clone();
-    let mut con = pool.get().await.unwrap().clone();
-    // con.
-
-    // let a: () = con
-    //     .xgroup_create_mkstream("immortal::logs", "immortal::logs::group", "$")
-    //     .await
-    //     .unwrap();
-
-    socket.on("message", |socket: SocketRef, Data::<OwnedValue>(data)| {
-        info!("Received event: {:?}", data);
-        socket.emit("message-back", &data).ok();
-    });
-
-    socket.on(
-        "message-with-ack",
-        |Data::<OwnedValue>(data), ack: AckSender| {
-            info!("Received event: {:?}", data);
-            ack.send(&data).ok();
-        },
-    );
-
-    {
-        let tx = notification_tx.clone();
-
-        socket.on(
-            "history-notifications",
-            |socket: SocketRef, Data::<OwnedValue>(data), ack: AckSender| async move {
-                info!("Received event: {:?} ", data);
-                ack.send(&data).ok();
-                let s2 = socket.clone();
-                let mut rx = tx.clone().subscribe();
-                let handle = tokio::spawn(async move {
-                    while let Ok(z) = rx.recv().await {
-                        s2.emit(
-                            "history-update",
-                            &simd_json::serde::to_owned_value(z).unwrap_or(simd_json::json!({})),
-                        )
-                        .ok();
-                    }
-
-                    // info!("Stream ended");
-                });
-
-                info!("Stream ended");
-                let abort = handle.abort_handle();
-                socket.on_disconnect(|_socket: SocketRef, _reason: DisconnectReason| async move {
-                    // sink.unsubscribe("immortal::logs").await.unwrap();
-                    abort.abort();
-                    println!("aborting stream");
-                    // handle.abort();
-                })
-            },
-        );
-    }
-
-    socket.on(
-        "fetch-logs",
-        |socket: SocketRef, Data::<OwnedValue>(data), ack: AckSender| {
-            info!("Received event: {:?}", data);
-            let log_id: String = simd_json::serde::from_owned_value(data.clone()).unwrap();
-            ack.send(&data).ok();
-            let s2 = socket.clone();
-            let handle = tokio::spawn(async move {
-                let mut last_id = "0-0".to_string();
-                loop {
-                    let opts = StreamReadOptions::default().block(500);
-
-                    let srr: StreamReadReply = con
-                        .xread_options(
-                            &[format!("immortal:logs:{log_id}")],
-                            &[last_id.as_str()],
-                            &opts,
-                        )
-                        .await
-                        .expect("read");
-                    for StreamKey { key: _, ids } in srr.keys {
-                        for StreamId { id, map } in ids {
-                            last_id = id.clone();
-                            let mut parsed_map = simd_json::json!({
-                                "id": id.clone()
-                            });
-                            for (n, s) in map {
-                                if let redis::Value::BulkString(mut bytes) = s {
-                                    if n == "metadata" {
-                                        parsed_map
-                                            .as_object_mut() // Get a mutable reference to the underlying Map
-                                            .unwrap() // Panics if not an object, which we've initialized it to be
-                                            .insert(
-                                                n.to_owned(), // Convert String n to OwnedValue::String for the key, or use n.as_str()
-                                                simd_json::from_slice(&mut bytes)
-                                                    .unwrap_or(OwnedValue::default()),
-                                            );
-                                    } else {
-                                        parsed_map.as_object_mut().unwrap().insert(
-                                            n.to_owned(), // Convert String n to OwnedValue::String for the key
-                                            OwnedValue::String(String::from_utf8(bytes).unwrap()),
-                                        );
-                                    }
-                                } else {
-                                    panic!("Weird data")
-                                }
-                            }
-                            s2.emit("message-back", &parsed_map).ok();
-                        }
-                    }
-                }
-
-                // info!("Stream ended");
-            });
-
-            info!("Stream ended");
-            let abort = handle.abort_handle();
-            socket.on_disconnect(|_socket: SocketRef, _reason: DisconnectReason| async move {
-                // sink.unsubscribe("immortal::logs").await.unwrap();
-                abort.abort();
-                println!("aborting stream");
-                // handle.abort();
-            })
-        },
-    );
-    // let s2 = socket.clone();
-
-    // let abort = handle.abort_handle();
-    socket.on_disconnect(|socket: SocketRef, reason: DisconnectReason| async move {
-        // sink.unsubscribe("immortal::logs").await.unwrap();
-        // abort.abort();
-        println!(
-            "Socket {} on ns {} disconnected, reason: {:?}",
-            socket.id,
-            socket.ns(),
-            reason
-        );
-        // handle.abort();
-    })
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
@@ -1997,6 +1850,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     {
+        let (latest_tx, latest_rx) = watch::channel(Metrics {
+            // ts_ms: 0,
+            cpu_pct: 0.0,
+            mem_used: 0,
+            mem_total: 0,
+        });
+        let (stream_tx, _) = broadcast::channel::<Metrics>(1024);
+
+        // optional history buffer (e.g., last 120 samples)
+        let history = Arc::new(RwLock::new(VecDeque::with_capacity(120)));
+
+        // spawn sampler
+        tokio::spawn(sampler(latest_tx, stream_tx.clone(), history.clone()));
         let cors = CorsLayer::very_permissive();
 
         let (layer, io) = SocketIo::builder()
@@ -2004,6 +1870,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // .with_state(log_streams)
             .with_state(pool.clone())
             .with_state(notification_tx)
+            .with_state(latest_rx)
+            .with_state(stream_tx)
             .build_layer();
         io.ns("/", on_connect);
         let app = axum::Router::new()
