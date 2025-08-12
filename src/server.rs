@@ -1889,13 +1889,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     {
-        let (_latest_tx, latest_rx) = watch::channel(IdentifiableMetrics {
-            // ts_ms: 0,
-            cpu_pct: 0.0,
-            mem_used: 0,
-            mem_total: 0,
-            worker_id: "server".to_string(),
-        });
+        // let (_latest_tx, _latest_rx) = watch::channel(IdentifiableMetrics {
+        //     // ts_ms: 0,
+        //     cpu_pct: 0.0,
+        //     mem_used: 0,
+        //     mem_total: 0,
+        //     worker_id: "server".to_string(),
+        // });
 
         // optional history buffer (e.g., last 120 samples)
         let history = Arc::new(RwLock::new(VecDeque::with_capacity(120)));
