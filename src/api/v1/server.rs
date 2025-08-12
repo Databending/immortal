@@ -31,7 +31,7 @@ struct Worker {
 
 //struct StrippedActivityQueue(HashMap<String, Vec<(String, RequestStartActivityOptionsV1)>>);
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct HistoryFilter {
     worker_id: Option<String>,
     task_queue: Option<String>,

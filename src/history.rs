@@ -156,7 +156,10 @@ impl History {
                 .iter()
                 .filter(|f| match &f {
                     WorkflowHistoryVersion::V1(v1) => {
-                        v1.task_queue.clone().map(|f| *f == task_queue).is_some()
+                        if let Some(history_task_queue) = &v1.task_queue {
+                            return *history_task_queue == task_queue 
+                        }
+                        return false
                     }
                 })
                 .map(|x| x.clone())
@@ -167,7 +170,10 @@ impl History {
                 .iter()
                 .filter(|f| match &f {
                     WorkflowHistoryVersion::V1(v1) => {
-                        v1.worker_id.clone().map(|f| *f == worker_id).is_some()
+                        if let Some(history_worker_id) = &v1.worker_id {
+                            return *history_worker_id == worker_id
+                        }
+                        return false
                     }
                 })
                 .map(|x| x.clone())
