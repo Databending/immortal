@@ -11,6 +11,7 @@ use itertools::Itertools;
 use redis::{AsyncCommands, ErrorKind, FromRedisValue, RedisError, RedisWrite, ToRedisArgs};
 use serde::{Deserialize, Serialize};
 use simd_json::OwnedValue;
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct History(Pool<RedisConnectionManager>);
@@ -26,6 +27,22 @@ impl History {
     ) -> std::result::Result<PooledConnection<'_, RedisConnectionManager>, RunError<RedisError>>
     {
         self.0.get().await
+    }
+
+    pub async fn delete_history(&self, workflow_id: &Uuid) -> Result<()> {
+        let mut con = self.get_con().await?;
+        let key = format!("{WORKFLOW_BASE_REDIS_KEY}:{}", workflow_id.to_string());
+        let _: () = con
+            .lrem(
+                format!("{WORKFLOW_BASE_REDIS_KEY}:workflow_index"),
+                1,
+                workflow_id.to_string(),
+            )
+            .await?;
+        let _: () = con
+            .del(&key)
+            .await?;
+        Ok(())
     }
 
     pub async fn sync_workflow_index(&self) -> Result<()> {

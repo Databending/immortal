@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::sync::Arc;
 
 use bb8_redis::RedisConnectionManager;
 use redis::AsyncCommands;
@@ -10,17 +10,24 @@ use socketioxide::socket::DisconnectReason;
 
 use bb8_redis::bb8::Pool;
 use simd_json::prelude::ValueAsMutObject;
-use tokio::sync::broadcast::Sender;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, Mutex};
+use tokio::task::JoinHandle;
 use tracing::info;
 
-use crate::{ImmortalService, Notification};
-use immortal_worker_lib::metrics::Metrics;
+use crate::metrics::IdentifiableMetrics;
+use crate::Notification;
 use redis::streams::{StreamId, StreamKey, StreamReadOptions, StreamReadReply};
 
 #[derive(Deserialize)]
 struct MetricsRequest {
     pub workers: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct FetchLogs {
+    pub workflow_id: String,
+    pub activity_id: Option<String>,
+    pub run_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -31,16 +38,22 @@ struct MetricsResponse {
     pub mem_total: u64,
 }
 
+#[derive(Default)]
+struct SocketState {
+    subscribed: bool,
+    forwarder: Option<JoinHandle<()>>,
+}
 pub async fn on_connect(
     socket: SocketRef,
     Data(_data): Data<OwnedValue>,
     pool: State<Pool<RedisConnectionManager>>,
     notification_tx: State<broadcast::Sender<Notification>>,
-    _latest_rx: State<watch::Receiver<Metrics>>,
-    stream_tx: State<broadcast::Sender<Metrics>>,
-    immortal_service: State<ImmortalService>,
+    stream_tx: State<broadcast::Sender<IdentifiableMetrics>>,
+    // immortal_service: State<ImmortalService>,
 ) {
-    info!("Socket.IO connected: {:?} {:?}", socket.ns(), socket.id);
+    println!("Socket.IO connected: {:?} {:?}", socket.ns(), socket.id);
+    let per_socket = Arc::new(Mutex::new(SocketState::default()));
+
     // println!("Data = {:?}", data);
     // socket.emit("auth", data).ok();
     // let pool = pool.clone();
@@ -49,54 +62,41 @@ pub async fn on_connect(
 
     {
         let stream_tx = stream_tx.clone();
-        let workers;
-        {
-            let workers_temp = immortal_service.workers.read().await;
-            workers = (*workers_temp)
-                .iter()
-                .map(|f| (f.0.clone(), f.1.metrics_stream.clone()))
-                .collect::<HashMap<String, Sender<Metrics>>>();
-        }
+
+        let per_socket = per_socket.clone();
 
         socket.on(
             "metrics",
             |socket: SocketRef, Data::<OwnedValue>(data)| async move {
                 println!("here");
+                // {
+                let per_socket = per_socket.clone();
+                let mut guard = per_socket.lock().await;
+                if guard.subscribed {
+                    if let Some(forwarder) = &guard.forwarder {
+                        forwarder.abort();
+                    }
+                    // already subscribed: noop (or emit ack)
+                    // socket.emit("metrics:ack", "already-subscribed").ok();
+                    // return;
+                }
+                guard.subscribed = true;
+                // }
+
                 let metrics_request: MetricsRequest =
                     simd_json::serde::from_owned_value(data.clone()).unwrap();
-                if metrics_request.workers.contains(&"server".to_string()) {
+                {
                     let socket = socket.clone();
-                    tokio::spawn(async move {
+                    guard.forwarder = Some(tokio::spawn(async move {
                         let mut sub = stream_tx.subscribe();
                         while let Ok(sample) = sub.recv().await {
-                            match socket.emit(
-                                "metrics-back",
-                                &MetricsResponse {
-                                    worker_id: "server".to_string(),
-                                    cpu_pct: sample.cpu_pct,
-                                    mem_used: sample.mem_used,
-                                    mem_total: sample.mem_total,
-                                },
-                            ) {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    println!("{:#?}", e);
-                                    break;
-                                }
-                            }
-                        }
-                    });
-                }
-                for worker in metrics_request.workers {
-                    if let Some(sender) = workers.get(&worker) {
-                        let mut sub = sender.subscribe();
-                        let socket = socket.clone();
-                        tokio::spawn(async move {
-                            while let Ok(sample) = sub.recv().await {
+                            if metrics_request.workers.contains(&"all".to_string())
+                                || metrics_request.workers.contains(&sample.worker_id)
+                            {
                                 match socket.emit(
                                     "metrics-back",
                                     &MetricsResponse {
-                                        worker_id: worker.to_string(),
+                                        worker_id: sample.worker_id,
                                         cpu_pct: sample.cpu_pct,
                                         mem_used: sample.mem_used,
                                         mem_total: sample.mem_total,
@@ -109,8 +109,8 @@ pub async fn on_connect(
                                     }
                                 }
                             }
-                        });
-                    }
+                        }
+                    }));
                 }
             },
         );
@@ -141,6 +141,7 @@ pub async fn on_connect(
             "history-notifications",
             |socket: SocketRef, Data::<OwnedValue>(data), ack: AckSender| async move {
                 info!("Received event: {:?} ", data);
+                println!("Received event: {:?} ", data);
                 ack.send(&data).ok();
                 let s2 = socket.clone();
                 let mut rx = tx.clone().subscribe();
@@ -172,7 +173,7 @@ pub async fn on_connect(
         "fetch-logs",
         |socket: SocketRef, Data::<OwnedValue>(data), ack: AckSender| {
             info!("Received event: {:?}", data);
-            let log_id: String = simd_json::serde::from_owned_value(data.clone()).unwrap();
+            let fetch_logs: FetchLogs = simd_json::serde::from_owned_value(data.clone()).unwrap();
             ack.send(&data).ok();
             let s2 = socket.clone();
             let handle = tokio::spawn(async move {
@@ -182,7 +183,7 @@ pub async fn on_connect(
 
                     let srr: StreamReadReply = con
                         .xread_options(
-                            &[format!("immortal:logs:{log_id}")],
+                            &[format!("immortal:logs:{}", fetch_logs.workflow_id)],
                             &[last_id.as_str()],
                             &opts,
                         )
@@ -194,6 +195,31 @@ pub async fn on_connect(
                             let mut parsed_map = simd_json::json!({
                                 "id": id.clone()
                             });
+                            if let Some(activity_id) = &fetch_logs.activity_id {
+                                if let Some(log_activity_id) = map.get("activity_id") {
+                                    if let redis::Value::BulkString(bytes) = log_activity_id.clone()
+                                    {
+                                        let log_activity_id: String =
+                                            String::from_utf8(bytes).unwrap();
+                                        if *activity_id != log_activity_id {
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(activity_run_id) = &fetch_logs.run_id {
+                                if let Some(log_activity_id) = map.get("activity_run_id") {
+                                    if let redis::Value::BulkString(bytes) = log_activity_id.clone()
+                                    {
+                                        let log_activity_id: String =
+                                            String::from_utf8(bytes).unwrap();
+                                        if *activity_run_id != log_activity_id {
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+
                             for (n, s) in map {
                                 if let redis::Value::BulkString(mut bytes) = s {
                                     if n == "metadata" {
@@ -215,7 +241,7 @@ pub async fn on_connect(
                                     panic!("Weird data")
                                 }
                             }
-                            s2.emit("message-back", &parsed_map).ok();
+                            s2.emit("log-back", &parsed_map).ok();
                         }
                     }
                 }

@@ -3,6 +3,7 @@ use crate::{
     history::{ActivityHistory, Status, WorkflowHistory, WorkflowHistoryVersion},
     ActivitySchema, WfSchema,
 };
+use axum::extract::Path;
 use axum::{
     extract::{Query, State},
     response::IntoResponse,
@@ -13,10 +14,12 @@ use o2o::o2o;
 use serde::{Deserialize, Serialize};
 // use serde_json::Value;
 use simd_json::OwnedValue;
+use uuid::Uuid;
 use std::collections::HashMap;
 #[derive(Debug, Clone, Default, Serialize)]
 struct Worker {
     id: String,
+    registered_on: DateTime<Utc>,
     task_queue: String,
     workflows: HashMap<String, WfSchema>,
     activities: HashMap<String, ActivitySchema>,
@@ -68,6 +71,29 @@ pub enum ApiStatus {
     Failed(String),
 }
 
+
+
+pub async fn delete_history(
+    State(state): State<AppState>,
+    Path(workflow_id): Path<Uuid>,
+
+) -> impl IntoResponse {
+    match state
+        .immortal_service
+        .history
+        .delete_history(&workflow_id)
+        .await
+    {
+        Ok(_history) => {
+            Json(())
+        }
+        Err(e) => {
+            println!("{:#?}", e);
+            Json(())
+        }
+    }
+}
+
 pub async fn get_history(
     State(state): State<AppState>,
 
@@ -92,9 +118,6 @@ pub async fn get_history(
             Json(vec![])
         }
     }
-
-    // this will be converted into a JSON response
-    // with a status code of `201 Created`
 }
 
 pub async fn get_workers(
@@ -106,6 +129,7 @@ pub async fn get_workers(
     let mut registered_workers = Vec::new();
     for (worker_id, worker) in workers.iter() {
         registered_workers.push(Worker {
+            registered_on: worker.registered_on,
             id: worker_id.clone(),
             workflows: worker.registered_workflows.clone(),
             activities: worker.registered_activities.clone(),

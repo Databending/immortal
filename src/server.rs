@@ -76,11 +76,10 @@ use uuid::Uuid;
 // use routeguide::worker_action::Action;
 // use routeguide::{Feature, Point, Rectangle, RouteNote, RouteSummary};
 
+use crate::metrics::IdentifiableMetrics;
 use crate::state::AppState;
 use crate::state::JwtPublicBytes;
 use crate::ws::on_connect;
-use immortal_worker_lib::metrics::sampler;
-use immortal_worker_lib::metrics::Metrics;
 use serde::Serialize;
 use std::path::Path;
 use tokio::io::AsyncReadExt;
@@ -90,7 +89,7 @@ use tonic::{Request, Response, Status, Streaming};
 pub mod api;
 pub mod error;
 pub mod history;
-// pub mod metrics;
+pub mod metrics;
 pub mod models;
 pub mod state;
 pub mod ws;
@@ -128,9 +127,9 @@ pub enum Notification {
 #[derive(Debug)]
 struct RegisteredWorker {
     worker_id: String,
-
+    registered_on: DateTime<Utc>,
     task_queue: String,
-    metrics_stream: broadcast::Sender<Metrics>,
+    // metrics_stream: broadcast::Sender<Metrics>,
     _incoming: JoinHandle<()>,
     tx: Sender<Result<ImmortalWorkerActionVersion, Status>>,
     registered_workflows: HashMap<String, WfSchema>,
@@ -222,6 +221,7 @@ struct ActivityProperties {
 #[derive(Debug, Clone)]
 pub struct ImmortalService {
     redis_pool: bb8::Pool<RedisConnectionManager>,
+    metrics_stream: broadcast::Sender<IdentifiableMetrics>,
     workers: Arc<RwLock<HashMap<String, RegisteredWorker>>>,
     // log_streams: (
     //     broadcast::Sender<LogStreamUpdate>,
@@ -1175,15 +1175,39 @@ impl Immortal for ImmortalService {
         println!("received worker details");
         let redis_pool = self.redis_pool.clone(); // clone the pool handle before spawning
 
-        let (metrics_stream, _) = broadcast::channel(10);
-        let metrics_stream_sender = metrics_stream.clone();
+        let metrics_stream = self.metrics_stream.clone();
+
+        let mut worker_id;
+        let mut worker_details = worker_details
+            .clone()
+            .ok_or(tonic::Status::invalid_argument(
+                "Worker details never provided",
+            ))?;
+        {
+            // sometimes immortal freezes here, not sure why
+            println!("waiting to receive workers write handle");
+            let workers = self.workers.read().await;
+
+            worker_id = worker_details.worker_id.clone();
+            let worker_ids = workers.iter().map(|f| f.0.clone()).collect::<Vec<_>>();
+
+            if worker_ids.contains(&worker_details.worker_id) {
+                worker_details.worker_id =
+                    format!("{}-{}", worker_details.worker_id, Uuid::new_v4());
+                worker_id = worker_details.worker_id.clone();
+            }
+        }
+        let worker_id2 = worker_id.clone();
+        // let (metrics_stream, _) = broadcast::channel(10);
+        // let metrics_stream_sender = metrics_stream.clone();
         let handle = tokio::spawn(async move {
             while let Some(Ok(action)) = stream.next().await {
                 match action.version {
                     Some(immortal_server_action_version::Version::V1(x)) => match x.action {
                         Some(immortal_server_action_v1::Action::Metrics(metrics)) => {
-                            metrics_stream_sender
-                                .send(Metrics {
+                            metrics_stream
+                                .send(IdentifiableMetrics {
+                                    worker_id: worker_id2.clone(),
                                     cpu_pct: metrics.cput_pct,
                                     mem_used: metrics.mem_used,
                                     mem_total: metrics.mem_total,
@@ -1263,24 +1287,10 @@ impl Immortal for ImmortalService {
 
         let (tx, rx) = mpsc::channel(100);
 
-        let mut worker_id;
         {
-            let mut worker_details = worker_details.ok_or(tonic::Status::invalid_argument(
-                "Worker details never provided",
-            ))?;
-            // sometimes immortal freezes here, not sure why
-            println!("waiting to receive workers write handle");
             let mut workers = self.workers.write().await;
 
-            worker_id = worker_details.worker_id.clone();
             let worker_ids = workers.iter().map(|f| f.0.clone()).collect::<Vec<_>>();
-
-            if worker_ids.contains(&worker_details.worker_id) {
-                worker_details.worker_id =
-                    format!("{}-{}", worker_details.worker_id, Uuid::new_v4());
-                worker_id = worker_details.worker_id.clone();
-            }
-
             println!("WORKER IDS: {:#?}", worker_ids);
             let registered_workflows = worker_details
                 .registered_workflows
@@ -1324,7 +1334,8 @@ impl Immortal for ImmortalService {
             workers.insert(
                 worker_details.worker_id.clone(),
                 RegisteredWorker {
-                    metrics_stream,
+                    // metrics_stream,
+                    registered_on: Utc::now(),
                     activity_capacity: worker_details.activity_capacity,
                     task_queue: worker_details.task_queue,
                     workflow_capacity: worker_details.workflow_capacity,
@@ -1440,6 +1451,8 @@ impl Immortal for ImmortalService {
 
                 println!("workflow_id {:?}", activity_result.workflow_id);
                 println!("activity_id {:?}", activity_result.activity_id);
+
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 // Fetch and update activity history
                 let activity_opt = self
                     .history
@@ -1476,11 +1489,12 @@ impl Immortal for ImmortalService {
 
                     run.end_time = Some(chrono::Utc::now());
 
+                    println!("{:#?}", activity_result.status);
                     match activity_result.status.clone() {
                         Some(immortal::activity_result_v1::Status::Completed(x)) => {
                             match x.result {
                                 Some(mut result_data) => {
-                                    HistoryStatus::Completed(
+                                    run.status = HistoryStatus::Completed(
                                         simd_json::to_owned_value(&mut result_data.data).unwrap(),
                                     );
                                     // match serde_json::from_slice(&result_data.data) {
@@ -1548,7 +1562,10 @@ impl Immortal for ImmortalService {
                             run.status = HistoryStatus::Failed("Missing status field".into());
                         }
                     }
-
+                    // let _ = self.notification_tx.send(Notification::ActivityRunCompleted(
+                    //     Uuid::parse_str(&workflow_id).unwrap(),
+                    //     activity.clone(),
+                    // ));
                     if let Err(e) = self
                         .history
                         .update_activity(&activity_result.workflow_id, activity)
@@ -1557,6 +1574,8 @@ impl Immortal for ImmortalService {
                         println!("error");
                         error!("Failed to update activity history: {:?}", e);
                         return Err(Status::internal("Failed to update activity history"));
+                    } else {
+                        println!("history updated");
                     }
                 }
 
@@ -1628,7 +1647,7 @@ impl Immortal for ImmortalService {
         };
 
         // give it a time to let activities sync with redis
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
         // Fetch workflow history
         let workflow_opt = self
             .history
@@ -1727,6 +1746,10 @@ impl Immortal for ImmortalService {
             }
         }
 
+        let _ = self.notification_tx.send(Notification::WorkflowCompleted(
+            Uuid::parse_str(&workflow_id).unwrap(),
+            workflow.clone(),
+        ));
         // Save updated workflow
         self.history
             .update_workflow(&workflow_id, workflow)
@@ -1823,8 +1846,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manager = RedisConnectionManager::new(redis_url).unwrap();
     let pool = bb8::Pool::builder().build(manager).await.unwrap();
 
+    let (stream_tx, _) = broadcast::channel::<IdentifiableMetrics>(1024);
     let (notification_tx, notification_rx) = broadcast::channel(100);
     let immortal_service = ImmortalService {
+        metrics_stream: stream_tx.clone(),
         notification_tx: Arc::new(notification_tx.clone()),
         notification_rx: Arc::new(notification_rx),
         workflow_queue: Arc::new(Mutex::new(HashMap::new())),
@@ -1864,19 +1889,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     {
-        let (latest_tx, latest_rx) = watch::channel(Metrics {
+        let (_latest_tx, latest_rx) = watch::channel(IdentifiableMetrics {
             // ts_ms: 0,
             cpu_pct: 0.0,
             mem_used: 0,
             mem_total: 0,
+            worker_id: "server".to_string(),
         });
-        let (stream_tx, _) = broadcast::channel::<Metrics>(1024);
 
         // optional history buffer (e.g., last 120 samples)
         let history = Arc::new(RwLock::new(VecDeque::with_capacity(120)));
 
         // spawn sampler
-        tokio::spawn(sampler(latest_tx, stream_tx.clone(), history.clone()));
+        tokio::spawn(metrics::server_sampler(stream_tx.clone(), history.clone()));
         let cors = CorsLayer::very_permissive();
 
         let (layer, io) = SocketIo::builder()
@@ -1884,7 +1909,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // .with_state(log_streams)
             .with_state(pool.clone())
             .with_state(notification_tx)
-            .with_state(latest_rx)
             .with_state(stream_tx)
             .with_state(immortal_service.clone())
             .build_layer();

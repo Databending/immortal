@@ -3,20 +3,21 @@ use serde::Serialize;
 use sysinfo::{System};
 use tokio::time::{interval, MissedTickBehavior};
 
-use tokio::sync::{broadcast, watch, RwLock};
+use tokio::sync::{broadcast, RwLock};
 #[derive(Clone, Serialize, Debug)]
-pub struct Metrics {
+pub struct IdentifiableMetrics {
     // pub ts_ms: u128,
 
+    pub worker_id: String,
     pub cpu_pct: f32,
     pub mem_used: u64,
     pub mem_total: u64,
 }
 
-pub async fn sampler(
-    latest_tx: watch::Sender<Metrics>,
-    stream_tx: broadcast::Sender<Metrics>,
-    history: Arc<RwLock<VecDeque<Metrics>>>,
+pub async fn server_sampler(
+    // latest_tx: watch::Sender<IdentifiableMetrics>,
+    stream_tx: broadcast::Sender<IdentifiableMetrics>,
+    history: Arc<RwLock<VecDeque<IdentifiableMetrics>>>,
 ) {
     let mut sys = System::new_all();
     let mut tick = interval(Duration::from_millis(1000));
@@ -31,7 +32,8 @@ pub async fn sampler(
         let mem_used = sys.used_memory();
         let mem_total = sys.total_memory();
 
-        let sample = Metrics {
+        let sample = IdentifiableMetrics {
+            worker_id: "server".to_string(),
             // ts_ms: chrono::Utc::now().timestamp_millis() as u128,
             cpu_pct,
             mem_used,
@@ -39,7 +41,7 @@ pub async fn sampler(
         };
 
         // update latest + stream
-        let _ = latest_tx.send(sample.clone());
+        // let _ = latest_tx.send(sample.clone());
         let _ = stream_tx.send(sample.clone());
         // println!("sending {:#?}", sample);
 
