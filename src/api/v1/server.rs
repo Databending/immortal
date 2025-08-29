@@ -33,8 +33,8 @@ struct Worker {
 
 #[derive(Deserialize, Debug)]
 pub struct HistoryFilter {
-    worker_id: Option<String>,
-    task_queue: Option<String>,
+    worker_ids: Option<Vec<String>>,
+    task_queues: Option<Vec<String>>,
 }
 
 #[derive(o2o, Debug, Clone, Serialize, Deserialize)]
@@ -103,7 +103,7 @@ pub async fn get_history(
     match state
         .immortal_service
         .history
-        .get_workflows(Some(100), None, params.task_queue, params.worker_id)
+        .get_workflows(Some(100), None, params.task_queues, params.worker_ids)
         .await
     {
         Ok(history) => {
@@ -125,7 +125,10 @@ pub async fn get_workers(
     // this argument tells axum to parse the request body
     // as JSON into a `CreateUser` type
 ) -> impl IntoResponse {
+    println!("waiting to read workers");
     let workers = state.immortal_service.workers.read().await;
+
+    println!("workers read");
     let mut registered_workers = Vec::new();
     for (worker_id, worker) in workers.iter() {
         registered_workers.push(Worker {

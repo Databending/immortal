@@ -1,7 +1,7 @@
-use crate::models::worker::WorkerConfigBuilder;
-use immortal_lib::common;
-use immortal_lib::failure;
-use immortal_lib::immortal;
+// use crate::models::worker::WorkerConfigBuilder;
+// use immortal_lib::common;
+// use immortal_lib::failure;
+// use immortal_lib::immortal;
 use immortal_lib::register_workflow;
 pub mod activities;
 pub mod models;
@@ -12,7 +12,8 @@ pub mod workflows;
 use activities::test::ActivityData;
 use anyhow::Result;
 
-use models::worker::Worker;
+use immortal_worker_lib::models::worker::{Worker, WorkerConfigBuilder};
+// use models::worker::Worker;
 
 #[tokio::main]
 pub async fn main() -> Result<()> {
@@ -45,7 +46,7 @@ pub async fn main() -> Result<()> {
     // worker
     //     .register_wf("new_validate_repair_wf", workflows::test::main_wf, workflows::test::main_wf_schema())
     //     .await;
-    register_workflow!(worker, "new_validate_repair_wf", workflows::test);
+    // register_workflow!(worker, "new_validate_repair_wf", workflows::test);
 
     // println!("{:#?}", serde_json::to_string_pretty(&workflows::test::main_wf_schema()));
     println!("Starting worker...");

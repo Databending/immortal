@@ -113,8 +113,8 @@ impl History {
         &self,
         limit: Option<usize>,
         offset: Option<usize>,
-        task_queue: Option<String>,
-        worker_id: Option<String>,
+        task_queues: Option<Vec<String>>,
+        worker_ids: Option<Vec<String>>,
     ) -> Result<Vec<WorkflowHistoryVersion>> {
         let limit = limit.unwrap_or(10) as isize;
         let offset = offset.unwrap_or(0) as isize;
@@ -151,13 +151,13 @@ impl History {
         // })
         // .collect();
 
-        if let Some(task_queue) = task_queue {
+        if let Some(task_queues) = task_queues {
             workflows = workflows
                 .iter()
                 .filter(|f| match &f {
                     WorkflowHistoryVersion::V1(v1) => {
                         if let Some(history_task_queue) = &v1.task_queue {
-                            return *history_task_queue == task_queue 
+                            return task_queues.contains(history_task_queue) 
                         }
                         return false
                     }
@@ -165,13 +165,13 @@ impl History {
                 .map(|x| x.clone())
                 .collect();
         }
-        if let Some(worker_id) = worker_id {
+        if let Some(worker_ids) = worker_ids {
             workflows = workflows
                 .iter()
                 .filter(|f| match &f {
                     WorkflowHistoryVersion::V1(v1) => {
                         if let Some(history_worker_id) = &v1.worker_id {
-                            return *history_worker_id == worker_id
+                            return worker_ids.contains(history_worker_id) 
                         }
                         return false
                     }

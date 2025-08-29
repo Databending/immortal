@@ -4,6 +4,8 @@ use axum::{
 };
 
 use crate::AppState;
+
+pub mod cron;
 pub mod run;
 pub mod server;
 

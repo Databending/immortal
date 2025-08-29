@@ -3,7 +3,7 @@ use axum::{
     extract::{FromRef, FromRequestParts},
     http::request::Parts,
 };
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 
 #[derive(Clone, Debug)]
 pub struct JwtPublicBytes(pub Vec<u8>);
@@ -11,7 +11,7 @@ pub struct JwtPublicBytes(pub Vec<u8>);
 #[derive(Clone, Debug, FromRef)]
 pub struct AppState {
     pub pub_key: JwtPublicBytes,
-    pub immortal_service: ImmortalService,
+    pub immortal_service: Arc<ImmortalService>,
     pub without_validation_arguments: (),
 }
 impl<S> FromRequestParts<S> for AppState

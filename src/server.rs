@@ -76,10 +76,12 @@ use uuid::Uuid;
 // use routeguide::worker_action::Action;
 // use routeguide::{Feature, Point, Rectangle, RouteNote, RouteSummary};
 
+use crate::cron::start_watcher;
 use crate::metrics::IdentifiableMetrics;
 use crate::state::AppState;
 use crate::state::JwtPublicBytes;
 use crate::ws::on_connect;
+use crate::ws::WsState;
 use serde::Serialize;
 use std::path::Path;
 use tokio::io::AsyncReadExt;
@@ -87,6 +89,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 pub mod api;
+pub mod cron;
 pub mod error;
 pub mod history;
 pub mod metrics;
@@ -1877,6 +1880,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     .await;
 
     immortal_service.history.sync_workflow_index().await?;
+    let immortal_service = Arc::new(immortal_service);
     // tokio::spawn(service_status(health_reporter.clone()));
     let use_tokio_console = std::env::var("ENABLE_TOKIO_CONSOLE").unwrap_or("false".to_string());
     if use_tokio_console.as_str() == "true" {
@@ -1910,7 +1914,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_state(pool.clone())
             .with_state(notification_tx)
             .with_state(stream_tx)
-            .with_state(immortal_service.clone())
+            .with_state(WsState::default())
+            .with_state(Arc::clone(&immortal_service))
             .build_layer();
         io.ns("/", on_connect);
         let app = axum::Router::new()
@@ -1932,6 +1937,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::serve(listener, app).await.unwrap();
         });
     }
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        start_watcher().await.unwrap();
+        println!("watcher started");
+    });
 
     Server::builder()
         .add_service(svc)
