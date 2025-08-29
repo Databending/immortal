@@ -1,7 +1,3 @@
-use crate::models::worker::WorkerConfigBuilder;
-use immortal_lib::common;
-use immortal_lib::failure;
-use immortal_lib::immortal;
 use immortal_lib::register_workflow;
 pub mod activities;
 pub mod models;
@@ -12,7 +8,7 @@ pub mod workflows;
 use activities::test::ActivityData;
 use anyhow::Result;
 
-use models::worker::Worker;
+use immortal_worker_lib::models::worker::{Worker, WorkerConfigBuilder};
 
 #[tokio::main]
 pub async fn main() -> Result<()> {

@@ -38,7 +38,7 @@ socketioxide = { version = "0.16.2", features = ["state"]}
 tower-http = { version = "0.6.2", features = ["cors"]}
 bb8-redis = {version="0.22.0"}
 redis = { version = "0.30", default-features = false, features = ["tokio-comp", "streams", "aio"]}
-# immortal-macros = { path = "immortal-macros" }
+immortal-macros = { path = "immortal-macros" }
 immortal-lib = { path = "immortal-lib" }
 immortal-worker-lib = { path = "immortal-worker-lib" }
 itertools = {version="0.14.0"}
@@ -51,6 +51,7 @@ o2o = { version = "0.5.4", features = ["o2o-macros"] }
 strum = { version = "0.27.2", features=["derive"] }
 garde = { version = "0.22.0" }
 sysinfo = "0.36.1"
+paste = "1.0.15"
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = {version = "0.6", features = ["profiling"]}
 
@@ -59,10 +60,10 @@ name = "server"
 path = "src/server.rs"
 
 
-#
-# [[bin]]
-# name = "worker"
-# path = "src/worker.rs"
+
+[[bin]]
+name = "worker"
+path = "src/worker.rs"
 #
 # [[bin]]
 # name = "client"

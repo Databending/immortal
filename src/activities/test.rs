@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 use schemars::JsonSchema;
 use uuid::Uuid;
-use crate::models::activity::{ActContext, ActivityError};
+use immortal_worker_lib::models::activity::{ActContext, ActivityError};
 pub struct ActivityData {
     pub data: String,
 }

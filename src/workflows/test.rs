@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 use uuid::Uuid;
 
-use crate::models::{
+use immortal_worker_lib::models::{
     activity::ActivityOptions,
     workflow::{WfContext, WfExitValue, WorkflowResult},
 };
