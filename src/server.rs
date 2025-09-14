@@ -1961,7 +1961,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_state(WsState::default())
             .with_state(Arc::clone(&immortal_service))
             .build_layer();
-        io.ns("/", on_connect);
+        io.ns("/api", on_connect);
         let app = axum::Router::new()
             .nest("/api", api::router())
             .layer(cors)
