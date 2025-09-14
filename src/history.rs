@@ -39,9 +39,7 @@ impl History {
                 workflow_id.to_string(),
             )
             .await?;
-        let _: () = con
-            .del(&key)
-            .await?;
+        let _: () = con.del(&key).await?;
         Ok(())
     }
 
@@ -116,8 +114,16 @@ impl History {
         task_queues: Option<Vec<String>>,
         worker_ids: Option<Vec<String>>,
     ) -> Result<Vec<WorkflowHistoryVersion>> {
+        println!("WORKER IDS: {:#?}", worker_ids);
         let limit = limit.unwrap_or(10) as isize;
         let offset = offset.unwrap_or(0) as isize;
+        let start = offset as i64;
+        let end = if limit == 0 {
+            // Return nothing
+            -1 // Redis will return empty when start > end
+        } else {
+            (offset + limit - 1) as i64
+        };
         let mut con = self.get_con().await?;
         //let _keys: Vec<String> = con
         //    .keys(format!("{WORKFLOW_BASE_REDIS_KEY}::*").as_str())
@@ -127,10 +133,18 @@ impl History {
         let keys2: Vec<String> = con
             .lrange(
                 format!("{WORKFLOW_BASE_REDIS_KEY}:workflow_index"),
-                (-1 - (offset + limit)).try_into().unwrap(),
-                (-1 - offset).try_into().unwrap(),
+                start as isize,
+                end as isize,
             )
             .await?;
+
+        // let keys2: Vec<String> = con
+        //     .lrange(
+        //         format!("{WORKFLOW_BASE_REDIS_KEY}:workflow_index"),
+        //         (-1 - offset).try_into().unwrap(),
+        //         (-1 - (offset + limit - 1)).try_into().unwrap(),
+        //     )
+        //     .await?;
         let workflows: Vec<Option<String>> = con
             .mget(
                 keys2
@@ -157,9 +171,9 @@ impl History {
                 .filter(|f| match &f {
                     WorkflowHistoryVersion::V1(v1) => {
                         if let Some(history_task_queue) = &v1.task_queue {
-                            return task_queues.contains(history_task_queue) 
+                            return task_queues.contains(history_task_queue);
                         }
-                        return false
+                        return false;
                     }
                 })
                 .map(|x| x.clone())
@@ -171,9 +185,9 @@ impl History {
                 .filter(|f| match &f {
                     WorkflowHistoryVersion::V1(v1) => {
                         if let Some(history_worker_id) = &v1.worker_id {
-                            return worker_ids.contains(history_worker_id) 
+                            return worker_ids.contains(history_worker_id);
                         }
-                        return false
+                        return false;
                     }
                 })
                 .map(|x| x.clone())

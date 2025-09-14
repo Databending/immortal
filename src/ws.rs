@@ -434,6 +434,8 @@ async fn fetch_logs_from_redis(
 pub async fn on_connect(
     socket: SocketRef,
     Data(_data): Data<OwnedValue>,
+
+    state: State<WsState>,
     _pool: State<Pool<RedisConnectionManager>>,
     notification_tx: State<broadcast::Sender<Notification>>,
     _stream_tx: State<broadcast::Sender<IdentifiableMetrics>>,
@@ -465,37 +467,82 @@ pub async fn on_connect(
         },
     );
 
+    socket.join("history-update");
     {
         let tx = notification_tx.clone();
 
+        let s2 = socket.clone();
+
+        let mut rx = tx.clone().subscribe();
+        let count_now = {
+            match state.subs.entry("history-update".to_string()) {
+                Entry::Occupied(mut e) => {
+                    *e.get_mut() += 1;
+                    *e.get()
+                }
+                Entry::Vacant(v) => {
+                    v.insert(1);
+                    1
+                }
+            }
+        };
+
+        if count_now == 1 {
+            println!("spawning");
+            tokio::spawn(async move {
+                let cancel = CancellationToken::new();
+                let cancel_child = cancel.clone();
+                loop {
+                    tokio::select! {
+                                            _ = cancel_child.cancelled() => break,
+
+                                            _ = tokio::time::sleep(Duration::from_millis(400)) => {
+                    if let Ok(z) = rx.recv().await {
+                        println!("RECEIVED EVENT");
+                                        s2.within("history-update")
+                                            .emit(
+                                                "history-update",
+                                                &simd_json::serde::to_owned_value(z).unwrap_or(simd_json::json!({})),
+                                            )
+                                            .await
+                                            .ok();
+                                    }
+                                            }
+                                        }
+                }
+            });
+        }
         socket.on(
             "history-notifications",
             |socket: SocketRef, Data::<OwnedValue>(data), ack: AckSender| async move {
-                info!("Received event: {:?} ", data);
-                println!("Received event: {:?} ", data);
+                // info!("Received event: {:?} ", data);
+                // println!("Received event: {:?} ", data);
                 ack.send(&data).ok();
+
+                // socket.join("history-notifications");
                 let s2 = socket.clone();
-                let mut rx = tx.clone().subscribe();
-                let handle = tokio::spawn(async move {
-                    while let Ok(z) = rx.recv().await {
-                        s2.emit(
-                            "history-update",
-                            &simd_json::serde::to_owned_value(z).unwrap_or(simd_json::json!({})),
-                        )
-                        .ok();
-                    }
-
-                    // info!("Stream ended");
-                });
-
-                info!("Stream ended");
-                let abort = handle.abort_handle();
-                socket.on_disconnect(|_socket: SocketRef, _reason: DisconnectReason| async move {
-                    // sink.unsubscribe("immortal::logs").await.unwrap();
-                    abort.abort();
-                    println!("aborting stream");
-                    // handle.abort();
-                })
+                // s2.join("history-update");
+                // let mut rx = tx.clone().subscribe();
+                // let handle = tokio::spawn(async move {
+                //     while let Ok(z) = rx.recv().await {
+                //         s2.emit(
+                //             "history-update",
+                //             &simd_json::serde::to_owned_value(z).unwrap_or(simd_json::json!({})),
+                //         )
+                //         .ok();
+                //     }
+                //
+                //     // info!("Stream ended");
+                // });
+                //
+                // info!("Stream ended");
+                // let abort = handle.abort_handle();
+                // socket.on_disconnect(|_socket: SocketRef, _reason: DisconnectReason| async move {
+                //     // sink.unsubscribe("immortal::logs").await.unwrap();
+                //     abort.abort();
+                //     println!("aborting stream");
+                //     // handle.abort();
+                // })
             },
         );
     }
@@ -682,6 +729,10 @@ pub async fn on_connect(
                     {
                         socket.leave(room(&job_id, "metrics"));
                         dec_and_maybe_stop(&state, &job_id);
+                    }
+                    {
+                        socket.leave("history-update");
+                        dec_and_maybe_stop(&state, "history-update");
                     }
                 }
             }

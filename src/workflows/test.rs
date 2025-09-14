@@ -4,9 +4,8 @@ use immortal_macros::wf;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::info;
-use uuid::Uuid;
 
-use crate::models::{
+use immortal_worker_lib::models::{
     activity::ActivityOptions,
     workflow::{WfContext, WfExitValue, WorkflowResult},
 };
@@ -21,19 +20,20 @@ pub struct WfResult {
     result: u64,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct WorkflowPayload {
     pub data: String,
 }
 
 #[wf]
-pub async fn main(mut ctx: WfContext, arg1: Uuid) -> WorkflowResult<WfResult> {
+pub async fn main(mut ctx: WfContext, arg1: WorkflowPayload) -> WorkflowResult<WfResult> {
     // tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     info!("Hello from the test workflow! {:#?}", arg1);
+    println!("Hello from the test workflow! {:#?}", arg1);
 
     match ctx
         .activity::<ActivityOutput>(ActivityOptions {
-            activity_type: "get_avs_request_id".to_string(),
+            activity_type: "hs_tariff_sync".to_string(),
             input: Payload::new(&arg1),
             ..Default::default()
         })
@@ -50,3 +50,4 @@ pub async fn main(mut ctx: WfContext, arg1: Uuid) -> WorkflowResult<WfResult> {
 
     Ok(WfExitValue::Normal(WfResult { result: 0 }))
 }
+

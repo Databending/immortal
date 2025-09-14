@@ -12,6 +12,8 @@ static GLOBAL: Jemalloc = Jemalloc;
 use chrono::DateTime;
 use chrono::Duration;
 use chrono::Utc;
+
+use kube::Client as KubeClient;
 // pub mod immortal {
 //     tonic::include_proto!("immortal");
 // }
@@ -77,6 +79,7 @@ use uuid::Uuid;
 // use routeguide::{Feature, Point, Rectangle, RouteNote, RouteSummary};
 
 use crate::cron::start_watcher;
+use crate::cron::CronManager;
 use crate::metrics::IdentifiableMetrics;
 use crate::state::AppState;
 use crate::state::JwtPublicBytes;
@@ -112,6 +115,7 @@ pub async fn get_file_as_byte_vec() -> JwtPublicBytes {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", content = "spec")]
 pub enum Notification {
     // ActivityStarted(Uuid, ActivityHistory),
     // ActivityCompleted(Uuid, ActivityHistory),
@@ -125,6 +129,8 @@ pub enum Notification {
     ActivityRunStarted(Uuid, ActivityHistory),
     ActivityRunCompleted(Uuid, ActivityHistory),
     ActivityRunFailed(Uuid, ActivityHistory),
+    WorkerAdded(String),
+    WorkerRemoved(String),
     // ActivityRunCancelled,
 }
 #[derive(Debug)]
@@ -207,6 +213,7 @@ struct CallOptions {
 struct RunningProperties<T> {
     start: DateTime<Utc>,
     timeout: DateTime<Utc>,
+    heartbeat_timeout: Duration,
     // in seconds
     max_duration: Duration,
     worker_id: String,
@@ -214,16 +221,20 @@ struct RunningProperties<T> {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct CallProperties {}
+struct CallProperties {
+    pub last_heartbeat: DateTime<Utc>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct ActivityProperties {
     pub workflow_id: String,
+    pub last_heartbeat: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ImmortalService {
     redis_pool: bb8::Pool<RedisConnectionManager>,
+    cron_manager: Arc<Mutex<CronManager>>,
     metrics_stream: broadcast::Sender<IdentifiableMetrics>,
     workers: Arc<RwLock<HashMap<String, RegisteredWorker>>>,
     // log_streams: (
@@ -339,7 +350,8 @@ impl ImmortalService {
 
                     for (id, running_activity) in running_activities.read().await.iter() {
                         let now = Utc::now();
-                        let max_time = running_activity.2.timeout;
+                        let max_time = running_activity.2.additional_properties.last_heartbeat
+                            + running_activity.2.heartbeat_timeout;
                         if now > max_time {
                             let available_worker = {
                                 let workers = workers.read().await;
@@ -451,6 +463,10 @@ impl ImmortalService {
                         .collect()
                 };
 
+                // min: 1
+                // max: 100
+                // ratio: for every 10 tasks + 1 worker
+                // interval: 10 mins
                 println!("got snapshot");
                 for (queue_name, queue) in queues_snapshot {
                     if queue.is_empty() {
@@ -561,11 +577,14 @@ impl ImmortalService {
                                         Box::new((
                                             sender,
                                             RunningProperties {
-                                                start: now,
+                                                start: now.clone(),
                                                 timeout,
                                                 max_duration: Duration::seconds(30),
                                                 worker_id: worker.0.clone(),
-                                                additional_properties: CallProperties {},
+                                                heartbeat_timeout: Duration::seconds(30),
+                                                additional_properties: CallProperties {
+                                                    last_heartbeat: now,
+                                                },
                                             },
                                         )),
                                     );
@@ -636,8 +655,13 @@ impl ImmortalService {
                                         timeout,
                                         max_duration: duration,
                                         worker_id: worker.0.clone(),
+                                        heartbeat_timeout: activity_options
+                                            .heartbeat_timeout
+                                            .map(|f| f.into())
+                                            .unwrap_or(Duration::seconds(30)),
                                         additional_properties: ActivityProperties {
                                             workflow_id: activity_options.workflow_id.clone(),
+                                            last_heartbeat: now,
                                         },
                                     },
                                 )),
@@ -1201,6 +1225,7 @@ impl Immortal for ImmortalService {
             }
         }
         let worker_id2 = worker_id.clone();
+        let running_activities = Arc::clone(&self.running_activities);
         // let (metrics_stream, _) = broadcast::channel(10);
         // let metrics_stream_sender = metrics_stream.clone();
         let handle = tokio::spawn(async move {
@@ -1218,8 +1243,9 @@ impl Immortal for ImmortalService {
                                 .ok();
                         }
                         Some(immortal_server_action_v1::Action::LogEvent(mut log)) => {
-                            if let Some(when) = DateTime::from_timestamp(log.when, 0) {
-                                let when = when.to_string();
+                            if let Some(when_dt) = DateTime::from_timestamp(log.when, 0) {
+                                let when = when_dt.to_string();
+
                                 let level = match log.level() {
                                     immortal::Level::Info => "info",
                                     immortal::Level::Warn => "warn",
@@ -1248,6 +1274,16 @@ impl Immortal for ImmortalService {
                                 }
                                 match log.activity_id.as_ref() {
                                     Some(activity_id) => {
+                                        let mut running_activities =
+                                            running_activities.write().await;
+                                        if let Some(running_activity) =
+                                            running_activities.get_mut(activity_id)
+                                        {
+                                            running_activity
+                                                .2
+                                                .additional_properties
+                                                .last_heartbeat = when_dt.clone();
+                                        }
                                         items.push(("activity_id", activity_id));
                                     }
                                     None => {}
@@ -1358,6 +1394,11 @@ impl Immortal for ImmortalService {
         self.call_notify.notify_one();
         self.workflow_notify.notify_one();
         self.activity_notify.notify_one();
+        let _ = self
+            .notification_tx
+            .send(Notification::WorkerAdded(worker_details.worker_id.clone()));
+
+        let notification_tx = self.notification_tx.clone();
         // let features = self.features.clone();
 
         tokio::spawn(async move {
@@ -1382,7 +1423,7 @@ impl Immortal for ImmortalService {
             {
                 let mut workers = workers.write().await;
                 let x = workers.remove(&worker_id);
-
+                let _ = notification_tx.send(Notification::WorkerRemoved(worker_id.clone()));
                 if let Some(x) = x {
                     println!("Stream ended and removed {:?}", x.worker_id);
                 } else {
@@ -1849,9 +1890,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manager = RedisConnectionManager::new(redis_url).unwrap();
     let pool = bb8::Pool::builder().build(manager).await.unwrap();
 
+    let kube_client = KubeClient::try_default().await?;
+    let cron_manager = Arc::new(Mutex::new(CronManager::new(kube_client).await?));
     let (stream_tx, _) = broadcast::channel::<IdentifiableMetrics>(1024);
     let (notification_tx, notification_rx) = broadcast::channel(100);
     let immortal_service = ImmortalService {
+        cron_manager: Arc::clone(&cron_manager),
         metrics_stream: stream_tx.clone(),
         notification_tx: Arc::new(notification_tx.clone()),
         notification_rx: Arc::new(notification_rx),
@@ -1938,9 +1982,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        start_watcher().await.unwrap();
-        println!("watcher started");
+        loop {
+            println!("watcher started");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let _ = start_watcher(Arc::clone(&cron_manager)).await;
+        }
     });
 
     Server::builder()

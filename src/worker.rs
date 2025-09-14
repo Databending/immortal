@@ -1,7 +1,3 @@
-// use crate::models::worker::WorkerConfigBuilder;
-// use immortal_lib::common;
-// use immortal_lib::failure;
-// use immortal_lib::immortal;
 use immortal_lib::register_workflow;
 pub mod activities;
 pub mod models;
@@ -13,7 +9,6 @@ use activities::test::ActivityData;
 use anyhow::Result;
 
 use immortal_worker_lib::models::worker::{Worker, WorkerConfigBuilder};
-// use models::worker::Worker;
 
 #[tokio::main]
 pub async fn main() -> Result<()> {
@@ -40,13 +35,13 @@ pub async fn main() -> Result<()> {
     });
 
     worker
-        .register_activity("get_avs_request_id", activities::test::hs_tariff_sync)
+        .register_activity("hs_tariff_sync", activities::test::hs_tariff_sync)
         .await;
 
     // worker
     //     .register_wf("new_validate_repair_wf", workflows::test::main_wf, workflows::test::main_wf_schema())
     //     .await;
-    // register_workflow!(worker, "new_validate_repair_wf", workflows::test);
+    register_workflow!(worker, "new_validate_repair_wf", workflows::test);
 
     // println!("{:#?}", serde_json::to_string_pretty(&workflows::test::main_wf_schema()));
     println!("Starting worker...");
@@ -58,3 +53,4 @@ pub async fn main() -> Result<()> {
     // worker.main_thread(srx).await;
     Ok(())
 }
+

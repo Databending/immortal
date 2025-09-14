@@ -12,41 +12,67 @@ use tokio_cron_scheduler::{Job, JobScheduler, JobSchedulerError};
 use uuid::Uuid;
 
 use kube::{
-    api::{Api, PostParams, ResourceExt},
+    api::{Api, Patch, PatchParams, PostParams, ResourceExt},
     runtime::{watcher, WatchStreamExt},
     Client as KubeClient,
 };
 
-#[derive(Deserialize, Serialize, PartialEq)]
-struct CronSpec {
-    id: Uuid,
-    schedule: String,
-    job: CronJob,
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct CronSpec {
+    pub id: Uuid,
+    pub label: String,
+    pub description: Option<String>,
+    pub status: CronStatus,
+    pub schedule: String,
+    pub job: CronJob,
 }
 
-#[derive(Clone, Deserialize, Serialize, PartialEq)]
-enum CronJob {
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+#[serde(tag = "type", content = "spec")]
+pub enum CronStatus {
+    Running,
+    Paused(Option<String>),
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Debug)]
+#[serde(tag = "type", content = "spec")]
+pub enum CronJob {
     Workflow(immortal_lib::immortal::client_start_workflow_options_version::Version),
-    Call(CallVersion),
-    Notification(NotifyVersion),
+    Call(immortal_lib::immortal::call_version::Version),
+    Notification(immortal_lib::immortal::notify_version::Version),
 }
 
-struct CronManager {
+pub struct CronManager {
     sched: JobScheduler,
     // key (stable id from CM) -> scheduler job id
     installed: HashMap<Uuid, Uuid>,
-    installed2: HashMap<Uuid, CronSpec>,
-    immortal_client: Arc<Mutex<Client>>,
+    pub installed2: HashMap<Uuid, CronSpec>,
+    pub installed3: Vec<CronSpec>,
+    kube_client: KubeClient,
+    // immortal_client: Arc<Mutex<Client>>,
 }
+
+impl std::fmt::Debug for CronManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // grab a tiny sample of keys so Debug stays short and doesn't require Debug on values
+        let mut sample_installed_keys: Vec<_> = self.installed.keys().cloned().take(3).collect();
+        let mut sample_installed2_keys: Vec<_> = self.installed2.keys().cloned().take(3).collect();
+
+        // sort for stable output (optional)
+        sample_installed_keys.sort();
+        sample_installed2_keys.sort();
+
+        f.debug_struct("CronManager")
+            .field("installed_len", &self.installed.len())
+            .field("installed_keys_sample", &sample_installed_keys)
+            .field("installed2_len", &self.installed2.len())
+            .field("installed2_keys_sample", &sample_installed2_keys)
+            .finish()
+    }
+}
+
 impl CronManager {
-    async fn new() -> Result<Self, JobSchedulerError> {
-        let immortal_client: Arc<Mutex<Client>> = Arc::new(Mutex::new(
-            Client::connect(
-                std::env::var("IMMORTAL_URL").unwrap_or("http://localhost:10000".to_string()),
-            )
-            .await
-            .unwrap(),
-        ));
+    pub async fn new(kube_client: KubeClient) -> Result<Self, JobSchedulerError> {
         let sched = JobScheduler::new().await?;
         // Important: start the scheduler loop
         sched.start().await?;
@@ -54,14 +80,104 @@ impl CronManager {
             sched,
             installed: HashMap::new(),
             installed2: HashMap::new(),
-            immortal_client,
+            installed3: Vec::new(),
+            kube_client,
+            // immortal_client,
         })
+    }
+    async fn get_config_kube(&self) -> anyhow::Result<CronConfig> {
+        let ns = std::env::var("K8S_NAMESPACE").unwrap_or("default".to_string());
+        let api = Api::<ConfigMap>::namespaced(self.kube_client.clone(), &ns);
+        let cm: ConfigMap = api.get("immortal-cron").await?;
+
+        if let Some(data) = cm.data {
+            if let Some(config) = data.get("config") {
+                let mut x = config.as_bytes().to_owned();
+                let parsed_config: CronConfig = simd_json::serde::from_slice(&mut x)?;
+                return Ok(parsed_config);
+            }
+        }
+        Err(anyhow::anyhow!("Couldn't find config"))
+    }
+    async fn save_config_kube(&self, config: CronConfig) -> anyhow::Result<()> {
+        let ns = std::env::var("K8S_NAMESPACE").unwrap_or("default".to_string());
+        let api = Api::<ConfigMap>::namespaced(self.kube_client.clone(), &ns);
+        let patch: ConfigMap = simd_json::serde::from_owned_value(json!({
+        "metadata": {
+          "name": "immortal-cron",
+          "namespace": ns,
+          "labels": {
+            "app": "immortal"
+          }
+        },
+        "immutable": false,
+        "data": {
+          "config": simd_json::to_string(&config)?
+        }
+              }))?;
+        let params = PatchParams::apply("immortal").force();
+        let patch = Patch::Apply(&patch);
+        let _cm: ConfigMap = api.patch("immortal-cron", &params, &patch).await?;
+        Ok(())
+    }
+    pub async fn create_cron(&self, new_cron: CronSpec) -> anyhow::Result<()> {
+        let mut current_config = self.get_config_kube().await?;
+        match current_config {
+            CronConfig::V1(ref mut v1) => v1.crons.push(new_cron),
+        }
+        println!("{:#?}", current_config);
+        self.save_config_kube(current_config).await?;
+        Ok(())
+    }
+    pub async fn delete_cron(&self, cron_id: Uuid) -> anyhow::Result<()> {
+        let mut current_config = self.get_config_kube().await?;
+        match current_config {
+            CronConfig::V1(ref mut v1) => {
+                if let Some(index) = v1.crons.iter().position(|f| f.id == cron_id) {
+                    v1.crons.remove(index);
+                }
+            }
+        }
+        self.save_config_kube(current_config).await?;
+        Ok(())
+    }
+    pub async fn update_cron(&self, updated_cron: CronSpec) -> anyhow::Result<()> {
+        let mut current_config = self.get_config_kube().await?;
+        match current_config {
+            CronConfig::V1(ref mut v1) => {
+                if let Some(index) = v1.crons.iter().position(|f| f.id == updated_cron.id) {
+                    v1.crons.remove(index);
+                    v1.crons.push(updated_cron);
+                }
+            }
+        }
+        self.save_config_kube(current_config).await?;
+        Ok(())
+    }
+    pub async fn update_cron_status(&self, id: Uuid, status: CronStatus) -> anyhow::Result<()> {
+        let mut current_config = self.get_config_kube().await?;
+        match current_config {
+            CronConfig::V1(ref mut v1) => {
+                if let Some(index) = v1.crons.iter().position(|f| f.id == id) {
+                    let cron = v1.crons.get_mut(index).unwrap();
+                    cron.status = status.clone();
+                }
+            }
+        }
+        self.save_config_kube(current_config).await?;
+        Ok(())
     }
     /// Reconcile from desired map (from ConfigMap) to the running scheduler state.
     async fn reconcile(&mut self, desired: Vec<CronSpec>) -> Result<(), JobSchedulerError> {
+        let desired_filtered: Vec<_> = desired
+            .iter()
+            .filter(|f| f.status == CronStatus::Running)
+            .map(|f| f.clone())
+            .collect();
+
         // 1) Remove jobs no longer desired
         for (key, job_id) in self.installed.clone() {
-            if !desired.iter().find(|f| f.id == key).is_some() {
+            if !desired_filtered.iter().find(|f| f.id == key).is_some() {
                 let _ = self.sched.remove(&job_id).await;
                 self.installed.remove(&key);
                 self.installed2.remove(&key);
@@ -69,7 +185,7 @@ impl CronManager {
         }
 
         // 2) Add/update desired jobs
-        for spec in desired {
+        for spec in desired_filtered {
             // If exists and schedule+payload unchanged, skip. Otherwise re-add (simplest).
 
             match self.installed2.get(&spec.id) {
@@ -83,12 +199,18 @@ impl CronManager {
                 }
                 None => {}
             }
-
-            let immortal_client = Arc::clone(&self.immortal_client);
+            let immortal_client: Arc<Mutex<Client>> = Arc::new(Mutex::new(
+                Client::connect(
+                    std::env::var("IMMORTAL_URL").unwrap_or("http://localhost:10000".to_string()),
+                )
+                .await
+                .unwrap(),
+            ));
+            // let immortal_client = Arc::clone(&self.immortal_client);
             let job_payload = spec.job.clone();
             let schedule = spec.schedule.clone();
 
-            let job = Job::new_async(schedule.as_str(), move |_uuid, _l| {
+            let job = Job::new_async("0 ".to_owned() + schedule.as_str(), move |_uuid, _l| {
                 let immortal_client = Arc::clone(&immortal_client);
                 let job_payload = job_payload.clone();
                 Box::pin(async move {
@@ -121,22 +243,27 @@ impl CronManager {
             self.installed2.insert(spec.id.clone(), spec);
         }
 
+        {
+
+            self.installed3 = desired.clone();
+        }
+
         Ok(())
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Debug)]
 #[serde(tag = "version", content = "spec")]
 enum CronConfig {
     V1(CronConfigV1),
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Debug)]
 struct CronConfigV1 {
     pub crons: Vec<CronSpec>,
 }
 
-pub async fn start_watcher() -> anyhow::Result<()> {
+pub async fn start_watcher(cron_manager: Arc<Mutex<CronManager>>) -> anyhow::Result<()> {
     let client = KubeClient::try_default().await?;
     let ns = std::env::var("K8S_NAMESPACE").unwrap_or("default".to_string());
     let api = Api::<ConfigMap>::namespaced(client, &ns);
@@ -177,7 +304,6 @@ pub async fn start_watcher() -> anyhow::Result<()> {
         "metadata.name=immortal-cron,metadata.namespace={}",
         ns
     ));
-    let cron_manager = Arc::new(Mutex::new(CronManager::new().await?));
 
     watcher(api, wc)
         .applied_objects()
@@ -192,11 +318,11 @@ pub async fn start_watcher() -> anyhow::Result<()> {
                         let mut cron_manager = cron_manager_arc.lock().await;
 
                         let mut x = config.as_bytes().to_owned();
-                        let parsed_config: CronConfig = simd_json::serde::from_slice(&mut x).unwrap();
+                        let parsed_config: CronConfig =
+                            simd_json::serde::from_slice(&mut x).unwrap();
                         cron_manager
                             .reconcile(match parsed_config {
-                                CronConfig::V1(v1) => v1.crons
-                                
+                                CronConfig::V1(v1) => v1.crons,
                             })
                             .await
                             .unwrap();
