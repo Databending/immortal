@@ -35,7 +35,7 @@ pub async fn main() -> Result<()> {
     });
 
     worker
-        .register_activity("get_avs_request_id", activities::test::hs_tariff_sync)
+        .register_activity("hs_tariff_sync", activities::test::hs_tariff_sync)
         .await;
 
     // worker
@@ -53,3 +53,4 @@ pub async fn main() -> Result<()> {
     // worker.main_thread(srx).await;
     Ok(())
 }
+

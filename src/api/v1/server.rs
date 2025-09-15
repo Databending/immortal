@@ -14,8 +14,8 @@ use o2o::o2o;
 use serde::{Deserialize, Serialize};
 // use serde_json::Value;
 use simd_json::OwnedValue;
-use uuid::Uuid;
 use std::collections::HashMap;
+use uuid::Uuid;
 #[derive(Debug, Clone, Default, Serialize)]
 struct Worker {
     id: String,
@@ -33,8 +33,8 @@ struct Worker {
 
 #[derive(Deserialize, Debug)]
 pub struct HistoryFilter {
-    worker_id: Option<String>,
-    task_queue: Option<String>,
+    worker_ids: Option<Vec<String>>,
+    task_queues: Option<Vec<String>>,
 }
 
 #[derive(o2o, Debug, Clone, Serialize, Deserialize)]
@@ -71,12 +71,9 @@ pub enum ApiStatus {
     Failed(String),
 }
 
-
-
 pub async fn delete_history(
     State(state): State<AppState>,
     Path(workflow_id): Path<Uuid>,
-
 ) -> impl IntoResponse {
     match state
         .immortal_service
@@ -84,9 +81,7 @@ pub async fn delete_history(
         .delete_history(&workflow_id)
         .await
     {
-        Ok(_history) => {
-            Json(())
-        }
+        Ok(_history) => Json(()),
         Err(e) => {
             println!("{:#?}", e);
             Json(())
@@ -103,7 +98,7 @@ pub async fn get_history(
     match state
         .immortal_service
         .history
-        .get_workflows(Some(100), None, params.task_queue, params.worker_id)
+        .get_workflows(Some(100), None, params.task_queues, params.worker_ids)
         .await
     {
         Ok(history) => {
@@ -125,7 +120,10 @@ pub async fn get_workers(
     // this argument tells axum to parse the request body
     // as JSON into a `CreateUser` type
 ) -> impl IntoResponse {
+    println!("waiting to read workers");
     let workers = state.immortal_service.workers.read().await;
+
+    println!("workers read");
     let mut registered_workers = Vec::new();
     for (worker_id, worker) in workers.iter() {
         registered_workers.push(Worker {
@@ -145,6 +143,108 @@ pub async fn get_workers(
     // with a status code of `201 Created`
     Json(registered_workers)
 }
+
+pub async fn get_task_queues(
+    State(state): State<AppState>,
+    // this argument tells axum to parse the request body
+    // as JSON into a `CreateUser` type
+) -> impl IntoResponse {
+    println!("waiting to read workers");
+    let mut task_queues = vec![];
+    let workers = state.immortal_service.workers.read().await;
+
+    println!("workers read");
+    for (_worker_id, worker) in workers.iter() {
+        if !task_queues.contains(&worker.task_queue) {
+            task_queues.push(worker.task_queue.clone());
+        }
+    }
+
+    // this will be converted into a JSON response
+    // with a status code of `201 Created`
+    Json(task_queues)
+}
+
+pub async fn get_registered_workflows(
+    State(state): State<AppState>,
+    Path(task_queue): Path<String>,
+    // this argument tells axum to parse the request body
+    // as JSON into a `CreateUser` type
+) -> impl IntoResponse {
+    println!("waiting to read workers");
+    let mut workflow_types = HashMap::new();
+    let workers = state.immortal_service.workers.read().await;
+
+    println!("workers read");
+    for (_worker_id, worker) in workers.iter() {
+        if worker.task_queue == task_queue {
+            let registered_workflows: Vec<_> = worker.registered_workflows.iter().collect();
+            for (key, registered_workflow) in registered_workflows {
+                if !workflow_types.contains_key(key) {
+                    workflow_types.insert(key.clone(), registered_workflow.clone());
+                }
+            }
+        }
+    }
+
+    // this will be converted into a JSON response
+    // with a status code of `201 Created`
+    Json(workflow_types)
+}
+
+pub async fn get_registered_activities(
+    State(state): State<AppState>,
+    Path(task_queue): Path<String>,
+    // this argument tells axum to parse the request body
+    // as JSON into a `CreateUser` type
+) -> impl IntoResponse {
+    println!("waiting to read workers");
+    let mut activity_types = HashMap::new();
+    let workers = state.immortal_service.workers.read().await;
+
+    println!("workers read");
+    for (_worker_id, worker) in workers.iter() {
+        if worker.task_queue == task_queue {
+            let registered_activities: Vec<_> = worker.registered_activities.iter().collect();
+            for (key, registered_activity) in registered_activities {
+                if !activity_types.contains_key(key) {
+                    activity_types.insert(key.clone(), registered_activity.clone());
+                }
+            }
+        }
+    }
+
+    // this will be converted into a JSON response
+    // with a status code of `201 Created`
+    Json(activity_types)
+}
+
+//
+// pub async fn get_registered_notifications(
+//     State(state): State<AppState>,
+//     // this argument tells axum to parse the request body
+//     // as JSON into a `CreateUser` type
+// ) -> impl IntoResponse {
+//     println!("waiting to read workers");
+//     let mut activity_types = HashMap::new();
+//     let workers = state.immortal_service.workers.read().await;
+//
+//     println!("workers read");
+//     for (_worker_id, worker) in workers.iter() {
+//         // if worker.task_queue == task_queue {
+//             let registered_activities: Vec<_> = worker.registered_activities.iter().collect();
+//             for (key, registered_activity) in registered_activities {
+//                 if !activity_types.contains_key(key) {
+//                     activity_types.insert(key.clone(), registered_activity.clone());
+//                 }
+//             }
+//         // }
+//     }
+//
+//     // this will be converted into a JSON response
+//     // with a status code of `201 Created`
+//     Json(activity_types)
+// }
 
 //pub async fn get_workflow_queue(
 //    State(state): State<ImmortalService>,

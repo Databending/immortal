@@ -1,9 +1,11 @@
 use axum::{
-    routing::{get, post, delete},
+    routing::{get, post, delete, patch},
     Router,
 };
 
 use crate::AppState;
+
+pub mod cron;
 pub mod run;
 pub mod server;
 
@@ -14,6 +16,15 @@ pub fn router() -> Router<AppState> {
         .route("/history", get(server::get_history))
         .route("/history/{id}", delete(server::delete_history))
         .route("/workers", get(server::get_workers))
+        .route("/crons", get(cron::get_crons))
+        .route("/crons", post(cron::create_cron))
+        .route("/crons/{id}", delete(cron::delete_cron))
+        .route("/crons/{id}", patch(cron::update_cron))
+        .route("/crons/{id}/status", patch(cron::update_cron_status))
+        .route("/crons/{id}", get(cron::get_cron))
+        .route("/task-queues", get(server::get_task_queues))
+        .route("/workflows/{task_queue}", get(server::get_registered_workflows))
+        .route("/activities/{task_queue}", get(server::get_registered_activities))
         .route("/workflow-queue", get(server::get_workflow_queue))
         .route("/activity-queue", get(server::get_activity_queue))
         .route("/running-activities", get(server::running_activities))
