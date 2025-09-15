@@ -104,6 +104,26 @@ cargo build --release
 
 ### Running the Server
 
+You must create a .env with the following
+```
+REDIS_HOST=<YOUR REDIS HOST (localhost)>
+REDIS_PORT=<YOUR REDIS PORT (6379)>
+REDIS_USERNAME=<YOUR REDIS (default)>
+REDIS_PASSWORD=<YOUR REDIS PASSWORD>
+SERVERLESS_MODE=false
+IMMORTAL_URL=http://localhost:10000
+ENABLE_TOKIO_CONSOLE=false
+JEMALLOC_SYS_WITH_MALLOC_CONF=abort_conf:true,dirty_decay_ms:0,muzzy_decay_ms:0
+MALLOC_CONF=abort_conf:true,dirty_decay_ms:0,muzzy_decay_ms:0
+_RJEM_MALLOC_CONF=abort_conf:true,dirty_decay_ms:0,muzzy_decay_ms:0
+```
+
+As well as a jwt.pem file for security 
+```
+openssl genpkey -algorithm RSA -out private.pem -pkeyopt rsa_keygen_bits:4096
+openssl rsa -pubout -in private.pem -out jwt.pem
+```
+
 ```bash
 # start Redis first, then
 export IMMORTAL_URL=http://localhost:10000
