@@ -1985,7 +1985,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             println!("watcher started");
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            let _ = start_watcher(Arc::clone(&cron_manager)).await;
+            if let Err(e) = start_watcher(Arc::clone(&cron_manager)).await {
+                println!("{:#?}", e)
+
+            }
         }
     });
 

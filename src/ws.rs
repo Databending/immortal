@@ -368,6 +368,8 @@ async fn fetch_logs_from_redis(
                                     continue;
                                 }
                             }
+                        } else {
+                            continue;
                         }
                     }
                     if let Some(activity_run_id) = &workflow.run_id {
@@ -378,6 +380,8 @@ async fn fetch_logs_from_redis(
                                     continue;
                                 }
                             }
+                        }else {
+                            continue;
                         }
                     }
                     read_and_send_log(&room_name, &mut parsed_map, map, &io)
