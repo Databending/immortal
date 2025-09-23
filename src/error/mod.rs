@@ -2,6 +2,8 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response}, Json,
 };
+use bb8_redis::bb8::RunError;
+use redis::RedisError;
 use std::env::VarError;
 use strum::Display;
 use thiserror::Error;
@@ -37,6 +39,8 @@ pub enum AppError {
     Error(#[from] anyhow::Error),
 }
 impl_from_error_for_apperror!(VarError);
+impl_from_error_for_apperror!(RedisError);
+impl_from_error_for_apperror!(RunError<RedisError>);
 
 
 // Tell axum how to convert `AppError` into a response.

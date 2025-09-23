@@ -1,3 +1,4 @@
+// SERVER
 use serde::Serialize;
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 use sysinfo::{get_current_pid, System};

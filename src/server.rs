@@ -1,3 +1,4 @@
+use itertools::Itertools;
 use socketioxide::SocketIo;
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
@@ -98,6 +99,7 @@ pub mod history;
 pub mod metrics;
 pub mod models;
 pub mod state;
+pub mod utils;
 pub mod ws;
 
 pub async fn get_file_as_byte_vec() -> JwtPublicBytes {
@@ -229,6 +231,8 @@ struct CallProperties {
 struct ActivityProperties {
     pub workflow_id: String,
     pub last_heartbeat: DateTime<Utc>,
+    pub scheduled: DateTime<Utc>,
+    pub latest_run_start: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -258,7 +262,8 @@ pub struct ImmortalService {
             >,
         >,
     >,
-
+    orphaned_activities: Arc<RwLock<HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
+    orphaned_workflows: Arc<RwLock<HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
     activity_notify: Arc<Notify>,
     running_activities: Arc<
         RwLock<
@@ -311,6 +316,7 @@ pub struct ImmortalService {
                         String,
                         RequestStartActivityOptionsV1,
                         tokio::sync::oneshot::Sender<ActivityResultV1>,
+                        DateTime<Utc>,
                     )>,
                 >,
             >,
@@ -323,7 +329,184 @@ enum AdjustCapacity {
     Activity,
 }
 
+async fn fail_entire_workflow(
+    history: &History,
+    v1: &mut WorkflowHistory,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    for activity in &mut v1.activities {
+        let mut changed = false;
+        for run in &mut activity.runs {
+            if matches!(run.status, HistoryStatus::Running) {
+                run.status = HistoryStatus::Failed("Orphaned".to_string());
+                run.end_time = Some(now);
+                changed = true;
+            }
+        }
+        if changed {
+            let activity_clone = activity.clone();
+            history
+                .update_activity(&v1.workflow_id, activity_clone)
+                .await?;
+        }
+    }
+    v1.status = HistoryStatus::Failed("Orphaned".to_string());
+    v1.end_time = Some(now);
+    history.update_workflow(&v1.workflow_id, v1.clone()).await?;
+    Ok(())
+}
+
+async fn rehydrate_activity_if_absent(
+    running_activities: &Arc<
+        RwLock<
+            HashMap<
+                String,
+                Box<(
+                    String,
+                    tokio::sync::oneshot::Sender<ActivityResultV1>,
+                    RunningProperties<ActivityProperties>,
+                )>,
+            >,
+        >,
+    >,
+    workers: &Arc<RwLock<HashMap<String, RegisteredWorker>>>,
+    worker_id: &str,
+    workflow_id: &str,
+    activity: &ActivityHistory,
+    last_run_start: Option<DateTime<Utc>>,
+) {
+    let mut running = running_activities.write().await;
+    if running.contains_key(&activity.activity_id) {
+        return;
+    }
+    let (tx, _rx) = tokio::sync::oneshot::channel::<ActivityResultV1>();
+    let now = Utc::now();
+    running.insert(
+        activity.activity_id.clone(),
+        Box::new((
+            worker_id.to_string(),
+            tx,
+            RunningProperties {
+                start: last_run_start.unwrap_or(now),
+                timeout: now + Duration::seconds(30),
+                max_duration: Duration::seconds(30),
+                worker_id: worker_id.to_string(),
+                heartbeat_timeout: Duration::seconds(30),
+                additional_properties: ActivityProperties {
+                    workflow_id: workflow_id.to_string(),
+                    last_heartbeat: now,
+                    scheduled: last_run_start.unwrap_or(now),
+                    latest_run_start: last_run_start,
+                },
+            },
+        )),
+    );
+
+    // decrement activity capacity (best-effort)
+    ImmortalService::adjust_capacity(
+        Arc::clone(workers),
+        worker_id.to_string(),
+        -1,
+        AdjustCapacity::Activity,
+    )
+    .await;
+}
+
+// --- Activity retry policy (tweak as needed) ---
+const ACTIVITY_MAX_ATTEMPTS: usize = 3;
+const ACTIVITY_BACKOFF_BASE_MS: u64 = 1_000; // 1s
+const ACTIVITY_BACKOFF_FACTOR: u64 = 2;
+const ACTIVITY_BACKOFF_JITTER_MS: u64 = 250;
+
+// Build RequestStartActivityOptionsV1 from history for a retry.
+// We infer task_queue from the workflow (common case). If your activities
+// use a different queue, swap this to your preferred source.
+async fn build_retry_activity_options(
+    history: &History,
+    workflow_id: &str,
+    activity: &history::ActivityHistory,
+) -> anyhow::Result<immortal::RequestStartActivityOptionsV1> {
+    use immortal_lib::common::Payload;
+
+    // Grab the workflow to infer its task_queue
+    let wf = history
+        .get_workflow(workflow_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("workflow not found for retry"))?;
+
+    // Serialize the activity input (it’s stored as OwnedValue in history)
+    let activity_input = if let Some(v) = &activity.input {
+        let mut tmp = simd_json::to_vec(v)?;
+        Some(Payload {
+            data: std::mem::take(&mut tmp),
+            ..Default::default()
+        })
+    } else {
+        None
+    };
+
+    Ok(RequestStartActivityOptionsV1 {
+        workflow_id: workflow_id.to_string(),
+        activity_id: activity.activity_id.clone(),
+        activity_type: activity.activity_type.clone(),
+        activity_input,
+        // Use the same queue as the workflow by default
+        task_queue: wf.task_queue.unwrap_or_else(|| "default".to_string()),
+        // Reasonable defaults; override if you persist these in history
+        heartbeat_timeout: None,
+        schedule_to_start_timeout: None,
+        ..Default::default()
+    })
+}
+
+// Schedule a retry with exponential backoff (+ jitter)
 impl ImmortalService {
+    fn schedule_activity_retry(
+        &self,
+        options: immortal::RequestStartActivityOptionsV1,
+        next_run_id: String,
+        attempt_index: usize, // 0-based (0 => first retry)
+    ) {
+        let backoff_ms = ACTIVITY_BACKOFF_BASE_MS
+            .saturating_mul(ACTIVITY_BACKOFF_FACTOR.saturating_pow(attempt_index as u32));
+        let jitter = rand::rng().random_range(0..=ACTIVITY_BACKOFF_JITTER_MS);
+        let delay = std::time::Duration::from_millis(backoff_ms + jitter);
+
+        let activity_queue = Arc::clone(&self.activity_queue);
+        let activity_notify = Arc::clone(&self.activity_notify);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+
+            // Enqueue back onto the activity queue
+            let now = chrono::Utc::now();
+            {
+                let mut queues = activity_queue.lock().await;
+                match queues.get_mut(&options.task_queue) {
+                    Some(q) => q.push_back(Box::new((
+                        next_run_id.clone(),
+                        options.clone(),
+                        {
+                            // oneshot the worker’s final result back to whoever is waiting (the server)
+                            let (tx, _rx) =
+                                tokio::sync::oneshot::channel::<immortal::ActivityResultV1>();
+                            tx
+                        },
+                        now,
+                    ))),
+                    None => {
+                        let (tx, _rx) =
+                            tokio::sync::oneshot::channel::<immortal::ActivityResultV1>();
+                        let mut q = std::collections::VecDeque::new();
+                        q.push_back(Box::new((next_run_id.clone(), options.clone(), tx, now)));
+                        queues.insert(options.task_queue.clone(), q);
+                    }
+                }
+            }
+            activity_notify.notify_one();
+        });
+    }
+
     async fn adjust_capacity(
         workers: Arc<RwLock<HashMap<String, RegisteredWorker>>>,
         worker_id: String,
@@ -339,6 +522,213 @@ impl ImmortalService {
         }
     }
 
+    // We need to first check
+    // 1) Is the workflow still running on the workers
+    // 1.1) If it is, we simply add it back to the running queue
+    // 1.2) If it is not, we fail the entire workflow and all activities
+    // 2) Once we have determined that the workflow is still running. We need to now check with
+    //    activity it is stuck on. We can do an activity check as well.
+    // 2.1) If the activity is running, we add it back to the queue
+    // 2.2) If the activity is no longer running, depending on the retry policy, we either rerun it
+    //   or fail everything
+
+    async fn orphaned_workflows(&self) -> anyhow::Result<()> {
+        use tokio::time::{timeout, Duration as TokioDuration};
+
+        let running_activities = Arc::clone(&self.running_activities);
+        let orphaned_activities = Arc::clone(&self.orphaned_activities);
+        let orphaned_workflows = Arc::clone(&self.orphaned_workflows);
+        let workers = Arc::clone(&self.workers);
+        let history = self.history.clone();
+
+        // scan recent set; tune page as desired
+        let workflows = history
+            .get_workflows(Some(500), Some(0), None, None)
+            .await?;
+
+        for wf in workflows {
+            let history::WorkflowHistoryVersion::V1(mut v1) = wf else {
+                continue;
+            };
+
+            if !matches!(v1.status, HistoryStatus::Running) {
+                continue;
+            }
+
+            let now = Utc::now();
+            let Some(worker_id) = v1.worker_id.clone() else {
+                // nothing owns it: fail everything
+                fail_entire_workflow(&history, &mut v1, now).await?;
+                continue;
+            };
+
+            // ensure worker exists & matches queue + can run the workflow type
+            let (worker_tx, can_run_workflow) = {
+                let guard = workers.read().await;
+                if let Some(w) = guard.get(&worker_id) {
+                    let queue_ok = v1
+                        .task_queue
+                        .as_ref()
+                        .map(|q| q == &w.task_queue)
+                        .unwrap_or(true);
+                    let wf_ok = w.registered_workflows.contains_key(&v1.workflow_type);
+                    (Some(w.tx.clone()), queue_ok && wf_ok)
+                } else {
+                    (None, false)
+                }
+            };
+
+            if worker_tx.is_none() || !can_run_workflow {
+                fail_entire_workflow(&history, &mut v1, now).await?;
+                continue;
+            }
+
+            // Ask the worker if this workflow is actually still running.
+            let (tx_wf, rx_wf) = oneshot::channel::<bool>();
+            {
+                let mut map = orphaned_workflows.write().await;
+                map.insert(v1.workflow_id.clone(), tx_wf);
+            }
+
+            // fire-and-wait (bounded)
+            if let Err(_e) = worker_tx
+                .as_ref()
+                .unwrap()
+                .send(Ok(ImmortalWorkerActionVersion {
+                    version: Some(immortal_worker_action_version::Version::V1(
+                        ImmortalWorkerActionV1 {
+                            action: Some(WorkerAction::CheckWorkflow(v1.workflow_id.clone())),
+                        },
+                    )),
+                }))
+                .await
+            {
+                // can’t ask => consider orphaned
+                fail_entire_workflow(&history, &mut v1, now).await?;
+                continue;
+            }
+
+            let running = timeout(TokioDuration::from_secs(2), rx_wf)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(false);
+
+            if !running {
+                // worker said "no" (or timed out) => fail everything
+                fail_entire_workflow(&history, &mut v1, now).await?;
+                continue;
+            }
+
+            // Workflow is running: check each Running activity run.
+            for activity in &mut v1.activities {
+                // Only check the *latest* running run (if any)
+                let maybe_latest_running_idx = activity
+                    .runs
+                    .iter()
+                    .rposition(|r| matches!(r.status, HistoryStatus::Running));
+
+                let Some(idx) = maybe_latest_running_idx else {
+                    continue;
+                };
+                let run_id = activity.runs[idx].run_id.clone();
+
+                // Ensure worker can run this activity on this queue
+                let can_resume_activity = {
+                    let guard = workers.read().await;
+                    if let Some(w) = guard.get(&worker_id) {
+                        v1.task_queue
+                            .as_ref()
+                            .map(|q| &w.task_queue == q)
+                            .unwrap_or(true)
+                            && w.registered_activities
+                                .contains_key(&activity.activity_type)
+                    } else {
+                        false
+                    }
+                };
+
+                if !can_resume_activity {
+                    // Mark that run failed
+                    activity.runs[idx].status = HistoryStatus::Failed("Orphaned".to_string());
+                    activity.runs[idx].end_time = Some(now);
+                    let cloned = activity.clone();
+                    history.update_activity(&v1.workflow_id, cloned).await?;
+                    continue;
+                }
+
+                // Ask the worker about the activity
+                let (tx_act, rx_act) = oneshot::channel::<bool>();
+                {
+                    let mut map = orphaned_activities.write().await;
+                    map.insert(activity.activity_id.clone(), tx_act);
+                }
+
+                if let Err(_e) = worker_tx
+                    .as_ref()
+                    .unwrap()
+                    .send(Ok(ImmortalWorkerActionVersion {
+                        version: Some(immortal_worker_action_version::Version::V1(
+                            ImmortalWorkerActionV1 {
+                                action: Some(WorkerAction::CheckActivity(
+                                    activity.activity_id.clone(),
+                                )),
+                            },
+                        )),
+                    }))
+                    .await
+                {
+                    // treat as not running
+                    activity.runs[idx].status = HistoryStatus::Failed("Orphaned".to_string());
+                    activity.runs[idx].end_time = Some(now);
+                    let cloned = activity.clone();
+                    history.update_activity(&v1.workflow_id, cloned).await?;
+                    continue;
+                }
+
+                let act_running = timeout(TokioDuration::from_secs(2), rx_act)
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or(false);
+
+                if act_running {
+                    // rehydrate into memory so watchdog & logs update heartbeats again
+                    let last_run_start = activity.runs[idx].start_time;
+                    rehydrate_activity_if_absent(
+                        &running_activities,
+                        &workers,
+                        &worker_id,
+                        &v1.workflow_id,
+                        activity,
+                        Some(last_run_start),
+                    )
+                    .await;
+                } else {
+                    // mark failed
+                    activity.runs[idx].status = HistoryStatus::Failed("Orphaned".to_string());
+                    activity.runs[idx].end_time = Some(now);
+                    let cloned = activity.clone();
+                    history.update_activity(&v1.workflow_id, cloned).await?;
+                }
+            }
+
+            // If *all* activities ended up not running anymore, it’s safer to fail the workflow too.
+            let any_running_left = v1.activities.iter().any(|a| {
+                a.runs
+                    .iter()
+                    .any(|r| matches!(r.status, HistoryStatus::Running))
+            });
+
+            if !any_running_left {
+                v1.status = HistoryStatus::Failed("Orphaned".to_string());
+                v1.end_time = Some(now);
+                history.update_workflow(&v1.workflow_id, v1.clone()).await?;
+            }
+        }
+
+        Ok(())
+    }
     fn watchdog(&self) {
         let running_calls = Arc::clone(&self.running_calls);
         let running_activities = Arc::clone(&self.running_activities);
@@ -616,7 +1006,35 @@ impl ImmortalService {
 
                 for (queue_name, queue) in activity_queues.iter_mut() {
                     if let Some(queued_item) = queue.pop_front() {
-                        let (activity_run_id, activity_options, tx) = *queued_item;
+                        let (activity_run_id, activity_options, tx, scheduled) = *queued_item;
+                        if let Some(schedule_to_start_timeout) =
+                            activity_options.schedule_to_start_timeout
+                        {
+                            let now = Utc::now();
+                            let schedule_to_start_timeout: Duration =
+                                schedule_to_start_timeout.into();
+                            let max_time = scheduled + schedule_to_start_timeout;
+                            if now > max_time {
+                                if let Err(e) = tx.send(ActivityResultV1 {
+                                    activity_id: activity_options.activity_id.clone(),
+
+                                    workflow_id: activity_options.workflow_id.clone(),
+                                    activity_run_id: activity_run_id.to_string(),
+
+                                    status: Some(immortal::activity_result_v1::Status::Failed(
+                                        immortal::Failure {
+                                            failure: Some(failure::Failure {
+                                                message: "timeout".to_string(),
+                                                ..Default::default()
+                                            }),
+                                        },
+                                    )),
+                                }) {
+                                    println!("{:#?}", e);
+                                }
+                                continue;
+                            }
+                        }
                         let available_workers: Vec<_>;
                         {
                             let workers_guard = workers.read().await;
@@ -634,7 +1052,12 @@ impl ImmortalService {
                         }
 
                         if available_workers.is_empty() {
-                            queue.push_front(Box::new((activity_run_id, activity_options, tx)));
+                            queue.push_front(Box::new((
+                                activity_run_id,
+                                activity_options,
+                                tx,
+                                scheduled,
+                            )));
                             continue;
                         }
 
@@ -662,6 +1085,8 @@ impl ImmortalService {
                                         additional_properties: ActivityProperties {
                                             workflow_id: activity_options.workflow_id.clone(),
                                             last_heartbeat: now,
+                                            scheduled: now.clone(),
+                                            latest_run_start: None,
                                         },
                                     },
                                 )),
@@ -670,19 +1095,65 @@ impl ImmortalService {
                             let mut activity_history = ActivityHistory::new(
                                 activity_options.activity_type.clone(),
                                 activity_options.activity_id.clone(),
+                                activity_options
+                                    .activity_input
+                                    .clone()
+                                    .map(|mut i| simd_json::from_slice(&mut i.data).ok())
+                                    .unwrap_or_default(),
+                                activity_options.task_queue.clone(),
+                                activity_options.activity_input.clone(),
                             );
                             activity_history
                                 .runs
                                 .push(ActivityRun::new("0".to_string()));
 
-                            if let Err(e) = history
-                                .add_activity(
+                            match history
+                                .get_activity(
                                     &activity_options.workflow_id,
-                                    activity_history.clone(),
+                                    &activity_options.activity_id,
                                 )
                                 .await
                             {
-                                error!("Failed to add activity to history: {:?}", e);
+                                Ok(Some(mut existing)) => {
+                                    existing
+                                        .runs
+                                        .push(ActivityRun::new(activity_run_id.clone()));
+                                    if let Err(e) = history
+                                        .update_activity(&activity_options.workflow_id, existing)
+                                        .await
+                                    {
+                                        error!(
+                                            "Failed to append run to existing activity: {:?}",
+                                            e
+                                        );
+                                    }
+                                }
+                                _ => {
+                                    // first ever run for this activity id
+                                    let mut activity_history = ActivityHistory::new(
+                                        activity_options.activity_type.clone(),
+                                        activity_options.activity_id.clone(),
+                                        activity_options
+                                            .activity_input
+                                            .clone()
+                                            .map(|mut i| simd_json::from_slice(&mut i.data).ok())
+                                            .unwrap_or_default(),
+                                        activity_options.task_queue.clone(),
+                                        activity_options.activity_input.clone(),
+                                    );
+                                    activity_history
+                                        .runs
+                                        .push(ActivityRun::new(activity_run_id.clone()));
+                                    if let Err(e) = history
+                                        .add_activity(
+                                            &activity_options.workflow_id,
+                                            activity_history,
+                                        )
+                                        .await
+                                    {
+                                        error!("Failed to add activity to history: {:?}", e);
+                                    }
+                                }
                             }
                             println!("added activity history");
                             if let Err(e) = worker
@@ -729,7 +1200,12 @@ impl ImmortalService {
                                 eprintln!("Failed to send notification: {:?}", e);
                             }
                         } else {
-                            queue.push_front(Box::new((activity_run_id, activity_options, tx)));
+                            queue.push_front(Box::new((
+                                activity_run_id,
+                                activity_options,
+                                tx,
+                                scheduled,
+                            )));
                         }
                     }
                 }
@@ -1226,6 +1702,8 @@ impl Immortal for ImmortalService {
         }
         let worker_id2 = worker_id.clone();
         let running_activities = Arc::clone(&self.running_activities);
+        let orphaned_workflows = Arc::clone(&self.orphaned_workflows);
+        let orphaned_activities = Arc::clone(&self.orphaned_activities);
         // let (metrics_stream, _) = broadcast::channel(10);
         // let metrics_stream_sender = metrics_stream.clone();
         let handle = tokio::spawn(async move {
@@ -1241,6 +1719,25 @@ impl Immortal for ImmortalService {
                                     mem_total: metrics.mem_total,
                                 })
                                 .ok();
+                        }
+                        Some(immortal_server_action_v1::Action::CheckActivity(check_activity)) => {
+                            // Expect the worker to send back { activity_id, running } (bool)
+                            // If your proto uses different field names, adjust here.
+                            let running = check_activity.running;
+                            let id = check_activity.activity_id.clone();
+                            let mut map = orphaned_activities.write().await;
+                            if let Some(sender) = map.remove(&id) {
+                                let _ = sender.send(running);
+                            }
+                        }
+                        Some(immortal_server_action_v1::Action::CheckWorkflow(check_workflow)) => {
+                            // Expect the worker to send back { workflow_id, running } (bool)
+                            let running = check_workflow.running;
+                            let id = check_workflow.workflow_id.clone();
+                            let mut map = orphaned_workflows.write().await;
+                            if let Some(sender) = map.remove(&id) {
+                                let _ = sender.send(running);
+                            }
                         }
                         Some(immortal_server_action_v1::Action::LogEvent(mut log)) => {
                             if let Some(when_dt) = DateTime::from_timestamp(log.when, 0) {
@@ -1534,6 +2031,7 @@ impl Immortal for ImmortalService {
                     run.end_time = Some(chrono::Utc::now());
 
                     println!("{:#?}", activity_result.status);
+
                     match activity_result.status.clone() {
                         Some(immortal::activity_result_v1::Status::Completed(x)) => {
                             match x.result {
@@ -1541,18 +2039,6 @@ impl Immortal for ImmortalService {
                                     run.status = HistoryStatus::Completed(
                                         simd_json::to_owned_value(&mut result_data.data).unwrap(),
                                     );
-                                    // match serde_json::from_slice(&result_data.data) {
-                                    //     Ok(result_value) => {
-                                    //         run.status = HistoryStatus::Completed(result_value);
-                                    //     }
-                                    //     Err(e) => {
-                                    //         println!("Failed to parse result: {:?}", e);
-                                    //         error!("Failed to parse result: {:?}", e);
-                                    //         run.status = HistoryStatus::Failed(
-                                    //             "Invalid result format".into(),
-                                    //         );
-                                    //     }
-                                    // }
                                 }
                                 None => {
                                     run.status =
@@ -1569,16 +2055,62 @@ impl Immortal for ImmortalService {
                                         e
                                     );
                                 }
-                            } else {
-                                error!(
-                                    "Invalid UUID in workflow_id: {}",
-                                    activity_result.workflow_id
-                                );
                             }
                         }
 
                         Some(immortal::activity_result_v1::Status::Failed(x)) => {
+                            // Mark this run failed in history
                             run.status = HistoryStatus::Failed(format!("{:#?}", x));
+
+                            // Count attempts so far (all runs for this activity)
+                            let attempts = activity.runs.len(); // includes this failed run
+
+                            // Decide retry
+                            if attempts < ACTIVITY_MAX_ATTEMPTS {
+                                // Persist the failed run before we schedule the retry
+                                if let Err(e) = self
+                                    .history
+                                    .update_activity(&activity_result.workflow_id, activity.clone())
+                                    .await
+                                {
+                                    error!(
+                                        "Failed to update activity history (failed run): {:?}",
+                                        e
+                                    );
+                                }
+
+                                // Build next options from history
+                                match build_retry_activity_options(
+                                    &self.history,
+                                    &activity_result.workflow_id,
+                                    &activity,
+                                )
+                                .await
+                                {
+                                    Ok(next_opts) => {
+                                        // Next run_id is attempts as string (previous runs are 0..attempts-1)
+                                        let next_run_id = attempts.to_string();
+
+                                        // Schedule retry with exponential backoff
+                                        self.schedule_activity_retry(
+                                            next_opts,
+                                            next_run_id,
+                                            attempts - 1, // attempt_index: 0-based for first retry
+                                        );
+
+                                        // (Optional) You can emit a small notification here if you want:
+                                        // let _ = self.notification_tx.send(Notification::ActivityRunStarted(...));
+                                    }
+                                    Err(err) => {
+                                        error!("Could not build retry options: {:?}", err);
+                                        // fall through: no retry ⇒ final failure (we already marked run as failed)
+                                    }
+                                }
+                            } else {
+                                // No more retries; final failure
+                            }
+
+                            // Send a completion/failed notification for this run (kept as-is)
                             if let Ok(id) = Uuid::parse_str(&activity_result.workflow_id) {
                                 if let Err(e) = self
                                     .notification_tx
@@ -1589,17 +2121,12 @@ impl Immortal for ImmortalService {
                                         e
                                     );
                                 }
-                            } else {
-                                error!(
-                                    "Invalid UUID in workflow_id: {}",
-                                    activity_result.workflow_id
-                                );
                             }
                         }
 
                         Some(immortal::activity_result_v1::Status::Cancelled(x)) => {
                             run.status = HistoryStatus::Failed(format!("{:#?}", x));
-                            // No notification in this case?
+                            // (No retry on cancelled by default; tweak if you want)
                         }
 
                         None => {
@@ -1832,6 +2359,7 @@ impl Immortal for ImmortalService {
             Some(request_start_activity_options_version::Version::V1(activity_options)) => {
                 let (tx, rx) = oneshot::channel::<ActivityResultV1>();
                 {
+                    let now = Utc::now();
                     let mut activity_queues = self.activity_queue.lock().await;
                     match activity_queues.get_mut(&activity_options.task_queue) {
                         Some(queue) => {
@@ -1839,6 +2367,7 @@ impl Immortal for ImmortalService {
                                 "0".to_string(),
                                 activity_options.clone(),
                                 tx,
+                                now,
                             )));
                         }
                         None => {
@@ -1847,6 +2376,7 @@ impl Immortal for ImmortalService {
                                 "0".to_string(),
                                 activity_options.clone(),
                                 tx,
+                                now,
                             )));
                             activity_queues.insert(activity_options.task_queue.clone(), queue);
                         }
@@ -1899,6 +2429,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics_stream: stream_tx.clone(),
         notification_tx: Arc::new(notification_tx.clone()),
         notification_rx: Arc::new(notification_rx),
+        orphaned_activities: Arc::new(RwLock::new(HashMap::new())),
+        orphaned_workflows: Arc::new(RwLock::new(HashMap::new())),
         workflow_queue: Arc::new(Mutex::new(HashMap::new())),
         workflow_notify: Arc::new(Notify::new()),
         activity_notify: Arc::new(Notify::new()),
@@ -1912,6 +2444,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         running_activities: Arc::new(RwLock::new(HashMap::new())),
         running_calls: Arc::new(RwLock::new(HashMap::new())),
     };
+
+    let _ = immortal_service.orphaned_workflows().await;
 
     immortal_service.workflow_queue_thread();
     immortal_service.activity_queue_thread();
@@ -1971,6 +2505,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .layer(layer),
             )
             .with_state(AppState {
+                redis: pool,
                 without_validation_arguments: (),
                 pub_key: get_file_as_byte_vec().await,
                 immortal_service,
@@ -1987,7 +2522,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             if let Err(e) = start_watcher(Arc::clone(&cron_manager)).await {
                 println!("{:#?}", e)
-
             }
         }
     });

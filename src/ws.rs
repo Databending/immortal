@@ -1,3 +1,4 @@
+use anyhow::Context;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,7 +44,7 @@ impl MetricsRequest {
 
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(tag = "type", content = "spec")]
-enum FetchLogs {
+pub enum FetchLogs {
     Workflow(FetchWorkflowLogs),
     Worker(Vec<String>),
     TaskQueue(Vec<String>),
@@ -72,7 +73,7 @@ impl FetchLogs {
 }
 
 #[derive(Deserialize, Serialize, Clone)]
-struct FetchWorkflowLogs {
+pub struct FetchWorkflowLogs {
     pub workflow_id: String,
     pub activity_id: Option<String>,
     pub run_id: Option<String>,
@@ -95,10 +96,10 @@ struct SocketState {
 async fn read_and_send_log(
     room_name: &Option<String>,
     parsed_map: &mut simd_json::OwnedValue,
-    map: HashMap<String, redis::Value>,
+    map: &HashMap<String, redis::Value>,
     io: &SocketRef,
 ) -> anyhow::Result<()> {
-    for (n, s) in map {
+    for (n, s) in map.clone() {
         if let redis::Value::BulkString(mut bytes) = s {
             if n == "metadata" {
                 parsed_map
@@ -128,19 +129,20 @@ async fn read_and_send_log(
                 .within(room_name.clone())
                 .emit("log-back", &parsed_map)
                 .await
-                .unwrap();
+                .map_err(|e| anyhow::anyhow!(e.to_string())) // convert to anyhow::Error
+                .context("emitting log-back")?;
             println!("{:#?}", x);
         }
         None => {
-            let x = io.emit("log-back", &parsed_map).unwrap();
-            println!("{:#?}", x);
+            io.emit("log-back", &parsed_map)?
+            // println!("{:#?}", x);
         }
     }
 
     Ok(())
 }
 
-fn merge_last_ids(last_ids: &mut HashMap<String, String>, workflow_ids: &Vec<String>) {
+pub fn merge_last_ids(last_ids: &mut HashMap<String, String>, workflow_ids: &Vec<String>) {
     for workflow_id in workflow_ids {
         if !last_ids.contains_key(workflow_id) {
             last_ids.insert(workflow_id.clone(), "0-0".to_string());
@@ -148,7 +150,7 @@ fn merge_last_ids(last_ids: &mut HashMap<String, String>, workflow_ids: &Vec<Str
     }
 }
 
-fn sort_last_ids(last_ids: &HashMap<String, String>, workflow_ids: &Vec<String>) -> Vec<String> {
+pub fn sort_last_ids(last_ids: &HashMap<String, String>, workflow_ids: &Vec<String>) -> Vec<String> {
     workflow_ids
         .iter()
         .filter_map(|k| last_ids.get(k).cloned())
@@ -380,13 +382,21 @@ async fn fetch_logs_from_redis(
                                     continue;
                                 }
                             }
-                        }else {
+                        } else {
                             continue;
                         }
                     }
-                    read_and_send_log(&room_name, &mut parsed_map, map, &io)
-                        .await
-                        .unwrap();
+                    let mut count = 0;
+                    while count < 3 {
+                        let value = read_and_send_log(&room_name, &mut parsed_map, &map, &io);
+                        match value.await {
+                            Ok(_) => break,
+                            Err(_) => {
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                count += 1
+                            },
+                        }
+                    }
                 }
             }
         }
@@ -425,7 +435,7 @@ async fn fetch_logs_from_redis(
                     let mut parsed_map = simd_json::json!({
                         "id": id.clone()
                     });
-                    read_and_send_log(&room_name, &mut parsed_map, map, &io)
+                    read_and_send_log(&room_name, &mut parsed_map, &map, &io)
                         .await
                         .unwrap();
                 }
@@ -588,21 +598,21 @@ pub async fn on_connect(
                     }
                 }
             };
-            let mut last_id = "0-0".to_string();
-            let mut last_ids = HashMap::new();
+            let last_id = "$".to_string();
+            let last_ids = HashMap::new();
             println!("fetching from pool");
-            let mut con = pool.get().await.unwrap();
+            // let mut con = pool.get().await.unwrap();
             println!("fetching logs");
-            fetch_logs_from_redis(
-                &mut last_ids,
-                &mut last_id,
-                &req,
-                &mut con,
-                &None,
-                &socket,
-                &immortal_service,
-            )
-            .await;
+            // fetch_logs_from_redis(
+            //     &mut last_ids,
+            //     &mut last_id,
+            //     &req,
+            //     &mut con,
+            //     &None,
+            //     &socket,
+            //     &immortal_service,
+            // )
+            // .await;
 
             println!("fetched {last_id}");
             // start producer if first subscriber

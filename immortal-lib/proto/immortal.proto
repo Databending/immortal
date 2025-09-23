@@ -293,6 +293,8 @@ message ImmortalWorkerActionV1 {
     string kill_workflow = 6;
     string kill_activity = 7;
     string kill_call = 8;
+    string check_activity = 9;
+    string check_workflow = 10;
   }
 }
 enum Level {
@@ -336,8 +338,22 @@ message ImmortalServerActionV1 {
     Log log_event = 4;
     int32 heartbeat = 5;
     Metrics metrics = 6;
+    CheckActivity check_activity = 7;
+    CheckWorkflow check_workflow = 8;
   }
 }
+
+message CheckActivity {
+  string activity_id = 1;
+  bool running = 2;
+}
+
+
+message CheckWorkflow {
+  string workflow_id = 1;
+  bool running = 2;
+}
+
 
 message Metrics {
   float cput_pct = 1;

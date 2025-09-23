@@ -14,6 +14,7 @@ pub fn router() -> Router<AppState> {
         .route("/run/workflow", post(run::run_workflow))
         .route("/run/activity", post(run::run_activity))
         .route("/history", get(server::get_history))
+        .route("/logs", post(server::get_logs))
         .route("/history/{id}", delete(server::delete_history))
         .route("/workers", get(server::get_workers))
         .route("/crons", get(cron::get_crons))

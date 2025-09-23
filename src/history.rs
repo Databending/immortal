@@ -7,6 +7,7 @@ use const_format::formatcp;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use immortal_lib::common::Payload;
 use itertools::Itertools;
 use redis::{AsyncCommands, ErrorKind, FromRedisValue, RedisError, RedisWrite, ToRedisArgs};
 use serde::{Deserialize, Serialize};
@@ -320,6 +321,7 @@ impl FromRedisValue for WorkflowHistoryVersion {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowHistory {
     pub args: Vec<OwnedValue>,
+    pub output: Option<OwnedValue>,
     pub workflow_id: String,
     pub workflow_type: String,
     pub status: Status,
@@ -341,6 +343,7 @@ impl WorkflowHistory {
     ) -> Self {
         Self {
             args,
+            output: None,
             workflow_type,
             workflow_id,
             status: Status::Running,
@@ -379,16 +382,24 @@ pub enum Status {
 pub struct ActivityHistory {
     pub activity_id: String,
     pub activity_type: String,
+    pub args: Option<OwnedValue>,
+    pub output: Option<OwnedValue>,
+    pub task_queue: Option<String>,
+    pub input : Option<Payload>,
     // pub status: Status,
     // pub result: Option<Value>,
     pub runs: Vec<ActivityRun>,
 }
 
 impl ActivityHistory {
-    pub fn new(activity_type: String, activity_id: String) -> Self {
+    pub fn new(activity_type: String, activity_id: String, args: Option<OwnedValue>, task_queue: String, input: Option<Payload>) -> Self {
         Self {
             activity_id,
             activity_type,
+            args,
+            input,
+            task_queue: Some(task_queue),
+            output: None,
             // status: Status::Running,
             runs: Vec::new(),
         }

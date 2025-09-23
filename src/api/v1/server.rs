@@ -1,4 +1,7 @@
+use crate::error::AppError;
 use crate::state::AppState;
+use crate::utils::log::fetch_log_history_from_redis;
+use crate::ws::FetchLogs;
 use crate::{
     history::{ActivityHistory, Status, WorkflowHistory, WorkflowHistoryVersion},
     ActivitySchema, WfSchema,
@@ -33,8 +36,8 @@ struct Worker {
 
 #[derive(Deserialize, Debug)]
 pub struct HistoryFilter {
-    worker_ids: Option<Vec<String>>,
-    task_queues: Option<Vec<String>>,
+    worker_ids: Option<String>,
+    task_queues: Option<String>,
 }
 
 #[derive(o2o, Debug, Clone, Serialize, Deserialize)]
@@ -98,7 +101,16 @@ pub async fn get_history(
     match state
         .immortal_service
         .history
-        .get_workflows(Some(100), None, params.task_queues, params.worker_ids)
+        .get_workflows(
+            Some(100),
+            None,
+            params
+                .task_queues
+                .map(|f| f.split(",").map(|f| f.to_string()).collect()),
+            params
+                .worker_ids
+                .map(|f| f.split(",").map(|f| f.to_string()).collect()),
+        )
         .await
     {
         Ok(history) => {
@@ -113,6 +125,26 @@ pub async fn get_history(
             Json(vec![])
         }
     }
+}
+
+#[derive(Deserialize)]
+pub struct LogFilter {
+    fetch_type: FetchLogs,
+    cursor: Option<String>,
+    limit: Option<i32>,
+    // task_queues: Option<String>,
+}
+pub async fn get_logs(
+    State(state): State<AppState>,
+    Json(payload): Json<LogFilter>, // this argument tells axum to parse the request body
+) -> Result<Json<Vec<OwnedValue>>, AppError> {
+    let redis = &state.redis;
+    let mut con = redis.get().await?;
+    // let con = state.with_current_subscriber
+    let logs =
+        fetch_log_history_from_redis(&payload.fetch_type, &mut con, &payload.limit, &payload.cursor)
+            .await?;
+    Ok(Json(logs))
 }
 
 pub async fn get_workers(
