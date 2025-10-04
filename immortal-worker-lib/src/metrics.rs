@@ -53,8 +53,8 @@ fn is_cgroup_v2() -> bool {
 
 #[derive(Clone, Copy, Debug)]
 struct CpuSample {
-    usage_secs: f64,     // cgroup cumulative CPU time in seconds
-    wall: Instant,       // sampling timestamp
+    _usage_secs: f64,     // cgroup cumulative CPU time in seconds
+    _wall: Instant,       // sampling timestamp
     effective_cpus: f64, // quota/cpuset constrained CPUs
 }
 
@@ -97,8 +97,8 @@ async fn read_cpu_mem_v2() -> anyhow::Result<(CpuSample, u64)> {
         .parse().unwrap_or(0);
 
     Ok((CpuSample {
-        usage_secs: usage_usec as f64 / 1_000_000.0,
-        wall: Instant::now(),
+        _usage_secs: usage_usec as f64 / 1_000_000.0,
+        _wall: Instant::now(),
         effective_cpus: eff_cpus,
     }, mem_current))
 }
@@ -137,8 +137,8 @@ async fn read_cpu_mem_v1() -> anyhow::Result<(CpuSample, u64)> {
 
 
     Ok((CpuSample {
-        usage_secs: usage_ns as f64 / 1_000_000_000.0,
-        wall: Instant::now(),
+        _usage_secs: usage_ns as f64 / 1_000_000_000.0,
+        _wall: Instant::now(),
         effective_cpus: eff_cpus,
     }, mem_current))
 }
