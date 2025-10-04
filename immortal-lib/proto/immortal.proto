@@ -178,6 +178,7 @@ message StartWorkflowOptionsV1 {
   common.Payloads input = 3;
   string task_queue = 4;
   string workflow_id = 5;
+  repeated ActivityCache cache = 6;
 }
 
 message ClientStartWorkflowOptionsVersion {
@@ -392,6 +393,13 @@ message CallV1 {
   common.Payload input = 3;
   string task_queue = 4;
   optional bool stackable = 5;
+}
+
+message ActivityCache {
+  common.Payload input = 1;
+  common.Payload output = 2;
+  string activity_type = 3;
+  optional string task_queue = 4;
 }
 
 message WorkerCallVersion {

@@ -1,21 +1,21 @@
+use anyhow::{Error, anyhow};
+use futures::future::{BoxFuture, FutureExt};
 use immortal_lib::common::Payloads;
+use immortal_lib::immortal::{
+    ActivityCache, RequestStartActivityOptionsV1, RequestStartActivityOptionsVersion, RetryPolicy,
+};
 use immortal_lib::immortal::{
     activity_result_v1::Status, activity_result_version, immortal_client::ImmortalClient,
     request_start_activity_options_version,
 };
-use immortal_lib::immortal::{
-    RequestStartActivityOptionsV1, RequestStartActivityOptionsVersion, RetryPolicy,
-};
-use anyhow::{anyhow, Error};
-use futures::future::{BoxFuture, FutureExt};
 use serde::Deserialize;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use simd_json::OwnedValue;
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 use tonic::transport::Channel;
+use tracing::Instrument;
 use tracing::info_span;
 use tracing::instrument::Instrumented;
-use tracing::Instrument;
 use uuid::Uuid;
 
 use super::activity::ActivityOptions;
@@ -26,7 +26,13 @@ pub struct Workflow {
     pub fn_name: String,
     pub fn_args: Vec<OwnedValue>,
 }
-
+//
+// #[derive(Clone)]
+// pub struct ActivityCache {
+//     pub input: Option<Payload>,
+//     pub output: Option<Payload>,
+// }
+//
 #[derive(Clone)]
 pub struct WfContext {
     _namespace: String,
@@ -34,6 +40,7 @@ pub struct WfContext {
     pub client: ImmortalClient<Channel>,
     pub args: Arc<Payloads>,
     pub id: String,
+    pub cache: Option<Vec<ActivityCache>>,
     // pub app_data: Option<AppData>,
     // chan: Sender<RustWfCmd>,
     // am_cancelled: watch::Receiver<bool>,
@@ -43,10 +50,22 @@ pub struct WfContext {
 }
 
 impl WfContext {
-    pub async fn activity<T: DeserializeOwned >(
+    pub async fn activity<T: DeserializeOwned>(
         &mut self,
         options: ActivityOptions,
     ) -> anyhow::Result<T> {
+        // strip cache once it is done and remove some of the clones
+        if let Some(cache) = &self.cache {
+            for item in cache {
+                if item.input == Some(options.input.clone())
+                    && item.activity_type == options.activity_type
+                    && item.task_queue == options.task_queue
+                {
+                    return Ok(item.output.clone().unwrap().to()?);
+                }
+            }
+        }
+
         let mut request = RequestStartActivityOptionsV1 {
             activity_id: Uuid::new_v4().to_string(),
             activity_type: options.activity_type.to_string(),
@@ -81,7 +100,7 @@ impl WfContext {
                     Some(Status::Completed(y)) => {
                         match y.result {
                             Some(mut x) => Ok(x.to()?),
-                            None => Err(anyhow!("Paylaod empty"))
+                            None => Err(anyhow!("Paylaod empty")),
                         }
                         // let result: ActExitValue<T> = serde_json::from_slice(&y.result.unwrap().data)?;
                         // match result {
@@ -189,7 +208,6 @@ impl WorkflowFunction {
     pub fn new<F, Fut, O>(f: F) -> Self
     where
         F: Fn(WfContext) -> Fut + Send + Sync + 'static,
-
         Fut: Future<Output = Result<WfExitValue<O>, anyhow::Error>> + Send + 'static,
         O: Serialize,
     {
@@ -221,7 +239,9 @@ impl WorkflowFunction {
         workflow_id: String,
         namespace: String,
         task_queue: String,
-    ) -> Instrumented<Pin<Box<dyn Future<Output = Result<WfExitValue<OwnedValue>, Error>> + Send>>> {
+        cache: Option<Vec<ActivityCache>>,
+    ) -> Instrumented<Pin<Box<dyn Future<Output = Result<WfExitValue<OwnedValue>, Error>> + Send>>>
+    {
         let span = info_span!(
             "RunWorkflow",
             "otel.name" = workflow_type,
@@ -234,6 +254,7 @@ impl WorkflowFunction {
             client,
             args: Arc::new(args),
             id: workflow_id,
+            cache,
         })
         .instrument(span);
         handle

@@ -15,7 +15,7 @@ pub async fn run_workflow(
     );
     state
         .immortal_service
-        .start_workflow_internal(workflow_options, None)
+        .start_workflow_internal(workflow_options, None, None)
         .await
         .unwrap();
 

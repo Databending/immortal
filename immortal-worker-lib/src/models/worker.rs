@@ -579,7 +579,7 @@ impl Worker {
         );
 
         let server_sender = self.server_channel.clone();
-        let handle  =tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             while let Ok(x) = sub.recv().await {
                 if let Err(e) = server_sender.send(ImmortalServerActionV1 {
                     action: Some(
@@ -680,6 +680,12 @@ impl Worker {
                     workflow_id.clone(),
                     self.config.namespace.clone(),
                     self.config.task_queue.clone(),
+                    match workflow_options.cache.len() {
+                        0 => None,
+                        _ => Some(workflow_options.cache.clone())
+
+
+                    },
                 );
             } else {
                 if let Err(e) = sender.send((

@@ -1,4 +1,5 @@
-use itertools::Itertools;
+use immortal_lib::common::Payloads;
+use immortal_lib::immortal::ActivityCache;
 use socketioxide::SocketIo;
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
@@ -302,6 +303,7 @@ pub struct ImmortalService {
                         String,
                         ClientStartWorkflowOptionsV1,
                         Option<watch::Sender<i32>>,
+                        Option<Vec<ActivityCache>>,
                     )>,
                 >,
             >,
@@ -531,6 +533,39 @@ impl ImmortalService {
     // 2.1) If the activity is running, we add it back to the queue
     // 2.2) If the activity is no longer running, depending on the retry policy, we either rerun it
     //   or fail everything
+
+    async fn continue_workflow(&self, workflow_id: &str) -> anyhow::Result<()> {
+        if let Some(workflow) = self.history.get_workflow(workflow_id).await? {
+            let activities_cache: Vec<_> = workflow
+                .activities
+                .iter()
+                .map(|f| ActivityCache {
+                    input: f.input.clone(),
+                    output: f.output.as_ref().map(|x| Payload::new(x)),
+                    activity_type: f.activity_type.clone(),
+                    task_queue: f.task_queue.clone()
+                })
+                .collect();
+            self.start_workflow_internal(
+                ClientStartWorkflowOptionsVersion {
+                    version: Some(client_start_workflow_options_version::Version::V1(
+                        ClientStartWorkflowOptionsV1 {
+                            workflow_type: workflow.workflow_type.clone(),
+                            workflow_version: "V1".to_string(),
+                            input: Some(Payloads::new(workflow.args.iter().map(|f| f).collect())),
+                            task_queue: workflow.task_queue.clone().unwrap(),
+                            workflow_id: Some(workflow_id.to_string()),
+                        },
+                    )),
+                },
+                None,
+                Some(activities_cache),
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
 
     async fn orphaned_workflows(&self) -> anyhow::Result<()> {
         use tokio::time::{timeout, Duration as TokioDuration};
@@ -1238,10 +1273,11 @@ impl ImmortalService {
                             let converted_items = items
                                 .iter()
                                 .map(|item| {
-                                    let (id, client_opts, sender) = *(item.clone());
+                                    let (id, client_opts, sender, cache) = *(item.clone());
                                     (
                                         id.clone(),
                                         StartWorkflowOptionsV1 {
+                                            cache: cache.unwrap_or(vec![]),
                                             // this might be incorrect
                                             workflow_id: id,
                                             workflow_type: client_opts.workflow_type,
@@ -1338,6 +1374,7 @@ impl ImmortalService {
                                         ImmortalWorkerActionV1 {
                                             action: Some(WorkerAction::StartWorkflow(
                                                 StartWorkflowOptionsV1 {
+                                                    cache: vec![],
                                                     workflow_id: workflow_id.clone(),
                                                     workflow_type: workflow_options
                                                         .workflow_type
@@ -1435,6 +1472,7 @@ impl ImmortalService {
         &self,
         workflow_options: ClientStartWorkflowOptionsVersion,
         sender: Option<watch::Sender<i32>>,
+        activity_cache: Option<Vec<ActivityCache>>,
     ) -> Result<String, Status> {
         Ok(match workflow_options.version {
             Some(client_start_workflow_options_version::Version::V1(workflow_options)) => {
@@ -1450,6 +1488,7 @@ impl ImmortalService {
                             workflow_id.clone(),
                             workflow_options.clone(),
                             sender,
+                            activity_cache,
                         )));
                     }
                     None => {
@@ -1458,6 +1497,7 @@ impl ImmortalService {
                             workflow_id.clone(),
                             workflow_options.clone(),
                             sender,
+                            activity_cache,
                         )));
                         wq.insert(workflow_options.task_queue.clone(), queue);
                     }
@@ -1942,7 +1982,7 @@ impl Immortal for ImmortalService {
         let (tx, _rx) = watch::channel::<i32>(0);
         let workflow_id = Uuid::parse_str(
             &self
-                .start_workflow_internal(workflow_options, Some(tx))
+                .start_workflow_internal(workflow_options, Some(tx), None)
                 .await?,
         )
         .map_err(|e| tonic::Status::invalid_argument(format!("Invalid UUID: {}", e)))?;
@@ -1967,7 +2007,9 @@ impl Immortal for ImmortalService {
         request: Request<ClientStartWorkflowOptionsVersion>,
     ) -> Result<Response<ClientStartWorkflowResponse>, Status> {
         let workflow_options = request.into_inner();
-        let workflow_id = self.start_workflow_internal(workflow_options, None).await?;
+        let workflow_id = self
+            .start_workflow_internal(workflow_options, None, None)
+            .await?;
 
         println!("started workflow: {workflow_id}");
         Ok(Response::new(ClientStartWorkflowResponse { workflow_id }))

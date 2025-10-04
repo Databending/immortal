@@ -16,7 +16,7 @@ use socketioxide::extract::{Data, SocketRef};
 use socketioxide::socket::DisconnectReason;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -87,12 +87,6 @@ struct MetricsResponse {
     pub mem_total: u64,
 }
 
-#[derive(Default)]
-struct SocketState {
-    subscribed: bool,
-    forwarder: Option<JoinHandle<()>>,
-}
-
 async fn read_and_send_log(
     room_name: &Option<String>,
     parsed_map: &mut simd_json::OwnedValue,
@@ -150,7 +144,10 @@ pub fn merge_last_ids(last_ids: &mut HashMap<String, String>, workflow_ids: &Vec
     }
 }
 
-pub fn sort_last_ids(last_ids: &HashMap<String, String>, workflow_ids: &Vec<String>) -> Vec<String> {
+pub fn sort_last_ids(
+    last_ids: &HashMap<String, String>,
+    workflow_ids: &Vec<String>,
+) -> Vec<String> {
     workflow_ids
         .iter()
         .filter_map(|k| last_ids.get(k).cloned())
@@ -394,7 +391,7 @@ async fn fetch_logs_from_redis(
                             Err(_) => {
                                 tokio::time::sleep(Duration::from_secs(1)).await;
                                 count += 1
-                            },
+                            }
                         }
                     }
                 }
@@ -456,7 +453,6 @@ pub async fn on_connect(
     _immortal_service: State<Arc<ImmortalService>>,
 ) {
     println!("Socket.IO connected: {:?} {:?}", socket.ns(), socket.id);
-    let per_socket = Arc::new(Mutex::new(SocketState::default()));
 
     // println!("Data = {:?}", data);
     // socket.emit("auth", data).ok();
@@ -528,13 +524,12 @@ pub async fn on_connect(
         }
         socket.on(
             "history-notifications",
-            |socket: SocketRef, Data::<OwnedValue>(data), ack: AckSender| async move {
+            |_socket: SocketRef, Data::<OwnedValue>(data), ack: AckSender| async move {
                 // info!("Received event: {:?} ", data);
                 // println!("Received event: {:?} ", data);
                 ack.send(&data).ok();
 
                 // socket.join("history-notifications");
-                let s2 = socket.clone();
                 // s2.join("history-update");
                 // let mut rx = tx.clone().subscribe();
                 // let handle = tokio::spawn(async move {

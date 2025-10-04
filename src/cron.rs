@@ -1,8 +1,5 @@
 use futures::TryStreamExt;
-use immortal_lib::{
-    immortal::{client_start_workflow_options_version, CallVersion, NotifyVersion},
-    Client,
-};
+use immortal_lib::{immortal::{call_version, client_start_workflow_options_version}, Client};
 use k8s_openapi::api::core::v1::ConfigMap;
 use serde::{Deserialize, Serialize};
 use simd_json::json;
@@ -226,9 +223,16 @@ impl CronManager {
                                 }
                             }
                         },
-                        CronJob::Call(call) => {
-                            // TODO: invoke your call path
-                            let _ = call; /* implement */
+                        CronJob::Call(call_options) => match call_options {
+                           call_version::Version::V1(v1) => {
+                                let mut cli = immortal_client.lock().await;
+                                if let Err(e) = cli
+                                    .call_async_v1(v1.input, &v1.call_type, &v1.task_queue)
+                                    .await
+                                {
+                                    println!("[cron workflow] error: {e:#?}");
+                                }
+                           } 
                         }
                         CronJob::Notification(notify) => {
                             // TODO: invoke your notify path
@@ -244,7 +248,6 @@ impl CronManager {
         }
 
         {
-
             self.installed3 = desired.clone();
         }
 

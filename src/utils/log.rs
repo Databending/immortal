@@ -5,12 +5,8 @@ use redis::{
 };
 use simd_json::OwnedValue;
 
+use crate::ws::FetchLogs;
 use simd_json::prelude::ValueAsMutObject;
-use crate::{
-    history::WorkflowHistoryVersion,
-    ws::{merge_last_ids, sort_last_ids, FetchLogs},
-    ImmortalService,
-};
 
 pub async fn fetch_log_history_from_redis(
     fetch_logs: &FetchLogs,
@@ -86,7 +82,7 @@ pub async fn fetch_log_history_from_redis(
             }
             // }
         }
-        FetchLogs::Worker(ref worker_ids) => {
+        FetchLogs::Worker(ref _worker_ids) => {
             // let workflows = immortal_service
             //     .history
             //     .get_workflows(Some(1000), Some(0), None, Some(worker_ids.to_vec()))
