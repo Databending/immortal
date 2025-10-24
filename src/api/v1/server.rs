@@ -1,4 +1,5 @@
 use crate::error::AppError;
+use crate::history::StatusFilter;
 use crate::state::AppState;
 use crate::utils::log::fetch_log_history_from_redis;
 use crate::ws::FetchLogs;
@@ -38,6 +39,7 @@ struct Worker {
 pub struct HistoryFilter {
     worker_ids: Option<String>,
     task_queues: Option<String>,
+    status: Option<StatusFilter>,
 }
 
 #[derive(o2o, Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +112,7 @@ pub async fn get_history(
             params
                 .worker_ids
                 .map(|f| f.split(",").map(|f| f.to_string()).collect()),
+            params.status
         )
         .await
     {

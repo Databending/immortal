@@ -114,6 +114,7 @@ impl History {
         offset: Option<usize>,
         task_queues: Option<Vec<String>>,
         worker_ids: Option<Vec<String>>,
+        status: Option<StatusFilter>
     ) -> Result<Vec<WorkflowHistoryVersion>> {
         println!("WORKER IDS: {:#?}", worker_ids);
         let limit = limit.unwrap_or(10) as isize;
@@ -165,7 +166,27 @@ impl History {
         //
         // })
         // .collect();
-
+        if let Some(status) = status {
+            workflows = workflows
+                .iter()
+                .filter(|f| match &f {
+                    WorkflowHistoryVersion::V1(v1) => {
+                        match status {
+                            StatusFilter::Failed => {
+                               return matches!(v1.status, Status::Failed(..)) 
+                            },
+                            StatusFilter::Running => {
+                               return matches!(v1.status, Status::Running) 
+                            },
+                            StatusFilter::Completed => {
+                               return matches!(v1.status, Status::Completed(..)) 
+                            }
+                        } 
+                    }
+                })
+                .map(|x| x.clone())
+                .collect();
+        }
         if let Some(task_queues) = task_queues {
             workflows = workflows
                 .iter()
@@ -356,7 +377,7 @@ impl WorkflowHistory {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "spec")]
 pub enum Status {
     Running,
@@ -365,6 +386,16 @@ pub enum Status {
     // Completed(String),
     // Completed(Value),
     Failed(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum StatusFilter {
+    Running,
+    // #[serde(with = "serde_bytes")]
+    Completed,
+    // Completed(String),
+    // Completed(Value),
+    Failed
 }
 //
 // #[derive(Debug, Clone, Serialize, Deserialize)]

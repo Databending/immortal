@@ -578,7 +578,7 @@ impl ImmortalService {
 
         // scan recent set; tune page as desired
         let workflows = history
-            .get_workflows(Some(500), Some(0), None, None)
+            .get_workflows(Some(500), Some(0), None, None, None)
             .await?;
 
         for wf in workflows {

@@ -400,7 +400,7 @@ async fn fetch_logs_from_redis(
         FetchLogs::Worker(ref worker_ids) => {
             let workflows = immortal_service
                 .history
-                .get_workflows(Some(1000), Some(0), None, Some(worker_ids.to_vec()))
+                .get_workflows(Some(1000), Some(0), None, Some(worker_ids.to_vec()), None)
                 .await
                 .unwrap();
             let workflow_ids = workflows
