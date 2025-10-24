@@ -1,5 +1,8 @@
 use futures::TryStreamExt;
-use immortal_lib::{immortal::{call_version, client_start_workflow_options_version}, Client};
+use immortal_lib::{
+    immortal::{call_version, client_start_workflow_options_version},
+    Client,
+};
 use k8s_openapi::api::core::v1::ConfigMap;
 use serde::{Deserialize, Serialize};
 use simd_json::json;
@@ -40,7 +43,7 @@ pub enum CronJob {
 }
 
 pub struct CronManager {
-    sched: JobScheduler,
+    pub sched: JobScheduler,
     // key (stable id from CM) -> scheduler job id
     installed: HashMap<Uuid, Uuid>,
     pub installed2: HashMap<Uuid, CronSpec>,
@@ -180,36 +183,42 @@ impl CronManager {
                 self.installed2.remove(&key);
             }
         }
-
+        let immortal_client: Arc<Mutex<Client>> = Arc::new(Mutex::new(
+            Client::connect(
+                std::env::var("IMMORTAL_URL").unwrap_or("http://localhost:10000".to_string()),
+            )
+            .await
+            .unwrap(),
+        ));
         // 2) Add/update desired jobs
         for spec in desired_filtered {
             // If exists and schedule+payload unchanged, skip. Otherwise re-add (simplest).
+            let mut needs_add = true;
 
-            match self.installed2.get(&spec.id) {
-                Some(old_spec) => {
-                    if *old_spec != spec {
-                        if let Some(old) = self.installed.remove(&spec.id) {
-                            let _ = self.sched.remove(&old).await;
-                            self.installed2.remove(&spec.id);
-                        }
-                    }
+            if let Some(old_spec) = self.installed2.get(&spec.id) {
+                if *old_spec == spec {
+                    // Unchanged → skip entirely
+                    needs_add = false;
+                } else if let Some(old_id) = self.installed.remove(&spec.id) {
+                    // Changed → remove the old job first
+                    let _ = self.sched.remove(&old_id).await;
+                    self.installed2.remove(&spec.id);
                 }
-                None => {}
             }
-            let immortal_client: Arc<Mutex<Client>> = Arc::new(Mutex::new(
-                Client::connect(
-                    std::env::var("IMMORTAL_URL").unwrap_or("http://localhost:10000".to_string()),
-                )
-                .await
-                .unwrap(),
-            ));
+
+            if !needs_add {
+                continue;
+            }
+            let immortal_client = Arc::clone(&immortal_client);
+
             // let immortal_client = Arc::clone(&self.immortal_client);
             let job_payload = spec.job.clone();
             let schedule = spec.schedule.clone();
 
-            let job = Job::new_async("0 ".to_owned() + schedule.as_str(), move |_uuid, _l| {
+            let job = Job::new_async("0 ".to_owned() + schedule.as_str(), move |uuid, _l| {
                 let immortal_client = Arc::clone(&immortal_client);
                 let job_payload = job_payload.clone();
+                println!("JOB ID: {:#?}", uuid);
                 Box::pin(async move {
                     match job_payload {
                         CronJob::Workflow(workflow_options) => match workflow_options {
@@ -224,7 +233,7 @@ impl CronManager {
                             }
                         },
                         CronJob::Call(call_options) => match call_options {
-                           call_version::Version::V1(v1) => {
+                            call_version::Version::V1(v1) => {
                                 let mut cli = immortal_client.lock().await;
                                 if let Err(e) = cli
                                     .call_async_v1(v1.input, &v1.call_type, &v1.task_queue)
@@ -232,8 +241,8 @@ impl CronManager {
                                 {
                                     println!("[cron workflow] error: {e:#?}");
                                 }
-                           } 
-                        }
+                            }
+                        },
                         CronJob::Notification(notify) => {
                             // TODO: invoke your notify path
                             let _ = notify; /* implement */
