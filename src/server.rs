@@ -534,7 +534,7 @@ impl ImmortalService {
     // 2.2) If the activity is no longer running, depending on the retry policy, we either rerun it
     //   or fail everything
 
-    async fn continue_workflow(&self, workflow_id: &str) -> anyhow::Result<()> {
+    async fn _continue_workflow(&self, workflow_id: &str) -> anyhow::Result<()> {
         if let Some(workflow) = self.history.get_workflow(workflow_id).await? {
             let activities_cache: Vec<_> = workflow
                 .activities
@@ -582,9 +582,7 @@ impl ImmortalService {
             .await?;
 
         for wf in workflows {
-            let history::WorkflowHistoryVersion::V1(mut v1) = wf else {
-                continue;
-            };
+            let history::WorkflowHistoryVersion::V1(mut v1) = wf ;
 
             if !matches!(v1.status, HistoryStatus::Running) {
                 continue;
@@ -666,7 +664,7 @@ impl ImmortalService {
                 let Some(idx) = maybe_latest_running_idx else {
                     continue;
                 };
-                let run_id = activity.runs[idx].run_id.clone();
+                // let run_id = activity.runs[idx].run_id.clone();
 
                 // Ensure worker can run this activity on this queue
                 let can_resume_activity = {
@@ -2631,15 +2629,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::serve(listener, app).await.unwrap();
         });
     }
-    // tokio::spawn(async move {
-    //     loop {
-    //         println!("watcher started");
-    //         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    //         if let Err(e) = start_watcher(Arc::clone(&cron_manager)).await {
-    //             println!("{:#?}", e)
-    //         }
-    //     }
-    // });
+    tokio::spawn(async move {
+        loop {
+            println!("watcher started");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            if let Err(e) = start_watcher(Arc::clone(&cron_manager)).await {
+                println!("{:#?}", e)
+            }
+        }
+    });
 
     Server::builder()
         .add_service(svc)
