@@ -66,6 +66,7 @@ pub struct RunningWorkflow {
 // }
 
 pub struct RunningActivity {
+    pub workflow_id: String,
     pub activity_id: String,
     pub run_id: String,
     pub join_handle: JoinHandle<()>,
@@ -458,9 +459,11 @@ impl Worker {
             match feature.version {
                 Some(immortal_worker_action_version::Version::V1(x)) => match x.action {
                     Some(Action::KillWorkflow(workflow_id)) => {
+                        println!("received kill workflow");
                         self.kill_workflow(&workflow_id).await;
                     }
                     Some(Action::KillActivity(activity_id)) => {
+                        println!("received kill activity");
                         self.kill_activity(&activity_id).await;
                     }
                     Some(Action::KillCall(call_id)) => {
@@ -682,9 +685,7 @@ impl Worker {
                     self.config.task_queue.clone(),
                     match workflow_options.cache.len() {
                         0 => None,
-                        _ => Some(workflow_options.cache.clone())
-
-
+                        _ => Some(workflow_options.cache.clone()),
                     },
                 );
             } else {
@@ -702,19 +703,24 @@ impl Worker {
         {
             let workflow_id = workflow_id.clone();
             handle = tokio::spawn(async move {
-                let res = tokio::spawn(wf_handle);
-                match res.await {
-                    Ok(res) => {
-                        if let Err(e) = sender.send((workflow_id.to_string(), res)) {
-                            eprintln!("Error sending to sender: {}", e.to_string())
-                        }
-                    }
-                    Err(e) => {
-                        if let Err(e) = sender.send((workflow_id.to_string(), Err(e.into()))) {
-                            eprintln!("Error sending to sender: {}", e.to_string())
-                        }
-                    }
+                let res = wf_handle.await;
+
+                if let Err(e) = sender.send((workflow_id.clone(), res)) {
+                    eprintln!("Error sending to sender: {}", e.to_string());
                 }
+                // let res = tokio::spawn(wf_handle);
+                // match res.await {
+                //     Ok(res) => {
+                //         if let Err(e) = sender.send((workflow_id.to_string(), res)) {
+                //             eprintln!("Error sending to sender: {}", e.to_string())
+                //         }
+                //     }
+                //     Err(e) => {
+                //         if let Err(e) = sender.send((workflow_id.to_string(), Err(e.into()))) {
+                //             eprintln!("Error sending to sender: {}", e.to_string())
+                //         }
+                //     }
+                // }
             });
             //handle = tokio::spawn(async move {
             //    let res = wf_handle.await;
@@ -1058,6 +1064,7 @@ impl Worker {
             }
         });
         let running_workflow = RunningActivity {
+            workflow_id: workflow_id.to_string(),
             activity_id: activity_id.to_string(),
             run_id: activity_run_id.to_string(),
             join_handle: handle,
@@ -1163,26 +1170,14 @@ impl Worker {
             activity_run_id.to_string(),
         );
         let handle = tokio::spawn(async move {
-            let res = tokio::spawn(act_handle);
-            match res.await {
-                Ok(res) => {
-                    if let Err(e) = sender.send((wid.to_string(), aid, aid_run, res)) {
-                        eprintln!("{:#?}", e);
-                    }
-                }
-                Err(e) => {
-                    if let Err(e) = sender.send((
-                        wid.to_string(),
-                        aid,
-                        aid_run,
-                        Err(ActivityError::NonRetryable(e.into())),
-                    )) {
-                        eprintln!("{:#?}", e);
-                    }
-                }
+            let res = act_handle.await;
+
+            if let Err(e) = sender.send((wid.clone(), aid, aid_run, res)) {
+                eprintln!("{:#?}", e);
             }
         });
         let running_workflow = RunningActivity {
+            workflow_id: workflow_id.to_string(),
             activity_id: activity_id.to_string(),
             run_id: activity_run_id.to_string(),
             join_handle: handle,
@@ -1201,16 +1196,40 @@ impl Worker {
     pub async fn kill_workflow(&mut self, workflow_id: &str) {
         let mut running_workflows = self.running_workflows.lock().await;
         if let Some(running_workflow) = running_workflows.get(workflow_id) {
-            let _ = running_workflow.join_handle.abort();
+            running_workflow.join_handle.abort();
+            println!("aborting {workflow_id}");
+            let cancelled_err = anyhow!("workflow {workflow_id} cancelled");
+
+            if let Err(e) = self
+                .workflow_sender
+                .send((workflow_id.to_string(), Err(cancelled_err)))
+            {
+                eprintln!("Error sending cancelled workflow result: {}", e);
+            }
+            // let is_cancelled = join_handle.await.unwrap_err().is_cancelled();
+
+            // println!("aborted {workflow_id} {is_cancelled}");
             running_workflows.remove(workflow_id);
+        } else {
+            println!("COULD NOT FIND WORKFLOW: {workflow_id}")
         }
     }
 
     pub async fn kill_activity(&mut self, activity_id: &str) {
         let mut running_activities = self.running_activities.lock().await;
-        if let Some(running_activity) = running_activities.get(activity_id) {
-            let _ = running_activity.join_handle.abort();
-            running_activities.remove(activity_id);
+        if let Some(running_activity) = running_activities.remove(activity_id) {
+            // 1) Abort the running task
+            running_activity.join_handle.abort();
+
+            // 2) Synthesize a "cancelled" result and send it into the normal path
+            let _ = self.activity_sender.send((
+                running_activity.workflow_id.clone(),
+                running_activity.activity_id.clone(),
+                running_activity.run_id.clone(),
+                Err(ActivityError::Cancelled { details: None }),
+            ));
+        } else {
+            println!("COULD NOT FIND ACTIVITY: {activity_id}")
         }
     }
 
@@ -1248,17 +1267,15 @@ impl Worker {
             );
 
             let handle = tokio::spawn(async move {
-                let res = tokio::spawn(act_handle);
-                match res.await {
+                let res = act_handle.await;
+                match res {
                     Ok(res) => {
-                        if let Err(e) = sender.send((cid.to_string(), crid.to_string(), res)) {
+                        if let Err(e) = sender.send((cid.clone(), crid.clone(), Ok(res))) {
                             eprintln!("error sending to sender: {}", e.to_string())
                         }
                     }
                     Err(e) => {
-                        if let Err(e) =
-                            sender.send((cid, crid, Err(CallError::NonRetryable(e.into()))))
-                        {
+                        if let Err(e) = sender.send((cid, crid, Err(e.into()))) {
                             eprintln!("error sending to sender: {}", e.to_string())
                         }
                     }
@@ -1289,41 +1306,24 @@ impl Worker {
             );
 
             let handle = tokio::spawn(async move {
-                let res = tokio::spawn(act_handle);
-                match res.await {
-                    Ok(res) => {
-                        if let Err(e) = sender.send((
-                            cid.to_string(),
-                            crid.to_string(),
-                            match res {
-                                Ok(x) => Ok(match x {
-                                    ActExitValue::Normal(y) => CallExitValue::Normal(y),
-                                }),
-                                Err(e) => Err(match e {
-                                    ActivityError::Retryable {
-                                        source,
-                                        explicit_delay,
-                                    } => CallError::Retryable {
-                                        source,
-                                        explicit_delay,
-                                    },
-                                    ActivityError::Cancelled { details } => {
-                                        CallError::Cancelled { details }
-                                    }
-                                    ActivityError::NonRetryable(e) => CallError::NonRetryable(e),
-                                }),
-                            },
-                        )) {
-                            eprintln!("error sending to sender: {}", e.to_string())
-                        }
+                let res = act_handle.await;
+                let mapped = match res {
+                    Ok(ActExitValue::Normal(y)) => Ok(CallExitValue::Normal(y)),
+                    Err(ActivityError::Retryable {
+                        source,
+                        explicit_delay,
+                    }) => Err(CallError::Retryable {
+                        source,
+                        explicit_delay,
+                    }),
+                    Err(ActivityError::Cancelled { details }) => {
+                        Err(CallError::Cancelled { details })
                     }
-                    Err(e) => {
-                        if let Err(e) =
-                            sender.send((cid, crid, Err(CallError::NonRetryable(e.into()))))
-                        {
-                            eprintln!("error sending to sender: {}", e.to_string())
-                        }
-                    }
+                    Err(ActivityError::NonRetryable(e)) => Err(CallError::NonRetryable(e)),
+                };
+
+                if let Err(e) = sender.send((cid.clone(), crid.clone(), mapped)) {
+                    eprintln!("error sending to sender: {}", e.to_string())
                 }
             });
             let running_workflow = RunningCall {

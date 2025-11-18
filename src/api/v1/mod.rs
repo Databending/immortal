@@ -11,8 +11,13 @@ pub mod server;
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        // DEPRECATE
         .route("/run/workflow", post(run::run_workflow))
+        .route("/workflow/kill/{id}", delete(server::kill_workflow))
+        .route("/workflow/run", post(run::run_workflow))
+        // DEPRECATE
         .route("/run/activity", post(run::run_activity))
+        .route("/activity/run", post(run::run_activity))
         .route("/history", get(server::get_history))
         .route("/logs", post(server::get_logs))
         .route("/history/{id}", delete(server::delete_history))

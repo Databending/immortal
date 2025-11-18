@@ -543,7 +543,7 @@ impl ImmortalService {
                     input: f.input.clone(),
                     output: f.output.as_ref().map(|x| Payload::new(x)),
                     activity_type: f.activity_type.clone(),
-                    task_queue: f.task_queue.clone()
+                    task_queue: f.task_queue.clone(),
                 })
                 .collect();
             self.start_workflow_internal(
@@ -762,6 +762,79 @@ impl ImmortalService {
             }
         }
 
+        Ok(())
+    }
+    async fn kill_workflow(&self, workflow_id: &str) -> anyhow::Result<()> {
+        if let Some(workflow) = self.history.get_workflow(workflow_id).await? {
+            if let Some(worker_id) = workflow.worker_id {
+                {
+                    let running_activities_stripped: Vec<_>;
+                    {
+                        let running_activities = self.running_activities.read().await;
+
+                        running_activities_stripped = running_activities
+                            .iter()
+                            .map(|f| {
+                                (
+                                    f.0.clone(),
+                                    f.1 .2.additional_properties.workflow_id.clone(),
+                                )
+                            })
+                            .collect();
+                    }
+                    for (activity_id, w_id) in running_activities_stripped {
+                        if w_id == workflow_id {
+                            println!("killing activity");
+                            self.kill_activity(&activity_id).await?;
+                        }
+                    }
+                }
+                {
+                    let workers = self.workers.read().await;
+                    if let Some(worker) = workers.get(&worker_id) {
+
+                        println!("killing workflow");
+                        worker
+                            .tx
+                            .send(Ok(ImmortalWorkerActionVersion {
+                                version: Some(immortal_worker_action_version::Version::V1(
+                                    ImmortalWorkerActionV1 {
+                                        action: Some(WorkerAction::KillWorkflow(
+                                            workflow_id.to_string(),
+                                        )),
+                                    },
+                                )),
+                            }))
+                            .await?;
+                    }
+                }
+            }
+            // let running_workflows = self.execute_workflow
+        }
+        Ok(())
+    }
+    async fn kill_activity(&self, activity_id: &str) -> anyhow::Result<()> {
+        {
+            let running_activities = self.running_activities.read().await;
+
+            if let Some(running_activity) = running_activities.get(activity_id) {
+                let workers = self.workers.read().await;
+                if let Some(worker) = workers.get(&running_activity.2.worker_id) {
+                    worker
+                        .tx
+                        .send(Ok(ImmortalWorkerActionVersion {
+                            version: Some(immortal_worker_action_version::Version::V1(
+                                ImmortalWorkerActionV1 {
+                                    action: Some(WorkerAction::KillActivity(
+                                        activity_id.to_string(),
+                                    )),
+                                },
+                            )),
+                        }))
+                        .await?;
+                }
+            }
+        }
         Ok(())
     }
     fn watchdog(&self) {
@@ -2558,15 +2631,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::serve(listener, app).await.unwrap();
         });
     }
-    tokio::spawn(async move {
-        loop {
-            println!("watcher started");
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            if let Err(e) = start_watcher(Arc::clone(&cron_manager)).await {
-                println!("{:#?}", e)
-            }
-        }
-    });
+    // tokio::spawn(async move {
+    //     loop {
+    //         println!("watcher started");
+    //         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    //         if let Err(e) = start_watcher(Arc::clone(&cron_manager)).await {
+    //             println!("{:#?}", e)
+    //         }
+    //     }
+    // });
 
     Server::builder()
         .add_service(svc)

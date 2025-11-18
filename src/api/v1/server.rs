@@ -94,6 +94,24 @@ pub async fn delete_history(
     }
 }
 
+
+pub async fn kill_workflow(
+    State(state): State<AppState>,
+    Path(workflow_id): Path<Uuid>,
+) -> impl IntoResponse {
+    match state
+        .immortal_service
+        .kill_workflow(&workflow_id.to_string())
+        .await
+    {
+        Ok(_history) => Json(()),
+        Err(e) => {
+            println!("{:#?}", e);
+            Json(())
+        }
+    }
+}
+
 pub async fn get_history(
     State(state): State<AppState>,
 
