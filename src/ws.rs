@@ -116,8 +116,8 @@ async fn read_and_send_log(
 
     match room_name {
         Some(room_name) => {
-            println!("sending to {room_name}");
-            println!("listening rooms: {:?}", io.rooms());
+            // println!("sending to {room_name}");
+            // println!("listening rooms: {:?}", io.rooms());
 
             let x = io
                 .within(room_name.clone())
@@ -125,7 +125,7 @@ async fn read_and_send_log(
                 .await
                 .map_err(|e| anyhow::anyhow!(e.to_string())) // convert to anyhow::Error
                 .context("emitting log-back")?;
-            println!("{:#?}", x);
+            // println!("{:#?}", x);
         }
         None => {
             io.emit("log-back", &parsed_map)?
@@ -243,7 +243,7 @@ async fn start_metrics_producer(
             _handle: handle,
         },
     );
-    println!("inserted {room_name}");
+    // println!("inserted {room_name}");
 }
 
 async fn start_log_producer(
@@ -298,7 +298,7 @@ async fn start_log_producer(
             _handle: handle,
         },
     );
-    println!("inserted {room_name}");
+    // println!("inserted {room_name}");
 }
 
 fn dec_and_maybe_stop(state: &WsState, job_id: &str) {
@@ -318,13 +318,13 @@ fn dec_and_maybe_stop(state: &WsState, job_id: &str) {
     };
 
     if should_stop {
-        println!("stopping {job_id}");
+        // println!("stopping {job_id}");
         // remove count
         state.subs.remove(job_id);
-        println!("producers {:#?}", state.producers.get(job_id));
+        // println!("producers {:#?}", state.producers.get(job_id));
         // stop and remove producer
         if let Some((_, prod)) = state.producers.remove(job_id) {
-            println!("cancelling");
+            // println!("cancelling");
             prod.cancel.cancel();
             // detach: the task will end on next tick; no need to await here
         }
@@ -340,7 +340,7 @@ async fn fetch_logs_from_redis(
     io: &SocketRef,
     immortal_service: &Arc<ImmortalService>,
 ) {
-    println!("LAST ID: {last_id}");
+    // println!("LAST ID: {last_id}");
     let opts = StreamReadOptions::default().block(500);
     match fetch_logs {
         FetchLogs::Workflow(ref workflow) => {
@@ -508,7 +508,7 @@ pub async fn on_connect(
 
                                             _ = tokio::time::sleep(Duration::from_millis(400)) => {
                     if let Ok(z) = rx.recv().await {
-                        println!("RECEIVED EVENT");
+                        // println!("RECEIVED EVENT");
                                         s2.within("history-update")
                                             .emit(
                                                 "history-update",
@@ -567,11 +567,11 @@ pub async fn on_connect(
             let job_id = req.to_room_id_hashed();
             let room_name = room(&job_id, "logs");
 
-            println!("joining room {room_name}");
+            // println!("joining room {room_name}");
             // join room
             socket.join(room_name.clone());
 
-            println!("room joined");
+            // println!("room joined");
             // track per-socket subscriptions
             state
                 .by_socket
@@ -579,7 +579,7 @@ pub async fn on_connect(
                 .or_default()
                 .insert(job_id.clone());
 
-            println!("state updated");
+            // println!("state updated");
             // bump refcount
             let count_now = {
                 match state.subs.entry(job_id.clone()) {
@@ -595,9 +595,9 @@ pub async fn on_connect(
             };
             let last_id = "$".to_string();
             let last_ids = HashMap::new();
-            println!("fetching from pool");
+            // println!("fetching from pool");
             // let mut con = pool.get().await.unwrap();
-            println!("fetching logs");
+            // println!("fetching logs");
             // fetch_logs_from_redis(
             //     &mut last_ids,
             //     &mut last_id,
@@ -609,7 +609,7 @@ pub async fn on_connect(
             // )
             // .await;
 
-            println!("fetched {last_id}");
+            // println!("fetched {last_id}");
             // start producer if first subscriber
             if count_now == 1 {
                 start_log_producer(
@@ -631,7 +631,7 @@ pub async fn on_connect(
             let job_id = req.to_room_id_hashed();
             let room_name = room(&job_id, "logs");
 
-            println!("unsubscribing {room_name}");
+            // println!("unsubscribing {room_name}");
             // leave room
             socket.leave(room_name);
 
@@ -655,7 +655,7 @@ pub async fn on_connect(
             let job_id = req.to_room_id_hashed();
             let room_name = room(&job_id, "metrics");
 
-            println!("joining room {room_name}");
+            // println!("joining room {room_name}");
             // join room
             socket.join(room_name.clone());
 

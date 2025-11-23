@@ -98,6 +98,8 @@ impl History {
         let _: () = con
             .set_ex(&key, WorkflowHistoryVersion::V1(workflow), 259200)
             .await?;
+
+        println!("WRITING TO REDIS (add workflow)");
         Ok(())
     }
     pub async fn get_workflow(&self, workflow_id: &str) -> Result<Option<WorkflowHistory>> {
@@ -114,9 +116,9 @@ impl History {
         offset: Option<usize>,
         task_queues: Option<Vec<String>>,
         worker_ids: Option<Vec<String>>,
-        status: Option<StatusFilter>
+        status: Option<StatusFilter>,
     ) -> Result<Vec<WorkflowHistoryVersion>> {
-        println!("WORKER IDS: {:#?}", worker_ids);
+        // println!("WORKER IDS: {:#?}", worker_ids);
         let limit = limit.unwrap_or(10) as isize;
         let offset = offset.unwrap_or(0) as isize;
         let start = offset as i64;
@@ -170,19 +172,13 @@ impl History {
             workflows = workflows
                 .iter()
                 .filter(|f| match &f {
-                    WorkflowHistoryVersion::V1(v1) => {
-                        match status {
-                            StatusFilter::Failed => {
-                               return matches!(v1.status, Status::Failed(..)) 
-                            },
-                            StatusFilter::Running => {
-                               return matches!(v1.status, Status::Running) 
-                            },
-                            StatusFilter::Completed => {
-                               return matches!(v1.status, Status::Completed(..)) 
-                            }
-                        } 
-                    }
+                    WorkflowHistoryVersion::V1(v1) => match status {
+                        StatusFilter::Failed => return matches!(v1.status, Status::Failed(..)),
+                        StatusFilter::Running => return matches!(v1.status, Status::Running),
+                        StatusFilter::Completed => {
+                            return matches!(v1.status, Status::Completed(..))
+                        }
+                    },
                 })
                 .map(|x| x.clone())
                 .collect();
@@ -229,6 +225,8 @@ impl History {
         let _: () = con
             .set_ex(key, WorkflowHistoryVersion::V1(workflow), 259200)
             .await?;
+
+        println!("WRITING TO REDIS (update workflow)");
         Ok(())
     }
 
@@ -261,6 +259,8 @@ impl History {
         let _: () = con
             .set_ex(key, WorkflowHistoryVersion::V1(workflow), 259200)
             .await?;
+
+        println!("WRITING TO REDIS (add activity)");
         Ok(())
     }
     pub async fn update_activity(
@@ -283,6 +283,7 @@ impl History {
         let _: () = con
             .set_ex(key, WorkflowHistoryVersion::V1(workflow), 259200)
             .await?;
+        println!("WRITING TO REDIS (update activity)");
         Ok(())
     }
     // pub fn get_activity_mut(&mut self, activity_id: &str) -> Option<&mut ActivityHistory> {
@@ -299,6 +300,21 @@ impl History {
 pub enum WorkflowHistoryVersion {
     V1(WorkflowHistory),
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "version", content = "spec")]
+pub enum TruncatedWorkflowHistoryVersion {
+    V1(TruncatedWorkflowHistory),
+}
+impl Into<TruncatedWorkflowHistoryVersion> for WorkflowHistoryVersion {
+    fn into(self) -> TruncatedWorkflowHistoryVersion {
+        match self {
+            Self::V1(x) => TruncatedWorkflowHistoryVersion::V1(x.into()),
+
+        }
+    }
+}
+
 impl ToRedisArgs for WorkflowHistoryVersion {
     fn to_redis_args(&self) -> Vec<Vec<u8>> {
         let json = simd_json::to_string(self).unwrap();
@@ -339,6 +355,14 @@ impl FromRedisValue for WorkflowHistoryVersion {
     }
 }
 
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "spec")]
+pub enum TruncatedValue<T> {
+    Full(T),
+    Truncated,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowHistory {
     pub args: Vec<OwnedValue>,
@@ -347,6 +371,56 @@ pub struct WorkflowHistory {
     pub workflow_type: String,
     pub status: Status,
     pub activities: Vec<ActivityHistory>,
+    pub start_time: DateTime<Utc>,
+    pub end_time: Option<DateTime<Utc>>,
+    pub task_queue: Option<String>,
+    pub worker_id: Option<String>,
+    // pub status: Status,
+}
+
+impl Into<TruncatedWorkflowHistory> for WorkflowHistory {
+    fn into(self) -> TruncatedWorkflowHistory {
+        let mut args_approx_size = 0;
+        for arg in &self.args {
+            args_approx_size += approx_size(arg)
+        }
+        TruncatedWorkflowHistory {
+            worker_id: self.worker_id,
+            workflow_type: self.workflow_type,
+            workflow_id: self.workflow_id,
+            status: self.status.into(),
+            start_time: self.start_time,
+            end_time: self.end_time,
+            args: match args_approx_size > 10_000 {
+                true => TruncatedValue::Truncated,
+                false => TruncatedValue::Full(self.args)
+            },
+            output: match self.output {
+                Some(x) => {
+                    if approx_size(&x) > 10_000 {
+                        TruncatedValue::Truncated
+                    } else {
+                        TruncatedValue::Full(Some(x))
+                    }
+                }
+                None => TruncatedValue::Full(None),
+            },
+
+            task_queue: self.task_queue,
+            activities: self.activities.into_iter().map(|f| f.into()).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TruncatedWorkflowHistory {
+    pub args: TruncatedValue<Vec<OwnedValue>>,
+    pub output: TruncatedValue<Option<OwnedValue>>,
+    pub workflow_id: String,
+    pub workflow_type: String,
+    // this needs to be TruncatedStatus
+    pub status: TruncatedStatus,
+    pub activities: Vec<TruncatedActivityHistory>,
     pub start_time: DateTime<Utc>,
     pub end_time: Option<DateTime<Utc>>,
     pub task_queue: Option<String>,
@@ -388,6 +462,44 @@ pub enum Status {
     Failed(String),
 }
 
+fn approx_size(v: &OwnedValue) -> usize {
+    use simd_json::OwnedValue::*;
+
+    match v {
+        Static(_x) => 8,
+        String(s) => s.len(),
+        Array(arr) => arr.iter().map(approx_size).sum(),
+        Object(obj) => obj.iter().map(|(k, v)| k.len() + approx_size(v)).sum(),
+    }
+}
+
+impl Into<TruncatedStatus> for Status {
+    fn into(self) -> TruncatedStatus {
+        match self {
+            Self::Running => TruncatedStatus::Running,
+            Self::Failed(x) => TruncatedStatus::Failed(x),
+            Self::Completed(x) => {
+                if approx_size(&x) > 10_000 {
+                    TruncatedStatus::Completed(TruncatedValue::Truncated)
+                } else {
+                    TruncatedStatus::Completed(TruncatedValue::Full(x))
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "spec")]
+pub enum TruncatedStatus {
+    Running,
+    // #[serde(with = "serde_bytes")]
+    Completed(TruncatedValue<OwnedValue>),
+    // Completed(String),
+    // Completed(Value),
+    Failed(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum StatusFilter {
     Running,
@@ -395,7 +507,7 @@ pub enum StatusFilter {
     Completed,
     // Completed(String),
     // Completed(Value),
-    Failed
+    Failed,
 }
 //
 // #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -416,14 +528,75 @@ pub struct ActivityHistory {
     pub args: Option<OwnedValue>,
     pub output: Option<OwnedValue>,
     pub task_queue: Option<String>,
-    pub input : Option<Payload>,
+    pub input: Option<Payload>,
     // pub status: Status,
     // pub result: Option<Value>,
     pub runs: Vec<ActivityRun>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TruncatedActivityHistory {
+    pub activity_id: String,
+    pub activity_type: String,
+    pub args: TruncatedValue<Option<OwnedValue>>,
+    pub output: TruncatedValue<Option<OwnedValue>>,
+    pub task_queue: Option<String>,
+    pub input: TruncatedValue<Option<Payload>>,
+    // pub status: Status,
+    // pub result: Option<Value>,
+    pub runs: Vec<TruncatedActivityRun>,
+}
+
+impl Into<TruncatedActivityHistory> for ActivityHistory {
+    fn into(self) -> TruncatedActivityHistory {
+        TruncatedActivityHistory {
+            activity_id: self.activity_id,
+            activity_type: self.activity_type.into(),
+            args: match self.args {
+                Some(x) => {
+                    if approx_size(&x) > 10_000 {
+                        TruncatedValue::Truncated
+                    } else {
+                        TruncatedValue::Full(Some(x))
+                    }
+                }
+                None => TruncatedValue::Full(None),
+            },
+            input: match self.input {
+                Some(x) => {
+                    if x.data.len() > 10_000 {
+                        TruncatedValue::Truncated
+                    } else {
+                        TruncatedValue::Full(Some(x))
+                    }
+                }
+                None => TruncatedValue::Full(None),
+            },
+            output: match self.output {
+                Some(x) => {
+                    if approx_size(&x) > 10_000 {
+                        TruncatedValue::Truncated
+                    } else {
+                        TruncatedValue::Full(Some(x))
+                    }
+                }
+                None => TruncatedValue::Full(None),
+            },
+
+            task_queue: self.task_queue,
+            runs: self.runs.into_iter().map(|f| f.into()).collect(),
+        }
+    }
+}
+
 impl ActivityHistory {
-    pub fn new(activity_type: String, activity_id: String, args: Option<OwnedValue>, task_queue: String, input: Option<Payload>) -> Self {
+    pub fn new(
+        activity_type: String,
+        activity_id: String,
+        args: Option<OwnedValue>,
+        task_queue: String,
+        input: Option<Payload>,
+    ) -> Self {
         Self {
             activity_id,
             activity_type,
@@ -456,6 +629,25 @@ pub struct ActivityRun {
     pub status: Status,
     pub start_time: DateTime<Utc>,
     pub end_time: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TruncatedActivityRun {
+    pub run_id: String,
+    pub status: TruncatedStatus,
+    pub start_time: DateTime<Utc>,
+    pub end_time: Option<DateTime<Utc>>,
+}
+
+impl Into<TruncatedActivityRun> for ActivityRun {
+    fn into(self) -> TruncatedActivityRun {
+        TruncatedActivityRun {
+            run_id: self.run_id,
+            status: self.status.into(),
+            start_time: self.start_time,
+            end_time: self.end_time,
+        }
+    }
 }
 
 impl ActivityRun {

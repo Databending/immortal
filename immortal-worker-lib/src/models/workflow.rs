@@ -110,12 +110,18 @@ impl WfContext {
                         // }
                         // }
                     }
-                    None => Err(anyhow!("Activity failed")),
+                    None => {
+                        Err(anyhow!("Activity failed"))
+                    }
                 },
                 // Some(x) => Ok(serde_json::from_str(&x)?),
-                None => Err(anyhow!("Activity failed")),
+                None => {
+                    Err(anyhow!("Activity failed"))
+                }
             },
-            Err(e) => Err(anyhow!("Activity failed: {:?}", e)),
+            Err(e) => {
+                Err(anyhow!("Activity failed: {:?}", e))
+            }
         }
     }
 }

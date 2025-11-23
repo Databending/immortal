@@ -1,5 +1,5 @@
 use crate::error::AppError;
-use crate::history::StatusFilter;
+use crate::history::{StatusFilter, TruncatedWorkflowHistoryVersion};
 use crate::state::AppState;
 use crate::utils::log::fetch_log_history_from_redis;
 use crate::ws::FetchLogs;
@@ -94,7 +94,6 @@ pub async fn delete_history(
     }
 }
 
-
 pub async fn kill_workflow(
     State(state): State<AppState>,
     Path(workflow_id): Path<Uuid>,
@@ -130,19 +129,21 @@ pub async fn get_history(
             params
                 .worker_ids
                 .map(|f| f.split(",").map(|f| f.to_string()).collect()),
-            params.status
+            params.status,
         )
         .await
     {
         Ok(history) => {
+            let truncated_data: Vec<TruncatedWorkflowHistoryVersion> =
+                history.into_iter().map(|f| f.into()).collect();
             // let mut api_histories: Vec<ApiWorkflowHistoryVersion> = vec![];
             // for x in history {
             //     api_histories.push(x.into());
             // }
-            Json(history)
+            Json(truncated_data)
         }
         Err(e) => {
-            println!("{:#?}", e);
+            println!("{}", e);
             Json(vec![])
         }
     }
@@ -162,9 +163,13 @@ pub async fn get_logs(
     let redis = &state.redis;
     let mut con = redis.get().await?;
     // let con = state.with_current_subscriber
-    let logs =
-        fetch_log_history_from_redis(&payload.fetch_type, &mut con, &payload.limit, &payload.cursor)
-            .await?;
+    let logs = fetch_log_history_from_redis(
+        &payload.fetch_type,
+        &mut con,
+        &payload.limit,
+        &payload.cursor,
+    )
+    .await?;
     Ok(Json(logs))
 }
 

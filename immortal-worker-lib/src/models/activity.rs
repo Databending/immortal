@@ -195,6 +195,7 @@ where
 {
     fn into_activity_fn(self) -> BoxActFn {
         let wrapper = move |ctx: ActContext, mut input: Payload| {
+            // this needs to be updated because I no longer wrap the function
             match simd_json::from_slice(&mut input.data) {
                 Ok(x) => self(ctx, x)
                     .map(|r| {
@@ -211,7 +212,7 @@ where
                     })
                     .boxed(),
                 Err(e) => {
-                    println!("ERROR DESERIALIZING: {}", e.to_string());
+                    println!("FAILED DESERIALIZING INPUT ARGS: {}", e.to_string());
                     async move { Err(ActivityError::NonRetryable(e.into())) }.boxed()
                 },
             }

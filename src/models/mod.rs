@@ -2,7 +2,7 @@
 // pub mod activity;
 // pub mod call;
 pub mod client;
-// pub mod history;
+pub mod history;
 // pub mod worker;
 
 // pub mod serverless;

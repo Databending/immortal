@@ -473,6 +473,7 @@ impl Worker {
                         self.start_workflow_v1(&workflow).await;
                     }
                     Some(Action::StartActivity(activity)) => {
+                        println!("received start acitivity: run_id: {}", activity.activity_run_id);
                         self.start_activity(
                             &activity.workflow_id,
                             &activity.activity_type,
@@ -595,7 +596,7 @@ impl Worker {
                         ),
                     ),
                 }) {
-                    println!("ERROR: {:#?}", e);
+                    println!("ERROR: {}", e);
                     break;
                 }
             }
@@ -1173,7 +1174,7 @@ impl Worker {
             let res = act_handle.await;
 
             if let Err(e) = sender.send((wid.clone(), aid, aid_run, res)) {
-                eprintln!("{:#?}", e);
+                eprintln!("{}", e);
             }
         });
         let running_workflow = RunningActivity {

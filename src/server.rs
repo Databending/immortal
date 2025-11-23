@@ -428,7 +428,7 @@ async fn build_retry_activity_options(
     workflow_id: &str,
     activity: &history::ActivityHistory,
 ) -> anyhow::Result<immortal::RequestStartActivityOptionsV1> {
-    use immortal_lib::common::Payload;
+    // use immortal_lib::common::Payload;
 
     // Grab the workflow to infer its task_queue
     let wf = history
@@ -436,22 +436,23 @@ async fn build_retry_activity_options(
         .await?
         .ok_or_else(|| anyhow::anyhow!("workflow not found for retry"))?;
 
+    // WHY THE FUCK WAS I DOING THIS???????
     // Serialize the activity input (it’s stored as OwnedValue in history)
-    let activity_input = if let Some(v) = &activity.input {
-        let mut tmp = simd_json::to_vec(v)?;
-        Some(Payload {
-            data: std::mem::take(&mut tmp),
-            ..Default::default()
-        })
-    } else {
-        None
-    };
+    // let activity_input = if let Some(v) = &activity.input {
+    //     let mut tmp = simd_json::to_vec(v)?;
+    //     Some(Payload {
+    //         data: std::mem::take(&mut tmp),
+    //         ..Default::default()
+    //     })
+    // } else {
+    //     None
+    // };
 
     Ok(RequestStartActivityOptionsV1 {
         workflow_id: workflow_id.to_string(),
         activity_id: activity.activity_id.clone(),
         activity_type: activity.activity_type.clone(),
-        activity_input,
+        activity_input: activity.input.clone(),
         // Use the same queue as the workflow by default
         task_queue: wf.task_queue.unwrap_or_else(|| "default".to_string()),
         // Reasonable defaults; override if you persist these in history
@@ -468,6 +469,7 @@ impl ImmortalService {
         options: immortal::RequestStartActivityOptionsV1,
         next_run_id: String,
         attempt_index: usize, // 0-based (0 => first retry)
+        tx: tokio::sync::oneshot::Sender<ActivityResultV1>,
     ) {
         let backoff_ms = ACTIVITY_BACKOFF_BASE_MS
             .saturating_mul(ACTIVITY_BACKOFF_FACTOR.saturating_pow(attempt_index as u32));
@@ -485,20 +487,10 @@ impl ImmortalService {
             {
                 let mut queues = activity_queue.lock().await;
                 match queues.get_mut(&options.task_queue) {
-                    Some(q) => q.push_back(Box::new((
-                        next_run_id.clone(),
-                        options.clone(),
-                        {
-                            // oneshot the worker’s final result back to whoever is waiting (the server)
-                            let (tx, _rx) =
-                                tokio::sync::oneshot::channel::<immortal::ActivityResultV1>();
-                            tx
-                        },
-                        now,
-                    ))),
+                    Some(q) => {
+                        q.push_back(Box::new((next_run_id.clone(), options.clone(), tx, now)))
+                    }
                     None => {
-                        let (tx, _rx) =
-                            tokio::sync::oneshot::channel::<immortal::ActivityResultV1>();
                         let mut q = std::collections::VecDeque::new();
                         q.push_back(Box::new((next_run_id.clone(), options.clone(), tx, now)));
                         queues.insert(options.task_queue.clone(), q);
@@ -582,7 +574,7 @@ impl ImmortalService {
             .await?;
 
         for wf in workflows {
-            let history::WorkflowHistoryVersion::V1(mut v1) = wf ;
+            let history::WorkflowHistoryVersion::V1(mut v1) = wf;
 
             if !matches!(v1.status, HistoryStatus::Running) {
                 continue;
@@ -790,7 +782,6 @@ impl ImmortalService {
                 {
                     let workers = self.workers.read().await;
                     if let Some(worker) = workers.get(&worker_id) {
-
                         println!("killing workflow");
                         worker
                             .tx
@@ -879,33 +870,43 @@ impl ImmortalService {
                             // kill it
                         }
                     }
-                    if activities_to_remove.len() > 0 {
-                        let mut running_activities = running_activities.write().await;
-                        for activity_to_remove in activities_to_remove {
-                            if let Some(running_activity) =
-                                running_activities.remove(&activity_to_remove)
-                            {
-                                let (_worker_id, tx, props) = *running_activity;
-                                if let Err(e) = tx.send(ActivityResultV1 {
-                                    activity_id: activity_to_remove.clone(),
-
-                                    workflow_id: props.additional_properties.workflow_id.clone(),
-                                    activity_run_id: "0".to_string(),
-
-                                    status: Some(immortal::activity_result_v1::Status::Failed(
-                                        immortal::Failure {
-                                            failure: Some(failure::Failure {
-                                                message: "timeout".to_string(),
-                                                ..Default::default()
-                                            }),
-                                        },
-                                    )),
-                                }) {
-                                    println!("{:#?}", e);
-                                }
-                            }
-                        }
-                    }
+                    // I will temporarily remove this because I only want to remove activities from
+                    // the list once the worker confirmed that it has been killed. This might cause
+                    // issues I am not sure yet.
+                    // I also need to watch out with this. Because in the case of a deployment, if
+                    // we have another worker that joins, tries to grab the same name, the server
+                    // will think that this is the same worker, and not the old worker
+                    // reconnecting.
+                    // if activities_to_remove.len() > 0 {
+                    //     let mut running_activities = running_activities.write().await;
+                    //     for activity_to_remove in activities_to_remove {
+                    //         if let Some(running_activity) =
+                    //             running_activities.remove(&activity_to_remove)
+                    //         {
+                    //             let (_worker_id, tx, props) = *running_activity;
+                    //             // this is also weird that this does not work. This should
+                    //             // technically remove the activity. Unless the worker cannot find
+                    //             // it inside reunning activities
+                    //             if let Err(e) = tx.send(ActivityResultV1 {
+                    //                 activity_id: activity_to_remove.clone(),
+                    //
+                    //                 workflow_id: props.additional_properties.workflow_id.clone(),
+                    //                 activity_run_id: "0".to_string(),
+                    //
+                    //                 status: Some(immortal::activity_result_v1::Status::Failed(
+                    //                     immortal::Failure {
+                    //                         failure: Some(failure::Failure {
+                    //                             message: "timeout".to_string(),
+                    //                             ..Default::default()
+                    //                         }),
+                    //                     },
+                    //                 )),
+                    //             }) {
+                    //                 println!("{:#?}", e);
+                    //             }
+                    //         }
+                    //     }
+                    // }
                     for (id, running_call) in running_calls.read().await.clone().iter() {
                         let now = Utc::now();
                         let max_time = running_call.1.timeout;
@@ -1136,7 +1137,7 @@ impl ImmortalService {
                                         },
                                     )),
                                 }) {
-                                    println!("{:#?}", e);
+                                    eprintln!("{:#?}", e);
                                 }
                                 continue;
                             }
@@ -1225,14 +1226,18 @@ impl ImmortalService {
                                         .runs
                                         .push(ActivityRun::new(activity_run_id.clone()));
                                     if let Err(e) = history
-                                        .update_activity(&activity_options.workflow_id, existing)
+                                        .update_activity(
+                                            &activity_options.workflow_id,
+                                            existing.clone(),
+                                        )
                                         .await
                                     {
-                                        error!(
+                                        eprintln!(
                                             "Failed to append run to existing activity: {:?}",
                                             e
                                         );
                                     }
+                                    activity_history = existing;
                                 }
                                 _ => {
                                     // first ever run for this activity id
@@ -1257,7 +1262,7 @@ impl ImmortalService {
                                         )
                                         .await
                                     {
-                                        error!("Failed to add activity to history: {:?}", e);
+                                        eprintln!("Failed to add activity to history: {:?}", e);
                                     }
                                 }
                             }
@@ -1938,7 +1943,7 @@ impl Immortal for ImmortalService {
             let mut workers = self.workers.write().await;
 
             let worker_ids = workers.iter().map(|f| f.0.clone()).collect::<Vec<_>>();
-            println!("WORKER IDS: {:#?}", worker_ids);
+            // println!("WORKER IDS: {:#?}", worker_ids);
             let registered_workflows = worker_details
                 .registered_workflows
                 .iter_mut()
@@ -2090,9 +2095,11 @@ impl Immortal for ImmortalService {
         request: Request<ActivityResultVersion>,
     ) -> Result<Response<()>, Status> {
         let activity_version = request.into_inner();
+        // let mut inform_worker = true;
         match activity_version.version {
             Some(activity_result_version::Version::V1(activity_result)) => {
                 // Remove the activity from the running map
+                // I think what is happening is that tx is being dropped
                 let (worker_id, tx, _) = match self
                     .running_activities
                     .write()
@@ -2113,169 +2120,169 @@ impl Immortal for ImmortalService {
                     .get_activity(&activity_result.workflow_id, &activity_result.activity_id)
                     .await
                     .map_err(|e| {
-                        error!("Error fetching activity: {:?}", e);
+                        eprintln!("Error fetching activity: {:?}", e);
                         Status::internal("Failed to fetch activity history")
                     })?;
 
                 let mut activity = match activity_opt {
                     Some(a) => a,
                     None => {
-                        error!("Activity history not found for completed activity");
+                        eprintln!("Activity history not found for completed activity");
                         return Err(Status::not_found("Activity history not found"));
                     }
                 };
 
+                // {
+                let run = match activity
+                    .runs
+                    .iter_mut()
+                    .find(|f| f.run_id == activity_result.activity_run_id)
                 {
-                    let run = match activity
-                        .runs
-                        .iter_mut()
-                        .find(|f| f.run_id == activity_result.activity_run_id)
-                    {
-                        Some(r) => r,
-                        None => {
-                            error!(
-                                "Run ID {} not found in activity history",
-                                activity_result.activity_run_id
-                            );
-                            return Err(Status::not_found("Run ID not found in activity history"));
-                        }
-                    };
+                    Some(r) => r,
+                    None => {
+                        eprintln!(
+                            "Run ID {} not found in activity history",
+                            activity_result.activity_run_id
+                        );
+                        return Err(Status::not_found(format!(
+                            "Run ID {} not found in activity history",
+                            activity_result.activity_run_id
+                        )));
+                    }
+                };
 
-                    run.end_time = Some(chrono::Utc::now());
+                run.end_time = Some(chrono::Utc::now());
 
-                    println!("{:#?}", activity_result.status);
+                // println!("{:?}", activity_result.status);
 
-                    match activity_result.status.clone() {
-                        Some(immortal::activity_result_v1::Status::Completed(x)) => {
-                            match x.result {
-                                Some(mut result_data) => {
-                                    run.status = HistoryStatus::Completed(
-                                        simd_json::to_owned_value(&mut result_data.data).unwrap(),
-                                    );
-                                }
-                                None => {
-                                    run.status =
-                                        HistoryStatus::Failed("Missing result payload".into());
-                                }
+                let mut failed = false;
+                match activity_result.status.clone() {
+                    Some(immortal::activity_result_v1::Status::Completed(x)) => {
+                        match x.result {
+                            Some(mut result_data) => {
+                                run.status = HistoryStatus::Completed(
+                                    simd_json::to_owned_value(&mut result_data.data).unwrap(),
+                                );
                             }
-                            if let Ok(id) = Uuid::parse_str(&activity_result.workflow_id) {
-                                if let Err(e) = self
-                                    .notification_tx
-                                    .send(Notification::ActivityRunCompleted(id, activity.clone()))
-                                {
-                                    error!(
-                                        "Error sending ActivityRunCompleted notification: {:?}",
-                                        e
-                                    );
-                                }
+                            None => {
+                                run.status = HistoryStatus::Failed("Missing result payload".into());
                             }
                         }
-
-                        Some(immortal::activity_result_v1::Status::Failed(x)) => {
-                            // Mark this run failed in history
-                            run.status = HistoryStatus::Failed(format!("{:#?}", x));
-
-                            // Count attempts so far (all runs for this activity)
-                            let attempts = activity.runs.len(); // includes this failed run
-
-                            // Decide retry
-                            if attempts < ACTIVITY_MAX_ATTEMPTS {
-                                // Persist the failed run before we schedule the retry
-                                if let Err(e) = self
-                                    .history
-                                    .update_activity(&activity_result.workflow_id, activity.clone())
-                                    .await
-                                {
-                                    error!(
-                                        "Failed to update activity history (failed run): {:?}",
-                                        e
-                                    );
-                                }
-
-                                // Build next options from history
-                                match build_retry_activity_options(
-                                    &self.history,
-                                    &activity_result.workflow_id,
-                                    &activity,
-                                )
-                                .await
-                                {
-                                    Ok(next_opts) => {
-                                        // Next run_id is attempts as string (previous runs are 0..attempts-1)
-                                        let next_run_id = attempts.to_string();
-
-                                        // Schedule retry with exponential backoff
-                                        self.schedule_activity_retry(
-                                            next_opts,
-                                            next_run_id,
-                                            attempts - 1, // attempt_index: 0-based for first retry
-                                        );
-
-                                        // (Optional) You can emit a small notification here if you want:
-                                        // let _ = self.notification_tx.send(Notification::ActivityRunStarted(...));
-                                    }
-                                    Err(err) => {
-                                        error!("Could not build retry options: {:?}", err);
-                                        // fall through: no retry ⇒ final failure (we already marked run as failed)
-                                    }
-                                }
-                            } else {
-                                // No more retries; final failure
+                        if let Ok(id) = Uuid::parse_str(&activity_result.workflow_id) {
+                            if let Err(e) = self
+                                .notification_tx
+                                .send(Notification::ActivityRunCompleted(id, activity.clone()))
+                            {
+                                error!("Error sending ActivityRunCompleted notification: {:?}", e);
                             }
-
-                            // Send a completion/failed notification for this run (kept as-is)
-                            if let Ok(id) = Uuid::parse_str(&activity_result.workflow_id) {
-                                if let Err(e) = self
-                                    .notification_tx
-                                    .send(Notification::ActivityRunCompleted(id, activity.clone()))
-                                {
-                                    error!(
-                                        "Error sending ActivityRunCompleted notification: {:?}",
-                                        e
-                                    );
-                                }
-                            }
-                        }
-
-                        Some(immortal::activity_result_v1::Status::Cancelled(x)) => {
-                            run.status = HistoryStatus::Failed(format!("{:#?}", x));
-                            // (No retry on cancelled by default; tweak if you want)
-                        }
-
-                        None => {
-                            run.status = HistoryStatus::Failed("Missing status field".into());
                         }
                     }
-                    // let _ = self.notification_tx.send(Notification::ActivityRunCompleted(
-                    //     Uuid::parse_str(&workflow_id).unwrap(),
-                    //     activity.clone(),
-                    // ));
-                    if let Err(e) = self
-                        .history
-                        .update_activity(&activity_result.workflow_id, activity)
-                        .await
-                    {
-                        println!("error");
-                        error!("Failed to update activity history: {:?}", e);
-                        return Err(Status::internal("Failed to update activity history"));
-                    } else {
-                        println!("history updated");
+
+                    Some(immortal::activity_result_v1::Status::Failed(x)) => {
+                        failed = true;
+                        // Mark this run failed in history
+                        run.status = HistoryStatus::Failed(format!("{:#?}", x));
+
+                        // Count attempts so far (all runs for this activity)
+
+                        // Send a completion/failed notification for this run (kept as-is)
+                        if let Ok(id) = Uuid::parse_str(&activity_result.workflow_id) {
+                            if let Err(e) = self
+                                .notification_tx
+                                .send(Notification::ActivityRunCompleted(id, activity.clone()))
+                            {
+                                eprintln!(
+                                    "Error sending ActivityRunCompleted notification: {:?}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+
+                    Some(immortal::activity_result_v1::Status::Cancelled(x)) => {
+                        run.status = HistoryStatus::Failed(format!("{:#?}", x));
+                        // (No retry on cancelled by default; tweak if you want)
+                    }
+
+                    None => {
+                        run.status = HistoryStatus::Failed("Missing status field".into());
                     }
                 }
+                // let _ = self.notification_tx.send(Notification::ActivityRunCompleted(
+                //     Uuid::parse_str(&workflow_id).unwrap(),
+                //     activity.clone(),
+                // ));
+                // I THINK IT'S THIS MOTHERFUCKER RIGHT HERE OVERWRITING MY ACTIVITY DATA
 
-                // Update the worker's activity capacity
-                let mut workers = self.workers.write().await;
-                //this is the root of my problems
-                if let Some(worker) = workers.get_mut(&worker_id) {
-                    if worker.activity_capacity < worker.max_activity_capacity {
-                        worker.activity_capacity += 1;
-                    }
+                let attempts = activity.runs.len(); // includes this failed run
+                if let Err(e) = self
+                    .history
+                    .update_activity(&activity_result.workflow_id, activity.clone())
+                    .await
+                {
+                    println!("error");
+                    eprintln!("Failed to update activity history: {:?}", e);
+                    return Err(Status::internal("Failed to update activity history"));
+                } 
 
-                    if let Err(e) = tx.send(activity_result) {
-                        error!("Failed to send activity result: {:?}", e);
+                // I TRIED MOVING THIS HERE SO THAT WE FIRST UPDATE THE RUN WITH A FAILED
+                // STATUS AND THEN. IF WE CAN RUN AGAIN. WE WRITE A NEW ATTEMPT
+                // I MIGHT HAVE TO CREATE A SYSTEM WHERE WE ALWAYS FETCH THE LATEST REDIS DATA
+                // Decide retry
+                if failed && attempts < ACTIVITY_MAX_ATTEMPTS {
+                    // inform_worker = false;
+                    // Persist the failed run before we schedule the retry
+
+                    // Build next options from history
+                    match build_retry_activity_options(
+                        &self.history,
+                        &activity_result.workflow_id,
+                        &activity,
+                    )
+                    .await
+                    {
+                        Ok(next_opts) => {
+                            // Next run_id is attempts as string (previous runs are 0..attempts-1)
+                            let next_run_id = attempts.to_string();
+
+                            // Schedule retry with exponential backoff
+                            self.schedule_activity_retry(
+                                next_opts,
+                                next_run_id,
+                                attempts - 1, // attempt_index: 0-based for first retry
+                                tx,
+                            );
+
+                            // (Optional) You can emit a small notification here if you want:
+                            // let _ = self.notification_tx.send(Notification::ActivityRunStarted(...));
+                        }
+                        Err(err) => {
+                            eprintln!("Could not build retry options: {:?}", err);
+                            // fall through: no retry ⇒ final failure (we already marked run as failed)
+                        }
                     }
                 } else {
-                    error!("Worker {} not found", worker_id);
+                    // }
+
+                    // if inform_worker {
+                    println!("INFORMING WORKER");
+                    // Update the worker's activity capacity
+                    let mut workers = self.workers.write().await;
+                    //this is the root of my problems
+                    if let Some(worker) = workers.get_mut(&worker_id) {
+                        if worker.activity_capacity < worker.max_activity_capacity {
+                            worker.activity_capacity += 1;
+                        }
+
+                        // THIS IS WHERE WE TELL THE WORKER THE RESULT OF THE ACTIVITY
+                        // IN THIS CASE. WHEN WE RETRY THE ACTIVITY. WE DON'T WANT TO INFORM THE WORKER
+                        // JUST YET. I WILL ADD A BOOL CALLED INFORM_WORKER
+                        if let Err(e) = tx.send(activity_result) {
+                            eprintln!("Failed to send activity result: {:?}", e);
+                        }
+                    } else {
+                        eprintln!("Worker {} not found", worker_id);
+                    }
                 }
 
                 println!("finished");
@@ -2629,15 +2636,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::serve(listener, app).await.unwrap();
         });
     }
-    tokio::spawn(async move {
-        loop {
-            println!("watcher started");
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            if let Err(e) = start_watcher(Arc::clone(&cron_manager)).await {
-                println!("{:#?}", e)
+    let enable_cron = std::env::var("ENABLE_CRON")
+        .unwrap_or_else(|_| "true".into())
+        .to_lowercase()
+        == "true";
+
+    if enable_cron {
+        tokio::spawn(async move {
+            loop {
+                println!("watcher started");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if let Err(e) = start_watcher(Arc::clone(&cron_manager)).await {
+                    println!("{:#?}", e)
+                }
             }
-        }
-    });
+        });
+    }
 
     Server::builder()
         .add_service(svc)
