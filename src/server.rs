@@ -1942,7 +1942,7 @@ impl Immortal for ImmortalService {
         {
             let mut workers = self.workers.write().await;
 
-            let worker_ids = workers.iter().map(|f| f.0.clone()).collect::<Vec<_>>();
+            // let worker_ids = workers.iter().map(|f| f.0.clone()).collect::<Vec<_>>();
             // println!("WORKER IDS: {:#?}", worker_ids);
             let registered_workflows = worker_details
                 .registered_workflows

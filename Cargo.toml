@@ -1,5 +1,5 @@
-cargo.features = "all"
-resolver="2"
+# cargo.features = "all"
+# resolver="2"
 
 [package]
 name = "immortal"

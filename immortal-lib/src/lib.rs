@@ -408,6 +408,7 @@ pub mod failure {
                         Some(Self {
                             message: e.to_string(),
                             cause: cause.map(Box::new),
+                            stack_trace: ae.backtrace().to_string(),
                             ..Default::default()
                         })
                     })

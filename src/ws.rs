@@ -119,7 +119,7 @@ async fn read_and_send_log(
             // println!("sending to {room_name}");
             // println!("listening rooms: {:?}", io.rooms());
 
-            let x = io
+            let _x = io
                 .within(room_name.clone())
                 .emit("log-back", &parsed_map)
                 .await
