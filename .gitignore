@@ -7,3 +7,4 @@ dump.rdb
 .nvim.lua
 errors.log
 jwt.pem
+docker-compose.yml

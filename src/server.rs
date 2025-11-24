@@ -1,5 +1,6 @@
 use immortal_lib::common::Payloads;
 use immortal_lib::immortal::ActivityCache;
+use redis::RedisError;
 use socketioxide::SocketIo;
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
@@ -82,6 +83,7 @@ use uuid::Uuid;
 
 use crate::cron::start_watcher;
 use crate::cron::CronManager;
+use crate::history::WorkflowHistoryVersion;
 use crate::metrics::IdentifiableMetrics;
 use crate::state::AppState;
 use crate::state::JwtPublicBytes;
@@ -231,6 +233,7 @@ struct CallProperties {
 #[derive(Debug, Clone, Serialize)]
 struct ActivityProperties {
     pub workflow_id: String,
+    pub index: usize,
     pub last_heartbeat: DateTime<Utc>,
     pub scheduled: DateTime<Utc>,
     pub latest_run_start: Option<DateTime<Utc>>,
@@ -319,6 +322,8 @@ pub struct ImmortalService {
                         RequestStartActivityOptionsV1,
                         tokio::sync::oneshot::Sender<ActivityResultV1>,
                         DateTime<Utc>,
+                        // activity position index within workflow
+                        usize,
                     )>,
                 >,
             >,
@@ -336,7 +341,7 @@ async fn fail_entire_workflow(
     v1: &mut WorkflowHistory,
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    for activity in &mut v1.activities {
+    for (_i, activity) in v1.activities.iter_mut().enumerate() {
         let mut changed = false;
         for run in &mut activity.runs {
             if matches!(run.status, HistoryStatus::Running) {
@@ -395,6 +400,7 @@ async fn rehydrate_activity_if_absent(
                 worker_id: worker_id.to_string(),
                 heartbeat_timeout: Duration::seconds(30),
                 additional_properties: ActivityProperties {
+                    index: activity.index,
                     workflow_id: workflow_id.to_string(),
                     last_heartbeat: now,
                     scheduled: last_run_start.unwrap_or(now),
@@ -426,7 +432,7 @@ const ACTIVITY_BACKOFF_JITTER_MS: u64 = 250;
 async fn build_retry_activity_options(
     history: &History,
     workflow_id: &str,
-    activity: &history::ActivityHistory,
+    activity: &ActivityHistory,
 ) -> anyhow::Result<immortal::RequestStartActivityOptionsV1> {
     // use immortal_lib::common::Payload;
 
@@ -470,6 +476,7 @@ impl ImmortalService {
         next_run_id: String,
         attempt_index: usize, // 0-based (0 => first retry)
         tx: tokio::sync::oneshot::Sender<ActivityResultV1>,
+        activity_index: usize,
     ) {
         let backoff_ms = ACTIVITY_BACKOFF_BASE_MS
             .saturating_mul(ACTIVITY_BACKOFF_FACTOR.saturating_pow(attempt_index as u32));
@@ -487,12 +494,22 @@ impl ImmortalService {
             {
                 let mut queues = activity_queue.lock().await;
                 match queues.get_mut(&options.task_queue) {
-                    Some(q) => {
-                        q.push_back(Box::new((next_run_id.clone(), options.clone(), tx, now)))
-                    }
+                    Some(q) => q.push_back(Box::new((
+                        next_run_id.clone(),
+                        options.clone(),
+                        tx,
+                        now,
+                        activity_index,
+                    ))),
                     None => {
                         let mut q = std::collections::VecDeque::new();
-                        q.push_back(Box::new((next_run_id.clone(), options.clone(), tx, now)));
+                        q.push_back(Box::new((
+                            next_run_id.clone(),
+                            options.clone(),
+                            tx,
+                            now,
+                            activity_index,
+                        )));
                         queues.insert(options.task_queue.clone(), q);
                     }
                 }
@@ -574,7 +591,7 @@ impl ImmortalService {
             .await?;
 
         for wf in workflows {
-            let history::WorkflowHistoryVersion::V1(mut v1) = wf;
+            let WorkflowHistoryVersion::V1(mut v1) = wf;
 
             if !matches!(v1.status, HistoryStatus::Running) {
                 continue;
@@ -1113,7 +1130,8 @@ impl ImmortalService {
 
                 for (queue_name, queue) in activity_queues.iter_mut() {
                     if let Some(queued_item) = queue.pop_front() {
-                        let (activity_run_id, activity_options, tx, scheduled) = *queued_item;
+                        let (activity_run_id, activity_options, tx, scheduled, index) =
+                            *queued_item;
                         if let Some(schedule_to_start_timeout) =
                             activity_options.schedule_to_start_timeout
                         {
@@ -1164,6 +1182,7 @@ impl ImmortalService {
                                 activity_options,
                                 tx,
                                 scheduled,
+                                index,
                             )));
                             continue;
                         }
@@ -1194,6 +1213,7 @@ impl ImmortalService {
                                             last_heartbeat: now,
                                             scheduled: now.clone(),
                                             latest_run_start: None,
+                                            index,
                                         },
                                     },
                                 )),
@@ -1209,6 +1229,7 @@ impl ImmortalService {
                                     .unwrap_or_default(),
                                 activity_options.task_queue.clone(),
                                 activity_options.activity_input.clone(),
+                                index,
                             );
                             activity_history
                                 .runs
@@ -1251,6 +1272,7 @@ impl ImmortalService {
                                             .unwrap_or_default(),
                                         activity_options.task_queue.clone(),
                                         activity_options.activity_input.clone(),
+                                        index,
                                     );
                                     activity_history
                                         .runs
@@ -1316,6 +1338,7 @@ impl ImmortalService {
                                 activity_options,
                                 tx,
                                 scheduled,
+                                index,
                             )));
                         }
                     }
@@ -1913,7 +1936,7 @@ impl Immortal for ImmortalService {
                                         let key = format!("immortal:logs:{}", log.workflow_id);
                                         if let Err(e) = con
                                             .xadd_maxlen::<_, &str, &str, _, ()>(
-                                                key,
+                                                &key,
                                                 StreamMaxlen::Approx(1000),
                                                 "*",
                                                 &items,
@@ -1921,6 +1944,10 @@ impl Immortal for ImmortalService {
                                             .await
                                         {
                                             eprintln!("Error appending to logs: {}", e);
+                                        }
+                                        // TODO: don't ignore this
+                                        if let Err(e) = con.expire::<&str, ()>(&key, 259_200).await {
+                                            eprintln!("Error setting exp for logs: {}", e);
                                         }
                                     }
                                     Err(e) => {
@@ -2217,13 +2244,17 @@ impl Immortal for ImmortalService {
                 let attempts = activity.runs.len(); // includes this failed run
                 if let Err(e) = self
                     .history
-                    .update_activity(&activity_result.workflow_id, activity.clone())
+                    .update_activity(
+                        &activity_result.workflow_id,
+                        activity.clone(),
+                        // activity.index,
+                    )
                     .await
                 {
                     println!("error");
                     eprintln!("Failed to update activity history: {:?}", e);
                     return Err(Status::internal("Failed to update activity history"));
-                } 
+                }
 
                 // I TRIED MOVING THIS HERE SO THAT WE FIRST UPDATE THE RUN WITH A FAILED
                 // STATUS AND THEN. IF WE CAN RUN AGAIN. WE WRITE A NEW ATTEMPT
@@ -2251,6 +2282,7 @@ impl Immortal for ImmortalService {
                                 next_run_id,
                                 attempts - 1, // attempt_index: 0-based for first retry
                                 tx,
+                                activity.index,
                             );
 
                             // (Optional) You can emit a small notification here if you want:
@@ -2345,7 +2377,7 @@ impl Immortal for ImmortalService {
             .get_workflow(&workflow_result.workflow_id)
             .await
             .map_err(|e| {
-                error!("Failed to get workflow history: {:?}", e);
+                println!("Failed to get workflow history: {:?}", e);
                 Status::internal("Failed to get workflow history")
             })?;
 
@@ -2481,6 +2513,17 @@ impl Immortal for ImmortalService {
                 {
                     let now = Utc::now();
                     let mut activity_queues = self.activity_queue.lock().await;
+                    let activity_index = self
+                        .history
+                        .get_workflow_activity_len(&activity_options.workflow_id)
+                        .await
+                        .map_err(|e| {
+                            Status::internal(format!(
+                                "Couldn't fetch workflow history activity length {}",
+                                e.to_string()
+                            ))
+                        })?;
+
                     match activity_queues.get_mut(&activity_options.task_queue) {
                         Some(queue) => {
                             queue.push_back(Box::new((
@@ -2488,6 +2531,7 @@ impl Immortal for ImmortalService {
                                 activity_options.clone(),
                                 tx,
                                 now,
+                                activity_index,
                             )));
                         }
                         None => {
@@ -2497,6 +2541,7 @@ impl Immortal for ImmortalService {
                                 activity_options.clone(),
                                 tx,
                                 now,
+                                activity_index,
                             )));
                             activity_queues.insert(activity_options.task_queue.clone(), queue);
                         }

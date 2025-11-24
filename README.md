@@ -20,6 +20,7 @@ in Rust with minimal boilerplate.
 5. [Directory Layout](#directory-layout)
 6. [Contributing](#contributing)
 7. [License](#license)
+8. [Todo](#todo)
 <!-- tocstop -->
 
 ## Goals
@@ -170,3 +171,45 @@ or documentation improvements.
 ## License
 
 This project is unlicensed. Feel free to adapt and integrate per your organization’s policies.
+
+## Redis Data Storage 
+
+### Workflow index for pagination
+immortal:history:workflow:workflow_index                 (LIST of workflow_id strings)
+
+### Workflow metadata
+immortal:history:workflow:<wf_id>                        (HASH)
+  version      = "V1"
+  workflow_type
+  status_tag   = "Running" | "Completed" | "Failed"
+  start_time   = RFC3339 string
+  end_time     = RFC3339 or ""
+  task_queue
+  worker_id
+
+### Workflow blobs
+immortal:history:workflow:<wf_id>:status                 (bytes, full Status)
+immortal:history:workflow:<wf_id>:args                   (bytes, Vec<OwnedValue>)
+immortal:history:workflow:<wf_id>:output                 (bytes, Option<OwnedValue>)
+
+### Activity order
+immortal:history:workflow:<wf_id>:activities             (LIST of activity_id strings)
+
+### Activity metadata
+immortal:history:workflow:<wf_id>:activity:<activity_id> (HASH)
+  activity_id
+  activity_type
+  task_queue
+
+### Activity blobs
+immortal:history:workflow:<wf_id>:activity:<activity_id>:args    (bytes, Option<OwnedValue>)
+immortal:history:workflow:<wf_id>:activity:<activity_id>:input   (bytes, Option<Payload>)
+immortal:history:workflow:<wf_id>:activity:<activity_id>:output  (bytes, Option<OwnedValue>)
+immortal:history:workflow:<wf_id>:activity:<activity_id>:runs    (bytes, Vec<ActivityRun>)
+
+## Todo 
+
+[ ] Add better handling for truncated data
+[ ] Notification system 
+[ ] Scale system 
+[ ] Migrate from storing history as string and instead as json

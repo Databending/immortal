@@ -1,5 +1,5 @@
 use crate::error::AppError;
-use crate::history::{StatusFilter, TruncatedWorkflowHistoryVersion};
+use crate::history::{get_blob, StatusFilter, TruncatedWorkflowHistoryVersion};
 use crate::state::AppState;
 use crate::utils::log::fetch_log_history_from_redis;
 use crate::ws::FetchLogs;
@@ -40,6 +40,11 @@ pub struct HistoryFilter {
     worker_ids: Option<String>,
     task_queues: Option<String>,
     status: Option<StatusFilter>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct BlobRef {
+    path: String,
 }
 
 #[derive(o2o, Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +116,17 @@ pub async fn kill_workflow(
     }
 }
 
+pub async fn get_blob_ref(
+    State(state): State<AppState>,
+
+    Query(params): Query<BlobRef>, // this argument tells axum to parse the request body
+                                   // as JSON into a `CreateUser` type
+) -> impl IntoResponse {
+    let mut con = state.redis.get().await.unwrap();
+
+    Json(get_blob::<simd_json::OwnedValue>(&mut con, &params.path).await.unwrap())
+}
+
 pub async fn get_history(
     State(state): State<AppState>,
 
@@ -120,7 +136,7 @@ pub async fn get_history(
     match state
         .immortal_service
         .history
-        .get_workflows(
+        .get_workflows_summary(
             Some(100),
             None,
             params
@@ -134,13 +150,11 @@ pub async fn get_history(
         .await
     {
         Ok(history) => {
-            let truncated_data: Vec<TruncatedWorkflowHistoryVersion> =
-                history.into_iter().map(|f| f.into()).collect();
             // let mut api_histories: Vec<ApiWorkflowHistoryVersion> = vec![];
             // for x in history {
             //     api_histories.push(x.into());
             // }
-            Json(truncated_data)
+            Json(history)
         }
         Err(e) => {
             println!("{}", e);
