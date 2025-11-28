@@ -1,5 +1,6 @@
 use crate::error::AppError;
-use crate::history::{get_blob, StatusFilter, TruncatedWorkflowHistoryVersion};
+use crate::history2::{get_blob_raw, Status as Status2};
+use crate::history3::{WorkflowHistoryMetadata, WorkflowHistoryMetadataVersion};
 use crate::state::AppState;
 use crate::utils::log::fetch_log_history_from_redis;
 use crate::ws::FetchLogs;
@@ -8,6 +9,7 @@ use crate::{
     ActivitySchema, WfSchema,
 };
 use axum::extract::Path;
+use axum::http::header;
 use axum::{
     extract::{Query, State},
     response::IntoResponse,
@@ -39,12 +41,13 @@ struct Worker {
 pub struct HistoryFilter {
     worker_ids: Option<String>,
     task_queues: Option<String>,
-    status: Option<StatusFilter>,
+    status: Option<Status2>,
 }
 
 #[derive(Deserialize, Debug)]
 pub struct BlobRef {
     path: String,
+    encode: Option<bool>,
 }
 
 #[derive(o2o, Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +119,13 @@ pub async fn kill_workflow(
     }
 }
 
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum BlobEncoding {
+    Raw(Option<Vec<u8>>),
+    String(Option<String>),
+}
+
 pub async fn get_blob_ref(
     State(state): State<AppState>,
 
@@ -124,7 +134,56 @@ pub async fn get_blob_ref(
 ) -> impl IntoResponse {
     let mut con = state.redis.get().await.unwrap();
 
-    Json(get_blob::<simd_json::OwnedValue>(&mut con, &params.path).await.unwrap())
+    if params.encode.unwrap_or(false) {
+        Json(BlobEncoding::String(
+            get_blob_raw::<String>(&mut con, &params.path)
+                .await
+                .unwrap(),
+        ))
+    } else {
+        Json(BlobEncoding::Raw(
+            get_blob_raw::<Vec<u8>>(&mut con, &params.path)
+                .await
+                .unwrap(),
+        ))
+    }
+}
+
+pub async fn download_blob_ref(
+    State(state): State<AppState>,
+
+    Query(params): Query<BlobRef>, // this argument tells axum to parse the request body
+) -> impl IntoResponse {
+    let mut con = state.redis.get().await.unwrap();
+    if params.encode.unwrap_or(false) {
+        let data = get_blob_raw::<String>(&mut con, &params.path)
+            .await
+            .unwrap();
+
+        let headers = [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"blob_ref.txt\"",
+            ),
+        ];
+
+        (headers, data.unwrap().into_response())
+    } else {
+        let data = get_blob_raw::<Vec<u8>>(&mut con, &params.path)
+            .await
+            .unwrap();
+
+        let headers = [
+            (header::CONTENT_TYPE, "application/octet-stream; charset=utf-8"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"blob_ref\"",
+            ),
+        ];
+
+        (headers, data.unwrap().into_response())
+    }
 }
 
 pub async fn get_history(
@@ -133,28 +192,32 @@ pub async fn get_history(
     Query(params): Query<HistoryFilter>, // this argument tells axum to parse the request body
                                          // as JSON into a `CreateUser` type
 ) -> impl IntoResponse {
-    match state
-        .immortal_service
-        .history
-        .get_workflows_summary(
-            Some(100),
-            None,
-            params
-                .task_queues
-                .map(|f| f.split(",").map(|f| f.to_string()).collect()),
-            params
-                .worker_ids
-                .map(|f| f.split(",").map(|f| f.to_string()).collect()),
-            params.status,
-        )
-        .await
+    let mut con = state.immortal_service.history.get_con().await.unwrap();
+    match WorkflowHistoryMetadata::get_all(
+        &mut con,
+        Some(100),
+        None,
+        params
+            .task_queues
+            .map(|f| f.split(",").map(|f| f.to_string()).collect()),
+        params
+            .worker_ids
+            .map(|f| f.split(",").map(|f| f.to_string()).collect()),
+        params.status,
+    )
+    .await
     {
         Ok(history) => {
             // let mut api_histories: Vec<ApiWorkflowHistoryVersion> = vec![];
             // for x in history {
             //     api_histories.push(x.into());
             // }
-            Json(history)
+            Json(
+                history
+                    .into_iter()
+                    .map(|f| WorkflowHistoryMetadataVersion::V1(f))
+                    .collect::<Vec<_>>(),
+            )
         }
         Err(e) => {
             println!("{}", e);
@@ -192,10 +255,10 @@ pub async fn get_workers(
     // this argument tells axum to parse the request body
     // as JSON into a `CreateUser` type
 ) -> impl IntoResponse {
-    println!("waiting to read workers");
+    // println!("waiting to read workers");
     let workers = state.immortal_service.workers.read().await;
 
-    println!("workers read");
+    // println!("workers read");
     let mut registered_workers = Vec::new();
     for (worker_id, worker) in workers.iter() {
         registered_workers.push(Worker {
@@ -221,11 +284,11 @@ pub async fn get_task_queues(
     // this argument tells axum to parse the request body
     // as JSON into a `CreateUser` type
 ) -> impl IntoResponse {
-    println!("waiting to read workers");
+    // println!("waiting to read workers");
     let mut task_queues = vec![];
     let workers = state.immortal_service.workers.read().await;
 
-    println!("workers read");
+    // println!("workers read");
     for (_worker_id, worker) in workers.iter() {
         if !task_queues.contains(&worker.task_queue) {
             task_queues.push(worker.task_queue.clone());
@@ -243,11 +306,11 @@ pub async fn get_registered_workflows(
     // this argument tells axum to parse the request body
     // as JSON into a `CreateUser` type
 ) -> impl IntoResponse {
-    println!("waiting to read workers");
+    // println!("waiting to read workers");
     let mut workflow_types = HashMap::new();
     let workers = state.immortal_service.workers.read().await;
 
-    println!("workers read");
+    // println!("workers read");
     for (_worker_id, worker) in workers.iter() {
         if worker.task_queue == task_queue {
             let registered_workflows: Vec<_> = worker.registered_workflows.iter().collect();
@@ -270,11 +333,11 @@ pub async fn get_registered_activities(
     // this argument tells axum to parse the request body
     // as JSON into a `CreateUser` type
 ) -> impl IntoResponse {
-    println!("waiting to read workers");
+    // println!("waiting to read workers");
     let mut activity_types = HashMap::new();
     let workers = state.immortal_service.workers.read().await;
 
-    println!("workers read");
+    // println!("workers read");
     for (_worker_id, worker) in workers.iter() {
         if worker.task_queue == task_queue {
             let registered_activities: Vec<_> = worker.registered_activities.iter().collect();

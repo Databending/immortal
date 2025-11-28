@@ -36,7 +36,7 @@ axum = {version="0.8.4", features = ["macros"]}
 socketioxide = { version = "0.16.2", features = ["state"]}
 tower-http = { version = "0.6.2", features = ["cors"]}
 bb8-redis = {version="0.22.0"}
-redis = { version = "0.30", default-features = false, features = ["tokio-comp", "streams", "aio", "json"]}
+redis = { version = "0.30", default-features = false, features = ["tokio-comp", "streams", "aio", "json", "script"]}
 immortal-macros = { path = "immortal-macros" }
 immortal-lib = { path = "immortal-lib" }
 immortal-worker-lib = { path = "immortal-worker-lib" }

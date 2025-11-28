@@ -325,26 +325,39 @@ pub async fn start_watcher(cron_manager: Arc<Mutex<CronManager>>) -> anyhow::Res
             async move {
                 println!("Saw ConfigMap update: {}", cm.name_any());
 
-                if let Some(data) = cm.data {
+                if let Some(data) = &cm.data {
                     if let Some(config) = data.get("config") {
                         let mut cron_manager = cron_manager_arc.lock().await;
 
                         let mut x = config.as_bytes().to_owned();
-                        let parsed_config: CronConfig =
-                            simd_json::serde::from_slice(&mut x).unwrap();
-                        cron_manager
+
+                        let parsed_config: CronConfig = match simd_json::serde::from_slice(&mut x) {
+                            Ok(cfg) => cfg,
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    cm = %cm.name_any(),
+                                    "invalid cron config in ConfigMap; ignoring"
+                                );
+                                // Ignore this update rather than killing the watcher
+                                return Ok(());
+                            }
+                        };
+
+                        // whatever your reconcile error type is, you can either:
+                        //  - also log-and-ignore, or
+                        //  - map it to watcher::Error like in option 2 below
+                        if let Err(e) = cron_manager
                             .reconcile(match parsed_config {
                                 CronConfig::V1(v1) => v1.crons,
                             })
                             .await
-                            .unwrap();
+                        {
+                            tracing::warn!(error = %e, "cron_manager reconcile failed; ignoring");
+                        }
                     }
                 }
 
-                // info!("saw {}", p.name_any());
-                // if let Some(unready_reason) = pod_unready(&p) {
-                // warn!("{}", unready_reason);
-                // }
                 Ok(())
             }
         })

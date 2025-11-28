@@ -1,19 +1,23 @@
+use std::collections::HashMap;
+
 use anyhow::anyhow;
+use anyhow::Result;
 use bb8_redis::{
     bb8::{Pool, PooledConnection, RunError},
     RedisConnectionManager,
 };
-use const_format::formatcp;
-
-use anyhow::Result;
 use chrono::{DateTime, Utc};
+use const_format::formatcp;
 use immortal_lib::common::Payload;
+use redis::FromRedisValue;
 use redis::{aio::MultiplexedConnection, AsyncCommands, RedisError};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use simd_json::OwnedValue;
+use strum::{AsRefStr, EnumString};
 use uuid::Uuid;
 
-use crate::history2::run_output_blob_key;
+use crate::history3::ActivityHistoryMetadata;
+use crate::history3::ActivityRunHistoryMetadata;
+use crate::history3::WorkflowHistoryMetadata;
 
 // STRUCTS
 
@@ -27,15 +31,11 @@ pub enum StatusFilter {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type", content = "spec")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, AsRefStr, EnumString)]
 pub enum Status {
     Running,
-    // #[serde(with = "serde_bytes")]
-    Completed(OwnedValue),
-    // Completed(String),
-    // Completed(Value),
-    Failed(String),
+    Completed,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,8 +46,8 @@ pub enum WorkflowHistoryVersion {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowHistory {
-    pub args: Vec<OwnedValue>,
-    pub output: Option<OwnedValue>,
+    pub args: Vec<Payload>,
+    pub output: Option<Payload>,
     pub workflow_id: String,
     pub workflow_type: String,
     pub status: Status,
@@ -63,7 +63,7 @@ impl WorkflowHistory {
     pub fn new(
         workflow_type: String,
         workflow_id: String,
-        args: Vec<OwnedValue>,
+        args: Vec<Payload>,
         task_queue: String,
         worker_id: String,
     ) -> Self {
@@ -86,21 +86,23 @@ impl WorkflowHistory {
 pub struct ActivityHistory {
     pub activity_id: String,
     pub activity_type: String,
-    pub args: Option<OwnedValue>,
-    pub output: Option<OwnedValue>,
+    // pub args: Option<Payload>,
+    // pub output: Option<Payload>,
     pub task_queue: Option<String>,
     pub input: Option<Payload>,
     // pub status: Status,
     // pub result: Option<Value>,
     pub runs: Vec<ActivityRun>,
     pub index: usize,
+    // NEED THIS FOR BLOB REF
+    pub workflow_id: String,
 }
 
 impl ActivityHistory {
     pub fn new(
+        workflow_id: String,
         activity_type: String,
         activity_id: String,
-        args: Option<OwnedValue>,
         task_queue: String,
         input: Option<Payload>,
         index: usize,
@@ -108,10 +110,11 @@ impl ActivityHistory {
         Self {
             activity_id,
             activity_type,
-            args,
+            workflow_id,
+            // args,
             input,
             task_queue: Some(task_queue),
-            output: None,
+            // output: None,
             // status: Status::Running,
             runs: Vec::new(),
             index,
@@ -134,19 +137,25 @@ impl ActivityHistory {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivityRun {
+    pub workflow_id: String,
+    pub activity_id: String,
     pub run_id: String,
     pub status: Status,
+    pub output: Option<Payload>,
     pub start_time: DateTime<Utc>,
     pub end_time: Option<DateTime<Utc>>,
 }
 
 impl ActivityRun {
-    pub fn new(run_id: String) -> Self {
+    pub fn new(workflow_id: String, activity_id: String, run_id: String) -> Self {
         Self {
+            workflow_id,
+            activity_id,
             run_id,
             status: Status::Running,
             start_time: chrono::Utc::now(),
             end_time: None,
+            output: None,
         }
     }
 }
@@ -168,12 +177,6 @@ impl History {
         self.0.get().await
     }
 
-    pub async fn store_workflow_output(&self, workflow_id: &str, output: Payload) -> Result<()> {
-        let mut con = self.get_con().await?;
-
-        set_blob(&mut con, &workflow_output_key(&workflow_id), &output.data).await?;
-        Ok(())
-    }
     pub async fn store_activity_run_output(
         &self,
         workflow_id: &str,
@@ -183,7 +186,7 @@ impl History {
     ) -> Result<()> {
         let mut con = self.get_con().await?;
 
-        set_blob(
+        set_blob_raw(
             &mut con,
             &run_output_blob_key(&workflow_id, activity_id, run_id),
             &output.data,
@@ -209,6 +212,8 @@ impl History {
             )
             .await?;
 
+        let wf_metadata = WorkflowHistoryMetadata::get_opt(&mut con, &wf_id).await?;
+
         // Find all activity ids
         let act_ids: Vec<String> = con
             .lrange(workflow_activities_list_key(&wf_id), 0, -1)
@@ -216,12 +221,17 @@ impl History {
 
         let mut keys_to_del = vec![
             wf_meta.clone(),
-            workflow_args_key(&wf_id),
             workflow_output_key(&wf_id),
             workflow_status_blob_key(&wf_id),
             workflow_activities_list_key(&wf_id),
             format!("immortal:logs:{wf_id}"),
         ];
+
+        if let Some(wf_metadata) = wf_metadata {
+            for (i, _) in wf_metadata.args.iter().enumerate() {
+                keys_to_del.push(workflow_args_key(&wf_id, i));
+            }
+        }
 
         for act_id in &act_ids {
             // delete runs for this activity
@@ -230,7 +240,7 @@ impl History {
 
             for run_id in run_ids {
                 keys_to_del.push(run_base_key(&wf_id, act_id, &run_id));
-                keys_to_del.push(run_status_blob_key(&wf_id, act_id, &run_id));
+                keys_to_del.push(run_output_blob_key(&wf_id, act_id, &run_id));
             }
 
             keys_to_del.push(runs_list_key);
@@ -314,38 +324,19 @@ impl History {
             .lpush(format!("{WORKFLOW_BASE_REDIS_KEY}:workflow_index"), &wf_id)
             .await?;
 
-        // Store workflow metadata hash (including status tag)
-        let status_clone = workflow.status.clone();
-        let _: () = bb8_redis::redis::pipe()
-            .cmd("HSET")
-            .arg(&wf_meta)
-            .arg("version")
-            .arg("V1")
-            .arg("workflow_type")
-            .arg(&workflow.workflow_type)
-            .arg("status_tag")
-            .arg(status_tag(&workflow.status))
-            .arg("start_time")
-            .arg(workflow.start_time.to_rfc3339())
-            .arg("end_time")
-            .arg(
-                workflow
-                    .end_time
-                    .map(|t| t.to_rfc3339())
-                    .unwrap_or_else(String::new),
-            )
-            .arg("task_queue")
-            .arg(workflow.task_queue.clone().unwrap_or_default())
-            .arg("worker_id")
-            .arg(workflow.worker_id.clone().unwrap_or_default())
-            .ignore()
-            .query_async(&mut *con)
-            .await?;
+        let wf_metadata: WorkflowHistoryMetadata = (&workflow).into();
 
-        // Store full status + args + output as blobs
-        set_blob(&mut con, &workflow_status_blob_key(&wf_id), &status_clone).await?;
-        set_blob(&mut con, &workflow_args_key(&wf_id), &workflow.args).await?;
-        set_blob(&mut con, &workflow_output_key(&wf_id), &workflow.output).await?;
+        // we don't need to store children because we add_workflow itself is already recursive
+        wf_metadata.store(&mut con, false).await?;
+
+        for (i, arg) in workflow.args.iter().enumerate() {
+            set_blob_raw(&mut con, &workflow_args_key(&wf_id, i), &arg.data).await?;
+        }
+        if let Some(output) = workflow.output {
+            set_blob_raw(&mut con, &workflow_output_key(&wf_id), &output.data).await?;
+        }
+
+        // for (i, arg) in workflow.
 
         // Store activities (IDs list + each activity)
         let act_list_key = workflow_activities_list_key(&wf_id);
@@ -357,7 +348,7 @@ impl History {
             let _: () = con.rpush(&act_list_key, act_id).await?;
 
             // Store activity itself
-            self.store_activity(&mut con, &wf_id, act_id, activity)
+            self.store_activity(&mut con, &wf_id, act_id, activity, true)
                 .await?;
         }
 
@@ -368,6 +359,12 @@ impl History {
         Ok(())
     }
 
+    pub async fn store_workflow_output(&self, workflow_id: &str, output: Payload) -> Result<()> {
+        let mut con = self.get_con().await?;
+
+        set_blob_raw(&mut con, &workflow_output_key(&workflow_id), &output.data).await?;
+        Ok(())
+    }
     // -------------------------------------------------------
     // update existing workflow (replace metadata + blobs + activities)
     // -------------------------------------------------------
@@ -375,6 +372,7 @@ impl History {
         &self,
         workflow_id: &str,
         workflow: WorkflowHistory,
+        store_children: bool,
     ) -> Result<()> {
         let mut con = self.get_con().await?;
         let wf_id = workflow_id.to_string();
@@ -384,71 +382,51 @@ impl History {
             return Err(anyhow!("Workflow does not exist"));
         }
 
-        // Overwrite metadata hash
-        let status_clone = workflow.status.clone();
-        let _: () = redis::pipe()
-            .cmd("HSET")
-            .arg(&wf_meta)
-            .arg("version")
-            .arg("V1")
-            .arg("workflow_type")
-            .arg(&workflow.workflow_type)
-            .arg("status_tag")
-            .arg(status_tag(&workflow.status))
-            .arg("start_time")
-            .arg(workflow.start_time.to_rfc3339())
-            .arg("end_time")
-            .arg(
-                workflow
-                    .end_time
-                    .map(|t| t.to_rfc3339())
-                    .unwrap_or_else(String::new),
-            )
-            .arg("task_queue")
-            .arg(workflow.task_queue.clone().unwrap_or_default())
-            .arg("worker_id")
-            .arg(workflow.worker_id.clone().unwrap_or_default())
-            .ignore()
-            .query_async(&mut *con)
-            .await?;
+        let wf_metadata: WorkflowHistoryMetadata = (&workflow).into();
 
-        // Overwrite status + args + output blobs
-        set_blob(&mut con, &workflow_status_blob_key(&wf_id), &status_clone).await?;
-        set_blob(&mut con, &workflow_args_key(&wf_id), &workflow.args).await?;
-        set_blob(&mut con, &workflow_output_key(&wf_id), &workflow.output).await?;
+        // we don't need to store children because we add_workflow itself is already recursive
+        wf_metadata.store(&mut con, false).await?;
 
-        // Rebuild activities (list + per-activity keys)
-        let act_list_key = workflow_activities_list_key(&wf_id);
-        let old_act_ids: Vec<String> = con.lrange(&act_list_key, 0, -1).await?;
+        for (i, arg) in workflow.args.iter().enumerate() {
+            set_blob_raw(&mut con, &workflow_args_key(&wf_id, i), &arg.data).await?;
+        }
+        if let Some(output) = workflow.output {
+            set_blob_raw(&mut con, &workflow_output_key(&wf_id), &output.data).await?;
+        }
 
-        // Delete old activities and their runs
-        let mut keys_to_del: Vec<String> = Vec::new();
-        for act_id in &old_act_ids {
-            let runs_list_key = activity_runs_list_key(&wf_id, act_id);
-            let run_ids: Vec<String> = con.lrange(&runs_list_key, 0, -1).await?;
+        if store_children {
+            // Rebuild activities (list + per-activity keys)
+            let act_list_key = workflow_activities_list_key(&wf_id);
+            let old_act_ids: Vec<String> = con.lrange(&act_list_key, 0, -1).await?;
 
-            for run_id in run_ids {
-                keys_to_del.push(run_base_key(&wf_id, act_id, &run_id));
-                keys_to_del.push(run_status_blob_key(&wf_id, act_id, &run_id));
+            // Delete old activities and their runs
+            let mut keys_to_del: Vec<String> = Vec::new();
+            for act_id in &old_act_ids {
+                let runs_list_key = activity_runs_list_key(&wf_id, act_id);
+                let run_ids: Vec<String> = con.lrange(&runs_list_key, 0, -1).await?;
+
+                for run_id in run_ids {
+                    keys_to_del.push(run_base_key(&wf_id, act_id, &run_id));
+                    keys_to_del.push(run_status_blob_key(&wf_id, act_id, &run_id));
+                }
+
+                keys_to_del.push(runs_list_key);
+                keys_to_del.push(activity_base_key(&wf_id, act_id));
+                keys_to_del.push(activity_args_key(&wf_id, act_id));
+                keys_to_del.push(activity_input_key(&wf_id, act_id));
+                keys_to_del.push(activity_output_key(&wf_id, act_id));
             }
-
-            keys_to_del.push(runs_list_key);
-            keys_to_del.push(activity_base_key(&wf_id, act_id));
-            keys_to_del.push(activity_args_key(&wf_id, act_id));
-            keys_to_del.push(activity_input_key(&wf_id, act_id));
-            keys_to_del.push(activity_output_key(&wf_id, act_id));
-        }
-        keys_to_del.push(act_list_key.clone());
-        if !keys_to_del.is_empty() {
-            let _: () = con.del(keys_to_del).await?;
-        }
-
-        // Write new list + activities
-        for activity in &workflow.activities {
-            let act_id = &activity.activity_id;
-            let _: () = con.rpush(&act_list_key, act_id).await?;
-            self.store_activity(&mut con, &wf_id, act_id, activity)
-                .await?;
+            keys_to_del.push(act_list_key.clone());
+            // Write new list + activities
+            for activity in &workflow.activities {
+                let act_id = &activity.activity_id;
+                let _: () = con.rpush(&act_list_key, act_id).await?;
+                self.store_activity(&mut con, &wf_id, act_id, activity, store_children)
+                    .await?;
+            }
+            if !keys_to_del.is_empty() {
+                let _: () = con.del(keys_to_del).await?;
+            }
         }
 
         let _: () = con.expire(&wf_meta, TTL).await?;
@@ -468,40 +446,33 @@ impl History {
             return Ok(None);
         }
 
-        // metadata hash
-        let meta_val: redis::Value = redis::cmd("HGETALL")
-            .arg(&wf_meta)
-            .query_async(&mut *con)
-            .await?;
-        let meta: std::collections::HashMap<String, String> = redis::from_redis_value(&meta_val)?;
-
-        let workflow_type = meta.get("workflow_type").cloned().unwrap_or_default();
-        let status_tag_str = meta
-            .get("status_tag")
-            .cloned()
-            .unwrap_or_else(|| "Running".to_string());
-        let start_time: DateTime<Utc> = meta
-            .get("start_time")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(Utc::now);
-        let end_time: Option<DateTime<Utc>> =
-            meta.get("end_time")
-                .and_then(|s| if s.is_empty() { None } else { s.parse().ok() });
-        let task_queue = meta.get("task_queue").cloned();
-        let worker_id = meta.get("worker_id").cloned();
-
-        // blobs
-        let status_full: Status = get_blob(&mut con, &workflow_status_blob_key(workflow_id))
+        let wf_metadata = WorkflowHistoryMetadata::get_opt(&mut con, workflow_id)
             .await?
-            .unwrap_or(Status::Running);
-        let status = status_from_tag_and_blob(&status_tag_str, status_full);
+            .unwrap();
 
-        let args: Vec<OwnedValue> = get_blob(&mut con, &workflow_args_key(workflow_id))
-            .await?
-            .unwrap_or_default();
-        let output: Option<OwnedValue> = get_blob(&mut con, &workflow_output_key(workflow_id))
-            .await?
-            .unwrap_or(None);
+        let mut args = vec![];
+
+        for (i, blob_ref) in wf_metadata.args.into_iter().enumerate() {
+            let data: Vec<u8> = get_blob(&mut con, &workflow_args_key(workflow_id, i))
+                .await?
+                .unwrap_or_default();
+            args.push(Payload {
+                metadata: blob_ref.metadata.unwrap(),
+                data,
+            });
+        }
+
+        let mut output = None;
+
+        if let Some(outputx) = wf_metadata.output {
+            let data: Vec<u8> = get_blob(&mut con, &workflow_output_key(workflow_id))
+                .await?
+                .unwrap_or_default();
+            output = Some(Payload {
+                metadata: outputx.metadata.unwrap(),
+                data,
+            })
+        }
 
         // activities
         let act_ids: Vec<String> = con
@@ -520,18 +491,17 @@ impl History {
             args,
             output,
             workflow_id: workflow_id.to_string(),
-            workflow_type,
-            status,
+            workflow_type: wf_metadata.workflow_type,
+            status: wf_metadata.status,
             activities,
-            start_time,
-            end_time,
-            task_queue,
-            worker_id,
+            start_time: wf_metadata.start_time,
+            end_time: wf_metadata.end_time,
+            task_queue: wf_metadata.task_queue,
+            worker_id: wf_metadata.worker_id,
         };
 
         Ok(Some(wf))
     }
-
     // -------------------------------------------------------
     // number of activities for a workflow
     // -------------------------------------------------------
@@ -589,9 +559,9 @@ impl History {
                 .into_iter()
                 .filter(|f| match f {
                     WorkflowHistoryVersion::V1(v1) => match status_filter {
-                        StatusFilter::Failed => matches!(v1.status, Status::Failed(..)),
+                        StatusFilter::Failed => matches!(v1.status, Status::Failed),
                         StatusFilter::Running => matches!(v1.status, Status::Running),
-                        StatusFilter::Completed => matches!(v1.status, Status::Completed(..)),
+                        StatusFilter::Completed => matches!(v1.status, Status::Completed),
                     },
                 })
                 .collect();
@@ -645,7 +615,7 @@ impl History {
         let _: () = con
             .expire(&workflow_activities_list_key(&wf_id), TTL)
             .await?;
-        self.store_activity(&mut con, &wf_id, &act_id, &activity)
+        self.store_activity(&mut con, &wf_id, &act_id, &activity, true)
             .await?;
 
         println!("WRITING TO REDIS (add activity)");
@@ -665,7 +635,8 @@ impl History {
         let act_id = activity.activity_id.clone();
 
         // We don't change ordering here; we just overwrite the data
-        self.store_activity(&mut con, &wf_id, &act_id, &activity)
+        // this might not always be true
+        self.store_activity(&mut con, &wf_id, &act_id, &activity, true)
             .await?;
         println!("WRITING TO REDIS (update activity)");
         Ok(())
@@ -708,55 +679,40 @@ impl History {
         workflow_id: &str,
         activity_id: &str,
         activity: &ActivityHistory,
+        store_children: bool,
     ) -> Result<()> {
         let base = activity_base_key(workflow_id, activity_id);
 
         // activity metadata
-        let _: () = redis::pipe()
-            .cmd("HSET")
-            .arg(&base)
-            .arg("activity_id")
-            .arg(&activity.activity_id)
-            .arg("activity_type")
-            .arg(&activity.activity_type)
-            .arg("task_queue")
-            .arg(activity.task_queue.clone().unwrap_or_default())
-            .ignore()
-            .query_async(con)
+
+        let activity_metadata: ActivityHistoryMetadata = activity.into();
+
+        // we don't need to store children because we already do it here.
+        activity_metadata.store(con, workflow_id, false).await?;
+
+        if let Some(input) = &activity.input {
+            set_blob_raw(
+                con,
+                &activity_input_key(workflow_id, activity_id),
+                &input.data,
+            )
             .await?;
+        }
 
-        // blobs for args/input/output
-        set_blob(
-            con,
-            &activity_args_key(workflow_id, activity_id),
-            &activity.args,
-        )
-        .await?;
-        set_blob(
-            con,
-            &activity_input_key(workflow_id, activity_id),
-            &activity.input,
-        )
-        .await?;
-        set_blob(
-            con,
-            &activity_output_key(workflow_id, activity_id),
-            &activity.output,
-        )
-        .await?;
+        if store_children {
+            // runs: store list of run_ids + each run separately
+            let runs_list_key = activity_runs_list_key(workflow_id, activity_id);
 
-        // runs: store list of run_ids + each run separately
-        let runs_list_key = activity_runs_list_key(workflow_id, activity_id);
+            // overwrite runs list completely for simplicity: delete + rebuild
+            let _: () = con.del(&runs_list_key).await?;
 
-        // overwrite runs list completely for simplicity: delete + rebuild
-        let _: () = con.del(&runs_list_key).await?;
-
-        for run in &activity.runs {
-            // append id to list
-            let _: () = con.rpush(&runs_list_key, &run.run_id).await?;
-            let _: () = con.expire(&runs_list_key, TTL).await?;
-            // store run separately
-            self.store_run(con, workflow_id, activity_id, run).await?;
+            for run in &activity.runs {
+                // append id to list
+                let _: () = con.rpush(&runs_list_key, &run.run_id).await?;
+                let _: () = con.expire(&runs_list_key, TTL).await?;
+                // store run separately
+                self.store_run(con, run).await?;
+            }
         }
 
         let _: () = con.expire(&base, TTL).await?;
@@ -779,18 +735,16 @@ impl History {
             return Ok(None);
         }
 
-        let meta_val: redis::Value = redis::cmd("HGETALL").arg(&base).query_async(con).await?;
-        let meta: std::collections::HashMap<String, String> = redis::from_redis_value(&meta_val)?;
+        let activity_metadata = ActivityHistoryMetadata::get_opt(con, workflow_id, activity_id)
+            .await?
+            .unwrap();
 
-        let activity_type = meta.get("activity_type").cloned().unwrap_or_default();
-        let task_queue = meta.get("task_queue").cloned();
-
-        let args: Option<OwnedValue> =
-            get_blob(con, &activity_args_key(workflow_id, activity_id)).await?;
+        // let args: Option<Payload> =
+        //     get_blob(con, &activity_args_key(workflow_id, activity_id)).await?;
         let input: Option<Payload> =
             get_blob(con, &activity_input_key(workflow_id, activity_id)).await?;
-        let output: Option<OwnedValue> =
-            get_blob(con, &activity_output_key(workflow_id, activity_id)).await?;
+        // let output: Option<OwnedValue> =
+        //     get_blob(con, &activity_output_key(workflow_id, activity_id)).await?;
 
         // load runs list
         let run_ids: Vec<String> = con
@@ -807,11 +761,10 @@ impl History {
         }
 
         Ok(Some(ActivityHistory {
+            workflow_id: workflow_id.to_string(),
             activity_id: activity_id.to_string(),
-            activity_type,
-            args,
-            output,
-            task_queue,
+            activity_type: activity_metadata.activity_type,
+            task_queue: activity_metadata.task_queue,
             input,
             runs,
             index: 0, // caller fills actual index based on activities list
@@ -821,41 +774,21 @@ impl History {
     // -------------------------------------------------------
     // internal: store one run (meta + status blob)
     // -------------------------------------------------------
-    async fn store_run(
-        &self,
-        con: &mut MultiplexedConnection,
-        workflow_id: &str,
-        activity_id: &str,
-        run: &ActivityRun,
-    ) -> Result<()> {
-        let base = run_base_key(workflow_id, activity_id, &run.run_id);
+    async fn store_run(&self, con: &mut MultiplexedConnection, run: &ActivityRun) -> Result<()> {
+        let base = run_base_key(&run.workflow_id, &run.activity_id, &run.run_id);
 
-        let _: () = redis::pipe()
-            .cmd("HSET")
-            .arg(&base)
-            .arg("run_id")
-            .arg(&run.run_id)
-            .arg("status_tag")
-            .arg(status_tag(&run.status))
-            .arg("start_time")
-            .arg(run.start_time.to_rfc3339())
-            .arg("end_time")
-            .arg(
-                run.end_time
-                    .map(|t| t.to_rfc3339())
-                    .unwrap_or_else(String::new),
-            )
-            .ignore()
-            .query_async(con)
+        let run_metadata: ActivityRunHistoryMetadata = run.into();
+        run_metadata
+            .store_run(con, &run.workflow_id, &run.activity_id)
             .await?;
 
-        // full status as blob
-        set_blob(
-            con,
-            &run_status_blob_key(workflow_id, activity_id, &run.run_id),
-            &run.status,
-        )
-        .await?;
+        // // full status as blob
+        // set_blob(
+        //     con,
+        //     &run_status_blob_key(&run.workflow_id, &run.activity_id, &run.run_id),
+        //     &run.status,
+        // )
+        // .await?;
 
         let _: () = con.expire(&base, TTL).await?;
         Ok(())
@@ -877,47 +810,51 @@ impl History {
             return Ok(None);
         }
 
-        let meta_val: redis::Value = redis::cmd("HGETALL").arg(&base).query_async(con).await?;
-        let meta: std::collections::HashMap<String, String> = redis::from_redis_value(&meta_val)?;
-
-        let status_tag_str = meta
-            .get("status_tag")
-            .cloned()
-            .unwrap_or_else(|| "Running".to_string());
-
-        let start_time: DateTime<Utc> = meta
-            .get("start_time")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(Utc::now);
-        let end_time: Option<DateTime<Utc>> =
-            meta.get("end_time")
-                .and_then(|s| if s.is_empty() { None } else { s.parse().ok() });
-
-        let full_status: Status =
-            get_blob(con, &run_status_blob_key(workflow_id, activity_id, run_id))
+        let activity_run_metadata =
+            ActivityRunHistoryMetadata::get_opt(con, workflow_id, activity_id, run_id)
                 .await?
-                .unwrap_or(Status::Running);
+                .unwrap();
 
-        let status = status_from_tag_and_blob(&status_tag_str, full_status);
+        let mut output = None;
+
+        if let Some(blob_ref) = activity_run_metadata.output {
+            let data: Vec<u8> =
+                get_blob_raw(con, &run_output_blob_key(workflow_id, activity_id, run_id))
+                    .await?
+                    .unwrap_or_default();
+            output = Some(Payload {
+                metadata: blob_ref.metadata.clone().unwrap_or_default(),
+                data,
+            })
+        }
 
         Ok(Some(ActivityRun {
+            workflow_id: workflow_id.to_string(),
+            activity_id: activity_id.to_string(),
             run_id: run_id.to_string(),
-            status,
-            start_time,
-            end_time,
+            status: activity_run_metadata.status,
+            start_time: activity_run_metadata.start_time,
+            end_time: activity_run_metadata.end_time,
+            output,
         }))
     }
 }
 
 // binary blob helpers ------------------------------------
+//
+// async fn set_blob<T: Serialize>(
+//     con: &mut MultiplexedConnection,
+//     key: &str,
+//     value: &T,
+// ) -> Result<()> {
+//     let bytes = simd_json::to_string(value)?;
+//     let _: () = con.set_ex(key, bytes, TTL as u64).await?;
+//     Ok(())
+// }
 
-async fn set_blob<T: Serialize>(
-    con: &mut MultiplexedConnection,
-    key: &str,
-    value: &T,
-) -> Result<()> {
-    let bytes = simd_json::to_string(value)?;
-    let _: () = con.set_ex(key, bytes, TTL as u64).await?;
+async fn set_blob_raw(con: &mut MultiplexedConnection, key: &str, data: &Vec<u8>) -> Result<()> {
+    // let bytes = simd_json::to_string(value)?;
+    let _: () = con.set_ex(key, data, TTL as u64).await?;
     Ok(())
 }
 
@@ -932,20 +869,78 @@ pub async fn get_blob<T: DeserializeOwned>(
     })
 }
 
+pub async fn get_blob_raw<T: FromRedisValue>(con: &mut MultiplexedConnection, key: &str) -> Result<Option<T>> {
+    let bytes: Option<T> = con.get(key).await?;
+    Ok(match bytes {
+        None => None,
+        Some(b) => Some(b),
+    })
+}
 
+pub fn payload_to_blob_ref(path: String, payload: &Payload) -> BlobRef {
+    BlobRef {
+        path,
+        data: None,
+        size: payload.data.len(),
+        present: true,
+        loaded: false,
+        metadata: Some(payload.metadata.clone())
+    }
+}
+
+pub async fn get_blob_ref(
+    con: &mut MultiplexedConnection,
+    key: &str,
+    max_size: Option<usize>,
+    metadata: Option<HashMap<String, Vec<u8>>>,
+) -> Result<BlobRef> {
+    let max_size = max_size.unwrap_or(100_000);
+    if con.exists(&key).await? {
+        let size: usize = con.strlen(key).await?;
+        if size > max_size {
+            Ok(BlobRef {
+                path: key.to_string(),
+                size,
+                present: true,
+                loaded: false,
+                data: None,
+                metadata,
+            })
+        } else {
+            let data: Vec<u8> = con.get(key).await?;
+            Ok(BlobRef {
+                path: key.to_string(),
+                size,
+                present: true,
+                loaded: true,
+                data: Some(data),
+                metadata,
+            })
+        }
+    } else {
+        Ok(BlobRef {
+            path: key.to_string(),
+            size: 0,
+            present: false,
+            loaded: false,
+            data: None,
+            metadata,
+        })
+    }
+}
 //
 // -------- key helpers + blob helpers + status helpers -------
 //
 
-fn workflow_meta_key(workflow_id: &str) -> String {
+pub fn workflow_meta_key(workflow_id: &str) -> String {
     format!("{WORKFLOW_BASE_REDIS_KEY}:{workflow_id}")
 }
 
-fn workflow_args_key(workflow_id: &str) -> String {
-    format!("{WORKFLOW_BASE_REDIS_KEY}:{workflow_id}:args")
+pub fn workflow_args_key(workflow_id: &str, arg_idx: usize) -> String {
+    format!("{WORKFLOW_BASE_REDIS_KEY}:{workflow_id}:args:{arg_idx}")
 }
 
-fn workflow_output_key(workflow_id: &str) -> String {
+pub fn workflow_output_key(workflow_id: &str) -> String {
     format!("{WORKFLOW_BASE_REDIS_KEY}:{workflow_id}:output")
 }
 
@@ -953,11 +948,11 @@ fn workflow_status_blob_key(workflow_id: &str) -> String {
     format!("{WORKFLOW_BASE_REDIS_KEY}:{workflow_id}:status")
 }
 
-fn workflow_activities_list_key(workflow_id: &str) -> String {
+pub fn workflow_activities_list_key(workflow_id: &str) -> String {
     format!("{WORKFLOW_BASE_REDIS_KEY}:{workflow_id}:activities")
 }
 
-fn activity_base_key(workflow_id: &str, activity_id: &str) -> String {
+pub fn activity_base_key(workflow_id: &str, activity_id: &str) -> String {
     format!("{WORKFLOW_BASE_REDIS_KEY}:{workflow_id}:activity:{activity_id}")
 }
 
@@ -965,7 +960,7 @@ fn activity_args_key(workflow_id: &str, activity_id: &str) -> String {
     format!("{WORKFLOW_BASE_REDIS_KEY}:{workflow_id}:activity:{activity_id}:args")
 }
 
-fn activity_input_key(workflow_id: &str, activity_id: &str) -> String {
+pub fn activity_input_key(workflow_id: &str, activity_id: &str) -> String {
     format!("{WORKFLOW_BASE_REDIS_KEY}:{workflow_id}:activity:{activity_id}:input")
 }
 
@@ -973,11 +968,11 @@ fn activity_output_key(workflow_id: &str, activity_id: &str) -> String {
     format!("{WORKFLOW_BASE_REDIS_KEY}:{workflow_id}:activity:{activity_id}:output")
 }
 
-fn activity_runs_list_key(workflow_id: &str, activity_id: &str) -> String {
+pub fn activity_runs_list_key(workflow_id: &str, activity_id: &str) -> String {
     format!("{WORKFLOW_BASE_REDIS_KEY}:{workflow_id}:activity:{activity_id}:runs_list")
 }
 
-fn run_base_key(workflow_id: &str, activity_id: &str, run_id: &str) -> String {
+pub fn run_base_key(workflow_id: &str, activity_id: &str, run_id: &str) -> String {
     format!("{WORKFLOW_BASE_REDIS_KEY}:{workflow_id}:activity:{activity_id}:run:{run_id}")
 }
 
@@ -985,25 +980,31 @@ fn run_status_blob_key(workflow_id: &str, activity_id: &str, run_id: &str) -> St
     format!("{WORKFLOW_BASE_REDIS_KEY}:{workflow_id}:activity:{activity_id}:run:{run_id}:status")
 }
 
-// status helpers -----------------------------------------
-
-fn status_tag(status: &Status) -> &'static str {
-    match status {
-        Status::Running => "Running",
-        Status::Completed(_) => "Completed",
-        Status::Failed(_) => "Failed",
-    }
+pub fn run_output_blob_key(workflow_id: &str, activity_id: &str, run_id: &str) -> String {
+    format!("{WORKFLOW_BASE_REDIS_KEY}:{workflow_id}:activity:{activity_id}:run:{run_id}:output")
 }
 
-fn status_from_tag_and_blob(tag: &str, full: Status) -> Status {
-    // For now, we just trust the blob and use tag for classification/filtering.
-    // If you ever want to "downgrade" Completed payloads, you can do it here.
-    match tag {
-        "Running" => Status::Running,
-        "Completed" => full,
-        "Failed" => full,
-        _ => full,
-    }
+//
+//
+//
+
+//
+// #[derive(Debug, Clone, Serialize, Deserialize)]
+// pub enum StatusSummary {
+//     Running,
+//     Completed,
+//     Failed
+// }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "spec")]
+pub enum StatusSummary {
+    Running,
+    // #[serde(with = "serde_bytes")]
+    Completed(BlobRef),
+    // Completed(String),
+    // Completed(Value),
+    Failed(BlobRef),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1020,5 +1021,51 @@ pub struct BlobRef {
     pub path: String, // "workflow.output", "activity:ID.output"
     pub size: usize,
     pub present: bool,
+    pub loaded: bool,
     pub data: Option<Vec<u8>>,
+    pub metadata: Option<HashMap<String, Vec<u8>>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "version", content = "spec")]
+pub enum WorkflowHistoryVersionSummary {
+    V1(WorkflowHistorySummary),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowHistorySummary {
+    pub args: BlobRef,
+    pub output: BlobRef,
+    pub workflow_id: String,
+    pub workflow_type: String,
+    // this needs to be TruncatedStatus
+    pub status: StatusSummary,
+    pub activities: Vec<ActivityHistorySummary>,
+    pub start_time: DateTime<Utc>,
+    pub end_time: Option<DateTime<Utc>>,
+    pub task_queue: Option<String>,
+    pub worker_id: Option<String>,
+    // pub status: Status,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityHistorySummary {
+    pub activity_id: String,
+    pub activity_type: String,
+    pub args: BlobRef,
+    pub output: BlobRef,
+    pub task_queue: Option<String>,
+    pub input: BlobRef,
+    pub index: usize,
+    // pub status: Status,
+    // pub result: Option<Value>,
+    pub runs: Vec<ActivityRunSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityRunSummary {
+    pub run_id: String,
+    pub status: StatusSummary,
+    pub start_time: DateTime<Utc>,
+    pub end_time: Option<DateTime<Utc>>,
 }
