@@ -1,13 +1,14 @@
 --!df flags=allow-undeclared-keys
+
 -- KEYS[1] = workflow index key
 -- KEYS[2] = workflow hash key prefix
 
--- ARGV[1] = offset
--- ARGV[2] = limit
--- ARGV[3] = status filter ("Failed"|"Running"|"Completed"|"" for none)
--- ARGV[4] = number of task_queues
--- ARGV[5..] = task queue values
--- Then worker IDs count + values
+-- ARGV[1] = offset           -- OFFSET APPLIES FROM THE END (0 = newest)
+-- ARGV[2] = limit            -- Max number of workflows to return
+-- ARGV[3] = status filter    -- e.g. "Running" or "" for none
+-- ARGV[4] = num task_queues
+-- ARGV[5..] = task_queue values
+-- Then worker id count + values
 
 local offset = tonumber(ARGV[1]) or 0
 local limit  = tonumber(ARGV[2]) or 10
@@ -42,8 +43,17 @@ end
 local result = {}
 local index_len = redis.call("LLEN", KEYS[1])
 
--- iterate until limit reached OR index exhausted
-for i = offset, index_len - 1 do
+if index_len == 0 then
+    return result
+end
+
+-- NEW: start from newest entry (right side of list)
+-- Example: LLEN = 100 → last index = 99
+-- offset=0 → start_at = 99
+local start_at = index_len - 1 - offset
+
+-- iterate backwards until limit reached or out of bounds
+for i = start_at, 0, -1 do
     if limit > 0 and #result >= limit then
         break
     end
@@ -59,7 +69,6 @@ for i = offset, index_len - 1 do
     local wf_task_queue = redis.call("HGET", wf_key, "task_queue")
     local wf_worker_id  = redis.call("HGET", wf_key, "worker_id")
 
-    -- skip missing workflows
     if wf_status ~= false then
         local ok = true
 
