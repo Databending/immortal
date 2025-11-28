@@ -267,11 +267,11 @@ impl WorkflowHistoryMetadata {
         status: Option<Status>,
     ) -> Result<Vec<Self>> {
 
-        let mut ids: Vec<String> =
+        let ids: Vec<String> =
             Self::get_all_workflow_ids(con, limit, offset, task_queues, worker_ids, status).await?;
-
-        ids.sort();
-        ids.dedup();
+        //
+        // ids.sort();
+        // ids.dedup();
 
         if ids.is_empty() {
             return Ok(vec![]);
