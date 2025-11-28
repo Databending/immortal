@@ -434,3 +434,47 @@ pub mod enums {
     tonic::include_proto!("enums");
 }
 // pub mod models;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::Payloads;
+    use crate::failure::Failure;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+    struct TestData {
+        name: String,
+        value: i32,
+    }
+
+    #[test]
+    fn test_payloads_serialization() {
+        let data = TestData {
+            name: "test".to_string(),
+            value: 42,
+        };
+        let vec_data = vec![data.clone()];
+        
+        // Test creation
+        let mut payloads = Payloads::new(vec_data.iter().collect());
+        
+        // Test extraction
+        let extracted: Vec<TestData> = payloads.to().expect("Failed to deserialize payloads");
+        
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0], data);
+    }
+
+    #[test]
+    fn test_failure_creation() {
+        let msg = "Something went wrong".to_string();
+        let failure = Failure::application_failure(msg.clone(), true);
+        
+        assert_eq!(failure.message, msg);
+        
+        let app_failure = failure.maybe_application_failure();
+        assert!(app_failure.is_some());
+        assert!(app_failure.unwrap().non_retryable);
+    }
+}

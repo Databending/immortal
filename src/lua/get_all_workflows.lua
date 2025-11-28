@@ -1,4 +1,4 @@
-
+--!df flags=allow-undeclared-keys
 -- KEYS[1] = workflow index key
 -- KEYS[2] = workflow hash key prefix
 

@@ -1069,3 +1069,78 @@ pub struct ActivityRunSummary {
     pub start_time: DateTime<Utc>,
     pub end_time: Option<DateTime<Utc>>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use immortal_lib::common::Payload;
+
+    #[test]
+    fn test_workflow_history_creation() {
+        let args = vec![Payload::new(&"arg1")];
+        let wf = WorkflowHistory::new(
+            "test_workflow".to_string(),
+            "wf_id_1".to_string(),
+            args.clone(),
+            "default".to_string(),
+            "worker_1".to_string(),
+        );
+
+        assert_eq!(wf.workflow_type, "test_workflow");
+        assert_eq!(wf.workflow_id, "wf_id_1");
+        assert_eq!(wf.task_queue, Some("default".to_string()));
+        assert_eq!(wf.worker_id, Some("worker_1".to_string()));
+        assert_eq!(wf.status, Status::Running);
+        assert_eq!(wf.activities.len(), 0);
+        assert!(wf.end_time.is_none());
+    }
+
+    #[test]
+    fn test_activity_history_creation_and_run() {
+        let mut activity = ActivityHistory::new(
+            "wf_id_1".to_string(),
+            "test_activity".to_string(),
+            "act_id_1".to_string(),
+            "default".to_string(),
+            Some(Payload::new(&"input")),
+            0,
+        );
+
+        assert_eq!(activity.activity_id, "act_id_1");
+        assert_eq!(activity.activity_type, "test_activity");
+        assert_eq!(activity.runs.len(), 0);
+
+        let run = ActivityRun::new(
+            "wf_id_1".to_string(),
+            "act_id_1".to_string(),
+            "run_id_1".to_string(),
+        );
+
+        activity.add_run(run.clone());
+        assert_eq!(activity.runs.len(), 1);
+        
+        // Test duplicate run addition
+        activity.add_run(run);
+        assert_eq!(activity.runs.len(), 1);
+
+        let retrieved_run = activity.get_run("run_id_1");
+        assert!(retrieved_run.is_some());
+        assert_eq!(retrieved_run.unwrap().status, Status::Running);
+    }
+
+    #[test]
+    fn test_activity_run_creation() {
+        let run = ActivityRun::new(
+            "wf_id_1".to_string(),
+            "act_id_1".to_string(),
+            "run_id_1".to_string(),
+        );
+
+        assert_eq!(run.workflow_id, "wf_id_1");
+        assert_eq!(run.activity_id, "act_id_1");
+        assert_eq!(run.run_id, "run_id_1");
+        assert_eq!(run.status, Status::Running);
+        assert!(run.end_time.is_none());
+        assert!(run.output.is_none());
+    }
+}
