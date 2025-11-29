@@ -1,3 +1,4 @@
+use chrono::Local;
 use futures::TryStreamExt;
 use immortal_lib::{
     immortal::{call_version, client_start_workflow_options_version},
@@ -215,41 +216,49 @@ impl CronManager {
             let job_payload = spec.job.clone();
             let schedule = spec.schedule.clone();
 
-            let job = Job::new_async("0 ".to_owned() + schedule.as_str(), move |uuid, _l| {
-                let immortal_client = Arc::clone(&immortal_client);
-                let job_payload = job_payload.clone();
-                println!("JOB ID: {:#?}", uuid);
-                Box::pin(async move {
-                    match job_payload {
-                        CronJob::Workflow(workflow_options) => match workflow_options {
-                            client_start_workflow_options_version::Version::V1(v1) => {
-                                let mut cli = immortal_client.lock().await;
-                                if let Err(e) = cli
-                                    .start_workflow_v1(v1.input, &v1.workflow_type, &v1.task_queue)
-                                    .await
-                                {
-                                    eprintln!("[cron workflow] error: {e:#?}");
+            let job = Job::new_async_tz(
+                "0 ".to_owned() + schedule.as_str(),
+                Local::now().timezone(),
+                move |uuid, _l| {
+                    let immortal_client = Arc::clone(&immortal_client);
+                    let job_payload = job_payload.clone();
+                    println!("JOB ID: {:#?}", uuid);
+                    Box::pin(async move {
+                        match job_payload {
+                            CronJob::Workflow(workflow_options) => match workflow_options {
+                                client_start_workflow_options_version::Version::V1(v1) => {
+                                    let mut cli = immortal_client.lock().await;
+                                    if let Err(e) = cli
+                                        .start_workflow_v1(
+                                            v1.input,
+                                            &v1.workflow_type,
+                                            &v1.task_queue,
+                                        )
+                                        .await
+                                    {
+                                        eprintln!("[cron workflow] error: {e:#?}");
+                                    }
                                 }
-                            }
-                        },
-                        CronJob::Call(call_options) => match call_options {
-                            call_version::Version::V1(v1) => {
-                                let mut cli = immortal_client.lock().await;
-                                if let Err(e) = cli
-                                    .call_async_v1(v1.input, &v1.call_type, &v1.task_queue)
-                                    .await
-                                {
-                                    println!("[cron workflow] error: {e:#?}");
+                            },
+                            CronJob::Call(call_options) => match call_options {
+                                call_version::Version::V1(v1) => {
+                                    let mut cli = immortal_client.lock().await;
+                                    if let Err(e) = cli
+                                        .call_async_v1(v1.input, &v1.call_type, &v1.task_queue)
+                                        .await
+                                    {
+                                        println!("[cron workflow] error: {e:#?}");
+                                    }
                                 }
+                            },
+                            CronJob::Notification(notify) => {
+                                // TODO: invoke your notify path
+                                let _ = notify; /* implement */
                             }
-                        },
-                        CronJob::Notification(notify) => {
-                            // TODO: invoke your notify path
-                            let _ = notify; /* implement */
                         }
-                    }
-                })
-            })?;
+                    })
+                },
+            )?;
 
             let id = self.sched.add(job).await?;
             self.installed.insert(spec.id.clone(), id);
