@@ -134,15 +134,14 @@ impl WorkflowHistoryMetadata {
     pub async fn store(&self, con: &mut MultiplexedConnection, store_children: bool) -> Result<()> {
         let wf_id = self.workflow_id.clone();
         let wf_meta = workflow_meta_key(&wf_id);
-
-        // if con.exists(&wf_meta).await? {
-        //     return Err(anyhow!("Workflow already exists"));
+        //
+        // if !con.exists(&wf_meta).await? {
+        //     let _: () = con
+        //         .lpush(format!("{WORKFLOW_BASE_REDIS_KEY}:workflow_index"), &wf_id)
+        //         .await?;
         // }
 
         // Add to workflow index (for pagination)
-        let _: () = con
-            .lpush(format!("{WORKFLOW_BASE_REDIS_KEY}:workflow_index"), &wf_id)
-            .await?;
 
         // Store workflow metadata hash (including status tag)
         // let args_metadata = self
@@ -266,7 +265,6 @@ impl WorkflowHistoryMetadata {
         worker_ids: Option<Vec<String>>,
         status: Option<Status>,
     ) -> Result<Vec<Self>> {
-
         let ids: Vec<String> =
             Self::get_all_workflow_ids(con, limit, offset, task_queues, worker_ids, status).await?;
         //
@@ -283,7 +281,6 @@ impl WorkflowHistoryMetadata {
                 workflows.push(wf);
             }
         }
-
 
         Ok(workflows)
     }
