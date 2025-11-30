@@ -2174,11 +2174,33 @@ impl Immortal for ImmortalService {
         loop {
             match &rx.recv().await {
                 Ok(x) => match x {
-                    Notification::WorkflowResult(id, _result) => {
+                    Notification::WorkflowResult(id, result) => {
                         if *id == workflow_id {
                             println!("workflow completed");
+                            let workflow_output = self.history.get_workflow_output(&result.workflow_id).await.unwrap();
+                            return Ok(Response::new(WorkflowResultVersion {
+                                version: Some(workflow_result_version::Version::V1(
+                                    immortal::WorkflowResultV1 {
+                                        workflow_id: result.workflow_id.clone(),
+                                        worker_id: result.worker_id.clone().unwrap(),
+                                        status: match result.status {
+                                            HistoryStatus::Completed => Some(immortal_lib::immortal::workflow_result_v1::Status::Completed(immortal_lib::immortal::Success {
+                                                result: workflow_output.map(|data| Payload {
+                                                    data,
+                                                    metadata: result.output.clone().unwrap().metadata.unwrap().clone()
+                                                }) 
+                                            })),
+                                            HistoryStatus::Failed => Some(immortal_lib::immortal::workflow_result_v1::Status::Failed(immortal_lib::immortal::Failure{
+                                                failure: workflow_output.map(|mut data| simd_json::from_slice::<immortal_lib::failure::Failure>(&mut data).unwrap()) 
+                                            })),
+                                            _ => None
+
+                                        },
+                                    },
+                                )),
+                            }));
                             // TODO
-                            return Err(tonic::Status::unimplemented(format!("lol")));
+                            // return Err(tonic::Status::unimplemented(format!("lol")));
                         }
                     }
                     _ => {}

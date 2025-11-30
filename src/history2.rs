@@ -365,6 +365,11 @@ impl History {
         set_blob_raw(&mut con, &workflow_output_key(&workflow_id), &output.data).await?;
         Ok(())
     }
+    pub async fn get_workflow_output(&self, workflow_id: &str) -> Result<Option<Vec<u8>>> {
+        let mut con = self.get_con().await?;
+
+         get_blob_raw::<Vec<u8>>(&mut con, &workflow_output_key(&workflow_id)).await
+    }
     // -------------------------------------------------------
     // update existing workflow (replace metadata + blobs + activities)
     // -------------------------------------------------------
