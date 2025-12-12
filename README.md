@@ -209,7 +209,10 @@ immortal:history:workflow:<wf_id>:activity:<activity_id>:runs    (bytes, Vec<Act
 
 ## Todo 
 
-[ ] Add better handling for truncated data
-[ ] Notification system 
-[ ] Scale system 
-[ ] Migrate from storing history as string and instead as json
+[X] Add better handling for truncated data
+[ ] Notification/Alert system 
+[ ] Auto-scaling system 
+[X] Migrate from storing history as string and instead as json
+[ ] Multi-tenancy
+[ ] Security (RBAC)
+[ ] HA (clustering) 

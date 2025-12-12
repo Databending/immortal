@@ -134,10 +134,12 @@ message ActivityResultV1 {
     Success completed = 3;
     Failure failed = 4;
     Cancellation cancelled = 5;
+    // maybe this should be it's own datatype
+    Failure timeout = 6;
     // WillCompleteAsync will_complete_async = 6;
   }
 
-  string workflow_id = 6;
+  string workflow_id = 7;
 }
 
 message ActivityResultVersion {
@@ -296,6 +298,7 @@ message ImmortalWorkerActionV1 {
     string kill_call = 8;
     string check_activity = 9;
     string check_workflow = 10;
+    string timeout_activity = 11;
   }
 }
 enum Level {

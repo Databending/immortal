@@ -106,7 +106,7 @@ use tonic::{Request, Response, Status, Streaming};
 pub mod api;
 pub mod cron;
 pub mod error;
-pub mod history;
+// pub mod history;
 pub mod history2;
 pub mod history3;
 pub mod metrics;
@@ -956,7 +956,7 @@ impl ImmortalService {
                                     .send(Ok(ImmortalWorkerActionVersion {
                                         version: Some(immortal_worker_action_version::Version::V1(
                                             ImmortalWorkerActionV1 {
-                                                action: Some(WorkerAction::KillActivity(
+                                                action: Some(WorkerAction::TimeoutActivity(
                                                     id.clone(),
                                                 )),
                                             },
@@ -2361,7 +2361,7 @@ impl Immortal for ImmortalService {
                         // }
                     }
 
-                    Some(immortal::activity_result_v1::Status::Failed(x)) => {
+                    Some(immortal::activity_result_v1::Status::Failed(x)) | Some(immortal::activity_result_v1::Status::Timeout(x)) => {
                         failed = true;
                         // Mark this run failed in history
                         run.status = HistoryStatus::Failed;
@@ -2380,7 +2380,8 @@ impl Immortal for ImmortalService {
                                 Status::internal("Error storing activity run output")
                             })?;
                         // Count attempts so far (all runs for this activity)
-                    }
+                    },
+
 
                     Some(immortal::activity_result_v1::Status::Cancelled(x)) => {
                         run.status = HistoryStatus::Failed;

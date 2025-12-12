@@ -368,7 +368,7 @@ impl History {
     pub async fn get_workflow_output(&self, workflow_id: &str) -> Result<Option<Vec<u8>>> {
         let mut con = self.get_con().await?;
 
-         get_blob_raw::<Vec<u8>>(&mut con, &workflow_output_key(&workflow_id)).await
+        get_blob_raw::<Vec<u8>>(&mut con, &workflow_output_key(&workflow_id)).await
     }
     // -------------------------------------------------------
     // update existing workflow (replace metadata + blobs + activities)
@@ -662,17 +662,37 @@ impl History {
             .lrange(workflow_activities_list_key(workflow_id), 0, -1)
             .await?;
 
+        println!("ACT IDS: {:?} - {workflow_id}.{activity_id}", act_ids);
+
         let index = act_ids.iter().position(|id| id == activity_id).unwrap_or(0);
 
-        if let Some(mut act) = self
-            .load_activity(&mut con, workflow_id, activity_id)
-            .await?
-        {
-            act.index = index;
-            Ok(Some(act))
-        } else {
-            Ok(None)
+        println!("{index}");
+
+        match self.load_activity(&mut con, workflow_id, activity_id).await {
+            Ok(act) => {
+                if let Some(mut act) = act {
+                    act.index = index;
+                    Ok(Some(act))
+                } else {
+                    println!("RETURNED BLANK");
+                    Ok(None)
+                }
+            }
+            Err(error) => {
+                println!("{} {}", error.backtrace(), error);
+                Ok(None)
+            }
         }
+
+        // if let Some(mut act) = self
+        //     .load_activity(&mut con, workflow_id, activity_id)
+        //     .await?
+        // {
+        //     act.index = index;
+        //     Ok(Some(act))
+        // } else {
+        //     Ok(None)
+        // }
     }
 
     // -------------------------------------------------------
@@ -737,6 +757,7 @@ impl History {
         let base = activity_base_key(workflow_id, activity_id);
 
         if !con.exists(&base).await? {
+            println!("COULD NOT FIND: {base}");
             return Ok(None);
         }
 
@@ -744,10 +765,11 @@ impl History {
             .await?
             .unwrap();
 
-        // let args: Option<Payload> =
-        //     get_blob(con, &activity_args_key(workflow_id, activity_id)).await?;
+        // WHAT I DID HEAR IS PRETTY HACKY AND MIGHT BIGHT MY ASS IN THE FUTURE 
+        // THE ISSUE IS THAT I DON'T STORE AN INPUT IF IT DOESN'T EXIST (history2.rs 718)
+        // TECHNICALLY THIS IS CORRECT THOUGH
         let input: Option<Payload> =
-            get_blob(con, &activity_input_key(workflow_id, activity_id)).await?;
+            get_blob(con, &activity_input_key(workflow_id, activity_id)).await.unwrap_or(None);
         // let output: Option<OwnedValue> =
         //     get_blob(con, &activity_output_key(workflow_id, activity_id)).await?;
 
@@ -874,7 +896,10 @@ pub async fn get_blob<T: DeserializeOwned>(
     })
 }
 
-pub async fn get_blob_raw<T: FromRedisValue>(con: &mut MultiplexedConnection, key: &str) -> Result<Option<T>> {
+pub async fn get_blob_raw<T: FromRedisValue>(
+    con: &mut MultiplexedConnection,
+    key: &str,
+) -> Result<Option<T>> {
     let bytes: Option<T> = con.get(key).await?;
     Ok(match bytes {
         None => None,
@@ -889,7 +914,7 @@ pub fn payload_to_blob_ref(path: String, payload: &Payload) -> BlobRef {
         size: payload.data.len(),
         present: true,
         loaded: false,
-        metadata: Some(payload.metadata.clone())
+        metadata: Some(payload.metadata.clone()),
     }
 }
 
@@ -1123,7 +1148,7 @@ mod tests {
 
         activity.add_run(run.clone());
         assert_eq!(activity.runs.len(), 1);
-        
+
         // Test duplicate run addition
         activity.add_run(run);
         assert_eq!(activity.runs.len(), 1);

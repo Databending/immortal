@@ -96,6 +96,7 @@ impl WfContext {
             Ok(activity_result) => match activity_result.into_inner().version {
                 Some(activity_result_version::Version::V1(x)) => match x.status {
                     Some(Status::Failed(x)) => Err(anyhow!("{:#?}", x)),
+                    Some(Status::Timeout(x)) => Err(anyhow!("{:#?}", x)),
                     Some(Status::Cancelled(x)) => Err(anyhow!("{:#?}", x)),
                     Some(Status::Completed(y)) => {
                         match y.result {

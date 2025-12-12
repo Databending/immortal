@@ -464,7 +464,11 @@ impl Worker {
                     }
                     Some(Action::KillActivity(activity_id)) => {
                         println!("received kill activity");
-                        self.kill_activity(&activity_id).await;
+                        self.kill_activity(&activity_id, false).await;
+                    }
+                    Some(Action::TimeoutActivity(activity_id)) => {
+                        println!("received timeout activity");
+                        self.kill_activity(&activity_id, true).await;
                     }
                     Some(Action::KillCall(call_id)) => {
                         self.kill_call(&call_id).await;
@@ -1009,6 +1013,7 @@ impl Worker {
                 match activity_result.into_inner().version {
                     Some(activity_result_version::Version::V1(x)) => match x.status {
                         Some(activity_result_v1::Status::Failed(x)) => Err(anyhow!("{:#?}", x)),
+                        Some(activity_result_v1::Status::Timeout(x)) => Err(anyhow!("{:#?}", x)),
                         Some(activity_result_v1::Status::Cancelled(x)) => Err(anyhow!("{:#?}", x)),
                         Some(activity_result_v1::Status::Completed(y)) => {
                             Ok(simd_json::from_slice(
@@ -1216,7 +1221,7 @@ impl Worker {
         }
     }
 
-    pub async fn kill_activity(&mut self, activity_id: &str) {
+    pub async fn kill_activity(&mut self, activity_id: &str, timeout: bool) {
         let mut running_activities = self.running_activities.lock().await;
         if let Some(running_activity) = running_activities.remove(activity_id) {
             // 1) Abort the running task
@@ -1227,7 +1232,10 @@ impl Worker {
                 running_activity.workflow_id.clone(),
                 running_activity.activity_id.clone(),
                 running_activity.run_id.clone(),
-                Err(ActivityError::Cancelled { details: None }),
+                match timeout {
+                    true => Err(ActivityError::Retryable { source: anyhow!("Activity Timeout"), explicit_delay: None }),
+                    false => Err(ActivityError::Cancelled { details: None })
+                },
             ));
         } else {
             println!("COULD NOT FIND ACTIVITY: {activity_id}")

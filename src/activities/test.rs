@@ -25,9 +25,10 @@ pub struct ActivityOutput {
 pub async fn hs_tariff_sync(_ctx: ActContext, _payload: WorkflowPayload) -> Result<ActivityOutput, ActivityError> {
     
 
-    for x in 0..50 {
+    info!("Hello from the test activity!");
+    for _x in 0..50 {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        info!("Hello from the test activity! ({x})");
+        // info!("Hello from the test activity! ({x})");
     }
     // let activity_data: &ActivityData = ctx.app_data().unwrap();
     Ok(ActivityOutput {

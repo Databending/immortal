@@ -4,10 +4,7 @@ use crate::history3::{WorkflowHistoryMetadata, WorkflowHistoryMetadataVersion};
 use crate::state::AppState;
 use crate::utils::log::fetch_log_history_from_redis;
 use crate::ws::FetchLogs;
-use crate::{
-    history::{ActivityHistory, Status, WorkflowHistory, WorkflowHistoryVersion},
-    ActivitySchema, WfSchema,
-};
+use crate::{ActivitySchema, WfSchema};
 use axum::extract::Path;
 use axum::http::header;
 use axum::{
@@ -16,7 +13,6 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use o2o::o2o;
 use serde::{Deserialize, Serialize};
 // use serde_json::Value;
 use simd_json::OwnedValue;
@@ -48,40 +44,6 @@ pub struct HistoryFilter {
 pub struct BlobRef {
     path: String,
     encode: Option<bool>,
-}
-
-#[derive(o2o, Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "version", content = "spec")]
-#[from_owned(WorkflowHistoryVersion)]
-enum ApiWorkflowHistoryVersion {
-    V1(#[from(~.into())] ApiWorkflowHistory),
-}
-
-#[derive(o2o, Debug, Clone, Serialize, Deserialize)]
-#[from_owned(WorkflowHistory)]
-struct ApiWorkflowHistory {
-    pub args: Vec<OwnedValue>,
-    pub workflow_id: String,
-    pub workflow_type: String,
-    #[from(~.into())]
-    pub status: ApiStatus,
-    pub activities: Vec<ActivityHistory>,
-    pub start_time: DateTime<Utc>,
-    pub end_time: Option<DateTime<Utc>>,
-    pub task_queue: Option<String>,
-    pub worker_id: Option<String>,
-    // pub status: Status,
-}
-
-#[derive(o2o, Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", content = "spec")]
-#[from_owned(Status)]
-pub enum ApiStatus {
-    Running,
-    // #[serde(with = "serde_bytes")]
-    Completed(OwnedValue),
-    // Completed(#[from(simd_json::from_str::<OwnedValue>(&mut ~.clone()).unwrap().clone())] OwnedValue),
-    Failed(String),
 }
 
 pub async fn delete_history(
@@ -175,7 +137,10 @@ pub async fn download_blob_ref(
             .unwrap();
 
         let headers = [
-            (header::CONTENT_TYPE, "application/octet-stream; charset=utf-8"),
+            (
+                header::CONTENT_TYPE,
+                "application/octet-stream; charset=utf-8",
+            ),
             (
                 header::CONTENT_DISPOSITION,
                 "attachment; filename=\"blob_ref\"",
