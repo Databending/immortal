@@ -1,9 +1,9 @@
-use crate::history2::{
+use crate::history::{
     activity_base_key, activity_input_key, activity_runs_list_key, get_blob_ref, run_base_key,
     run_output_blob_key, workflow_activities_list_key, workflow_meta_key, workflow_output_key,
     ActivityHistory, ActivityRun, Status, WorkflowHistory,
 };
-use crate::history2::{workflow_args_key, BlobRef};
+use crate::history::{workflow_args_key, BlobRef};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use const_format::formatcp;

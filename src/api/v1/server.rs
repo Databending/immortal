@@ -1,6 +1,6 @@
 use crate::error::AppError;
-use crate::history2::{get_blob_raw, Status as Status2};
-use crate::history3::{WorkflowHistoryMetadata, WorkflowHistoryMetadataVersion};
+use crate::history::{get_blob_raw, Status as Status2};
+use crate::history_metadata::{WorkflowHistoryMetadata, WorkflowHistoryMetadataVersion};
 use crate::state::AppState;
 use crate::utils::log::fetch_log_history_from_redis;
 use crate::ws::FetchLogs;

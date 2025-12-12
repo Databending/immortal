@@ -21,7 +21,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::history2::WorkflowHistoryVersion;
+use crate::history::WorkflowHistoryVersion;
 use crate::metrics::IdentifiableMetrics;
 use crate::{ImmortalService, Notification};
 use redis::streams::{StreamId, StreamKey, StreamReadOptions, StreamReadReply};

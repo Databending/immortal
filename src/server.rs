@@ -24,7 +24,7 @@ use axum;
 use dotenvy::dotenv;
 // use history::Status as HistoryStatus;
 // use history::{ActivityHistory, ActivityRun, History, WorkflowHistory};
-use history2::{ActivityHistory, ActivityRun, History, Status as HistoryStatus, WorkflowHistory};
+use history::{ActivityHistory, ActivityRun, History, Status as HistoryStatus, WorkflowHistory};
 // use immortal_lib::common;
 use immortal_lib::common::Payload;
 use immortal_lib::failure;
@@ -84,14 +84,10 @@ use uuid::Uuid;
 
 use crate::cron::start_watcher;
 use crate::cron::CronManager;
-use crate::history2::get_blob_raw;
-use crate::history2::payload_to_blob_ref;
-use crate::history2::run_output_blob_key;
-// use crate::history::WorkflowHistoryVersion;
-use crate::history2::workflow_output_key;
-use crate::history3::ActivityHistoryMetadata;
+use crate::history::{get_blob_raw, payload_to_blob_ref, run_output_blob_key, workflow_output_key};
+
+use crate::history_metadata::{ActivityHistoryMetadata, WorkflowHistoryMetadata};
 // use crate::history3::ActivityRunHistoryMetadata;
-use crate::history3::WorkflowHistoryMetadata;
 use crate::metrics::IdentifiableMetrics;
 use crate::state::AppState;
 use crate::state::JwtPublicBytes;
@@ -106,9 +102,8 @@ use tonic::{Request, Response, Status, Streaming};
 pub mod api;
 pub mod cron;
 pub mod error;
-// pub mod history;
-pub mod history2;
-pub mod history3;
+pub mod history;
+pub mod history_metadata;
 pub mod metrics;
 pub mod models;
 pub mod state;
@@ -2632,7 +2627,7 @@ impl Immortal for ImmortalService {
                     Some(result_data) => {
                         // let mut x = result_data.data.clone();
                         workflow.status = HistoryStatus::Completed;
-                        workflow.output = Some(history2::BlobRef {
+                        workflow.output = Some(history::BlobRef {
                             path: workflow_output_key(&workflow_id),
                             size: result_data.data.len(),
                             present: true,
@@ -2660,7 +2655,7 @@ impl Immortal for ImmortalService {
                         });
                         let data = simd_json::to_vec(&error_message_json).unwrap();
                         workflow.status = HistoryStatus::Failed;
-                        workflow.output = Some(history2::BlobRef {
+                        workflow.output = Some(history::BlobRef {
                             path: workflow_output_key(&workflow_id),
                             size: data.len(),
                             present: true,
@@ -2689,7 +2684,7 @@ impl Immortal for ImmortalService {
             Some(workflow_result_v1::Status::Failed(x)) => {
                 let data = simd_json::to_vec(&x).unwrap();
                 workflow.status = HistoryStatus::Failed;
-                workflow.output = Some(history2::BlobRef {
+                workflow.output = Some(history::BlobRef {
                     path: workflow_output_key(&workflow_id),
                     size: data.len(),
                     present: true,
@@ -2714,7 +2709,7 @@ impl Immortal for ImmortalService {
             Some(workflow_result_v1::Status::Cancelled(x)) => {
                 let data = simd_json::to_vec(&x).unwrap();
                 workflow.status = HistoryStatus::Failed;
-                workflow.output = Some(history2::BlobRef {
+                workflow.output = Some(history::BlobRef {
                     path: workflow_output_key(&workflow_id),
                     size: data.len(),
                     present: true,
@@ -2735,7 +2730,7 @@ impl Immortal for ImmortalService {
                 let data = simd_json::to_vec(&error_message_json).unwrap();
                 workflow.status = HistoryStatus::Failed;
                 // workflow.output_metadata = Some(HashMap::new());
-                workflow.output = Some(history2::BlobRef {
+                workflow.output = Some(history::BlobRef {
                     path: workflow_output_key(&workflow_id),
                     size: data.len(),
                     present: true,

@@ -15,9 +15,9 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use strum::{AsRefStr, EnumString};
 use uuid::Uuid;
 
-use crate::history3::ActivityHistoryMetadata;
-use crate::history3::ActivityRunHistoryMetadata;
-use crate::history3::WorkflowHistoryMetadata;
+use crate::history_metadata::{
+    ActivityHistoryMetadata, ActivityRunHistoryMetadata, WorkflowHistoryMetadata,
+};
 
 // STRUCTS
 
@@ -765,11 +765,12 @@ impl History {
             .await?
             .unwrap();
 
-        // WHAT I DID HEAR IS PRETTY HACKY AND MIGHT BIGHT MY ASS IN THE FUTURE 
+        // WHAT I DID HEAR IS PRETTY HACKY AND MIGHT BIGHT MY ASS IN THE FUTURE
         // THE ISSUE IS THAT I DON'T STORE AN INPUT IF IT DOESN'T EXIST (history2.rs 718)
         // TECHNICALLY THIS IS CORRECT THOUGH
-        let input: Option<Payload> =
-            get_blob(con, &activity_input_key(workflow_id, activity_id)).await.unwrap_or(None);
+        let input: Option<Payload> = get_blob(con, &activity_input_key(workflow_id, activity_id))
+            .await
+            .unwrap_or(None);
         // let output: Option<OwnedValue> =
         //     get_blob(con, &activity_output_key(workflow_id, activity_id)).await?;
 
