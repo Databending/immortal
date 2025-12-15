@@ -1,4 +1,7 @@
 use immortal_lib::common::Payloads;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
+
 use immortal_lib::immortal::ActivityCache;
 // use redis::RedisError;
 use socketioxide::SocketIo;
@@ -73,7 +76,7 @@ use tonic::transport::Server;
 // use tonic_health::server::HealthReporter;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
-use tracing::error;
+use tracing::{info, error};
 // use tracing_subscriber::FmtSubscriber;
 use uuid::Uuid;
 // use immortal::immortal_s
@@ -959,7 +962,7 @@ impl ImmortalService {
                                     }))
                                     .await
                                 {
-                                    println!("{:#?}", e);
+                                    error!("{:#?}", e);
 
                                     //running_calls.write().await.remove(id);
                                 }
@@ -1144,9 +1147,9 @@ impl ImmortalService {
                                 //    }
                                 //
                                 // }
-                                eprintln!("Failed to send call to worker {}: {:#?}", worker.0, e);
+                                error!("Failed to send call to worker {}: {:#?}", worker.0, e);
                                 //TODO: need to go ahead, check the error, and then act accordingly
-                                println!("{:#?}", available_workers);
+                                info!("{:#?}", available_workers);
                             } else {
                                 // Remove the item from the actual call queue (not the snapshot)
                                 {
@@ -1237,7 +1240,7 @@ impl ImmortalService {
                                         },
                                     )),
                                 }) {
-                                    eprintln!("{:#?}", e);
+                                    error!("{:#?}", e);
                                 }
                                 continue;
                             }
@@ -1335,7 +1338,7 @@ impl ImmortalService {
                                         )
                                         .await
                                     {
-                                        eprintln!(
+                                        error!(
                                             "Failed to append run to existing activity: {:?}",
                                             e
                                         );
@@ -1364,11 +1367,10 @@ impl ImmortalService {
                                         )
                                         .await
                                     {
-                                        eprintln!("Failed to add activity to history: {:?}", e);
+                                        error!("Failed to add activity to history: {:?}", e);
                                     }
                                 }
                             }
-                            println!("added activity history");
                             if let Err(e) = worker
                                 .1
                                 .send(Ok(ImmortalWorkerActionVersion {
@@ -1394,7 +1396,7 @@ impl ImmortalService {
                                 }))
                                 .await
                             {
-                                eprintln!("Failed to send StartActivity to worker: {:#?}", e);
+                                error!("Failed to send StartActivity to worker: {:#?}", e);
                                 continue;
                             }
 
@@ -1410,7 +1412,7 @@ impl ImmortalService {
                                 Uuid::parse_str(&activity_options.workflow_id).unwrap_or_default(),
                                 activity_history,
                             )) {
-                                eprintln!("Failed to send notification: {:?}", e);
+                                error!("Failed to send notification: {:?}", e);
                             }
                         } else {
                             queue.push_front(Box::new((
@@ -1537,7 +1539,7 @@ impl ImmortalService {
                             );
 
                             if let Err(e) = history.add_workflow(workflow_history.clone()).await {
-                                eprintln!("Failed to add workflow to history: {:?}", e);
+                                error!("Failed to add workflow to history: {:?}", e);
                             }
 
                             // Send to worker
@@ -1565,7 +1567,7 @@ impl ImmortalService {
                                 }))
                                 .await
                             {
-                                eprintln!("Failed to send workflow to worker: {:#?}", e);
+                                error!("Failed to send workflow to worker: {:#?}", e);
                                 continue;
                             }
                             Self::adjust_capacity(
@@ -1580,7 +1582,7 @@ impl ImmortalService {
                                 Uuid::parse_str(&workflow_id).unwrap_or_default(),
                                 workflow_history,
                             )) {
-                                eprintln!("Failed to send workflow notification: {:?}", e);
+                                error!("Failed to send workflow notification: {:?}", e);
                             }
 
                             //break;
@@ -1861,7 +1863,7 @@ impl Immortal for ImmortalService {
                                 }))
                                 .await
                             {
-                                eprintln!("Failed to send workflow notification: {:?}", e);
+                                error!("Failed to send workflow notification: {:?}", e);
                             }
                         }
                     }
@@ -1978,9 +1980,9 @@ impl Immortal for ImmortalService {
                                                 metadata = meta_str;
                                                 items.push(("metadata", &metadata));
                                             }
-                                            Err(e) => eprintln!("Error serializing JSON: {}", e),
+                                            Err(e) => error!("Error serializing JSON: {}", e),
                                         },
-                                        Err(e) => eprintln!("Error parsing metadata: {}", e),
+                                        Err(e) => error!("Error parsing metadata: {}", e),
                                     }
                                 }
                                 match log.activity_id.as_ref() {
@@ -2018,16 +2020,16 @@ impl Immortal for ImmortalService {
                                             )
                                             .await
                                         {
-                                            eprintln!("Error appending to logs: {}", e);
+                                            error!("Error appending to logs: {}", e);
                                         }
                                         // TODO: don't ignore this
                                         if let Err(e) = con.expire::<&str, ()>(&key, 259_200).await
                                         {
-                                            eprintln!("Error setting exp for logs: {}", e);
+                                            error!("Error setting exp for logs: {}", e);
                                         }
                                     }
                                     Err(e) => {
-                                        eprintln!("Error getting Redis connection: {}", e);
+                                        error!("Error getting Redis connection: {}", e);
                                     }
                                 }
                             }
@@ -2240,7 +2242,7 @@ impl Immortal for ImmortalService {
                 println!("activity_id {:?}", activity_result.activity_id);
 
                 let mut con = self.history.get_con().await.map_err(|e| {
-                    eprintln!("Error fetching redis connection: {:?}", e);
+                    error!("Error fetching redis connection: {:?}", e);
                     Status::internal("Failed to fetch redis connection")
                 })?;
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -2261,14 +2263,14 @@ impl Immortal for ImmortalService {
                 )
                 .await
                 .map_err(|e| {
-                    eprintln!("Error fetching activity: {:?}", e);
+                    error!("Error fetching activity: {:?}", e);
                     Status::internal("Failed to fetch activity history")
                 })?;
 
                 let mut activity = match activity_opt {
                     Some(a) => a,
                     None => {
-                        eprintln!("Activity history not found for completed activity");
+                        error!("Activity history not found for completed activity");
                         return Err(Status::not_found("Activity history not found"));
                     }
                 };
@@ -2281,7 +2283,7 @@ impl Immortal for ImmortalService {
                 {
                     Some(r) => r,
                     None => {
-                        eprintln!(
+                        error!(
                             "Run ID {} not found in activity history",
                             activity_result.activity_run_id
                         );
@@ -2316,7 +2318,7 @@ impl Immortal for ImmortalService {
                                     )
                                     .await
                                     .map_err(|e| {
-                                        eprintln!("Error storing activity run output: {:?}", e);
+                                        error!("Error storing activity run output: {:?}", e);
                                         Status::internal("Error storing activity run output")
                                     })?;
                                 run.output = Some(payload_to_blob_ref(run_path, &result_data));
@@ -2341,7 +2343,7 @@ impl Immortal for ImmortalService {
                                     )
                                     .await
                                     .map_err(|e| {
-                                        eprintln!("Error storing activity run output: {:?}", e);
+                                        error!("Error storing activity run output: {:?}", e);
                                         Status::internal("Error storing activity run output")
                                     })?;
                             }
@@ -2371,7 +2373,7 @@ impl Immortal for ImmortalService {
                             )
                             .await
                             .map_err(|e| {
-                                eprintln!("Error storing activity run output: {:?}", e);
+                                error!("Error storing activity run output: {:?}", e);
                                 Status::internal("Error storing activity run output")
                             })?;
                         // Count attempts so far (all runs for this activity)
@@ -2391,7 +2393,7 @@ impl Immortal for ImmortalService {
                             )
                             .await
                             .map_err(|e| {
-                                eprintln!("Error storing activity run output: {:?}", e);
+                                error!("Error storing activity run output: {:?}", e);
                                 Status::internal("Error storing activity run output")
                             })?;
                         // (No retry on cancelled by default; tweak if you want)
@@ -2417,7 +2419,7 @@ impl Immortal for ImmortalService {
                             )
                             .await
                             .map_err(|e| {
-                                eprintln!("Error storing activity run output: {:?}", e);
+                                error!("Error storing activity run output: {:?}", e);
                                 Status::internal("Error storing activity run output")
                             })?;
                     }
@@ -2434,7 +2436,7 @@ impl Immortal for ImmortalService {
                 )
                 .await
                 .map_err(|e| {
-                    eprintln!("Error storing activity run metadata: {:?}", e);
+                    error!("Error storing activity run metadata: {:?}", e);
                     Status::internal("Error storing activity run metadata")
                 })?;
                 let attempts = activity.runs.len(); // includes this failed run
@@ -2445,7 +2447,7 @@ impl Immortal for ImmortalService {
                         .notification_tx
                         .send(Notification::ActivityRunCompleted(id, activity.clone()))
                     {
-                        eprintln!("Error sending ActivityRunCompleted notification: {:?}", e);
+                        error!("Error sending ActivityRunCompleted notification: {:?}", e);
                     }
                 }
                 // if let Err(e) = self
@@ -2495,7 +2497,7 @@ impl Immortal for ImmortalService {
                             // let _ = self.notification_tx.send(Notification::ActivityRunStarted(...));
                         }
                         Err(err) => {
-                            eprintln!("Could not build retry options: {:?}", err);
+                            error!("Could not build retry options: {:?}", err);
                             // fall through: no retry ⇒ final failure (we already marked run as failed)
                         }
                     }
@@ -2516,10 +2518,10 @@ impl Immortal for ImmortalService {
                         // IN THIS CASE. WHEN WE RETRY THE ACTIVITY. WE DON'T WANT TO INFORM THE WORKER
                         // JUST YET. I WILL ADD A BOOL CALLED INFORM_WORKER
                         if let Err(e) = tx.send(activity_result) {
-                            eprintln!("Failed to send activity result: {:?}", e);
+                            error!("Failed to send activity result: {:?}", e);
                         }
                     } else {
-                        eprintln!("Worker {} not found", worker_id);
+                        error!("Worker {} not found", worker_id);
                     }
                 }
 
@@ -2874,6 +2876,20 @@ impl Immortal for ImmortalService {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
+      let _guard = sentry::init(("https://961020bbea942af57e22b66f1825355b@o4510499360014336.ingest.us.sentry.io/4510540688588800", sentry::ClientOptions {
+    release: sentry::release_name!(),
+    // Capture user IPs and potentially sensitive headers when using HTTP server integrations
+    // see https://docs.sentry.io/platforms/rust/data-management/data-collected for more info
+    send_default_pii: true,
+    ..Default::default()
+  }));
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(sentry::integrations::tracing::layer())
+        .init();
     // tracing::subscriber::set_global_default(FmtSubscriber::default())?;
     let addr = "0.0.0.0:10000".parse().unwrap();
 
@@ -3001,6 +3017,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+
 
     Server::builder()
         .add_service(svc)
