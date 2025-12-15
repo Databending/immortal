@@ -241,6 +241,7 @@ struct CallProperties {
 #[derive(Debug, Clone, Serialize)]
 struct ActivityProperties {
     pub workflow_id: String,
+    pub latest_run_id: String,
     pub index: usize,
     pub last_heartbeat: DateTime<Utc>,
     pub scheduled: DateTime<Utc>,
@@ -431,6 +432,8 @@ async fn rehydrate_activity_if_absent(
                 worker_id: worker_id.to_string(),
                 heartbeat_timeout: Duration::seconds(30),
                 additional_properties: ActivityProperties {
+                    // not sure if this is correct
+                    latest_run_id: activity.runs.get(activity.runs.len() - 1).unwrap().run_id.to_string(), 
                     index: activity.index,
                     workflow_id: workflow_id.to_string(),
                     last_heartbeat: now,
@@ -935,7 +938,8 @@ impl ImmortalService {
         tokio::spawn(async move {
             loop {
                 {
-                    let mut activities_to_remove = vec![];
+                    // let mut activities_to_remove = vec![];
+                    let mut activities_to_force_remove = vec![];
 
                     for (id, running_activity) in running_activities.read().await.iter() {
                         let now = Utc::now();
@@ -962,12 +966,11 @@ impl ImmortalService {
                                     }))
                                     .await
                                 {
-                                    error!("{:#?}", e);
-
+                                    error!("FORCE REMOVING ACTIVITY: {:#?}", e);
+                                    activities_to_force_remove.push(id.clone());
                                     //running_calls.write().await.remove(id);
                                 }
                                 println!("killing activity");
-                                activities_to_remove.push(id.clone());
                             }
                             // kill it
                         }
@@ -979,36 +982,36 @@ impl ImmortalService {
                     // we have another worker that joins, tries to grab the same name, the server
                     // will think that this is the same worker, and not the old worker
                     // reconnecting.
-                    // if activities_to_remove.len() > 0 {
-                    //     let mut running_activities = running_activities.write().await;
-                    //     for activity_to_remove in activities_to_remove {
-                    //         if let Some(running_activity) =
-                    //             running_activities.remove(&activity_to_remove)
-                    //         {
-                    //             let (_worker_id, tx, props) = *running_activity;
-                    //             // this is also weird that this does not work. This should
-                    //             // technically remove the activity. Unless the worker cannot find
-                    //             // it inside reunning activities
-                    //             if let Err(e) = tx.send(ActivityResultV1 {
-                    //                 activity_id: activity_to_remove.clone(),
-                    //
-                    //                 workflow_id: props.additional_properties.workflow_id.clone(),
-                    //                 activity_run_id: "0".to_string(),
-                    //
-                    //                 status: Some(immortal::activity_result_v1::Status::Failed(
-                    //                     immortal::Failure {
-                    //                         failure: Some(failure::Failure {
-                    //                             message: "timeout".to_string(),
-                    //                             ..Default::default()
-                    //                         }),
-                    //                     },
-                    //                 )),
-                    //             }) {
-                    //                 println!("{:#?}", e);
-                    //             }
-                    //         }
-                    //     }
-                    // }
+                    if activities_to_force_remove.len() > 0 {
+                        let mut running_activities = running_activities.write().await;
+                        for activity_to_remove in activities_to_force_remove {
+                            if let Some(running_activity) =
+                                running_activities.remove(&activity_to_remove)
+                            {
+                                let (_worker_id, tx, props) = *running_activity;
+                                // this is also weird that this does not work. This should
+                                // technically remove the activity. Unless the worker cannot find
+                                // it inside reunning activities
+                                if let Err(e) = tx.send(ActivityResultV1 {
+                                    activity_id: activity_to_remove.clone(),
+
+                                    workflow_id: props.additional_properties.workflow_id.clone(),
+                                    activity_run_id: props.additional_properties.latest_run_id.clone(),
+
+                                    status: Some(immortal::activity_result_v1::Status::Timeout(
+                                        immortal::Failure {
+                                            failure: Some(failure::Failure {
+                                                message: "timeout (forced)".to_string(),
+                                                ..Default::default()
+                                            }),
+                                        },
+                                    )),
+                                }) {
+                                    error!("{:#?}", e);
+                                }
+                            }
+                        }
+                    }
                     for (id, running_call) in running_calls.read().await.clone().iter() {
                         let now = Utc::now();
                         let max_time = running_call.1.timeout;
@@ -1294,6 +1297,8 @@ impl ImmortalService {
                                             .map(|f| f.into())
                                             .unwrap_or(Duration::seconds(30)),
                                         additional_properties: ActivityProperties {
+                                            // not sure this is right but we'll see
+                                            latest_run_id: "0".to_string(), 
                                             workflow_id: activity_options.workflow_id.clone(),
                                             last_heartbeat: now,
                                             scheduled: now.clone(),
