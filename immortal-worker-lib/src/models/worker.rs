@@ -1,6 +1,6 @@
 use anyhow::{Error, anyhow};
 use async_stream::stream;
-use schemars::schema::RootSchema;
+use schemars::Schema;
 use schemars::schema_for;
 use simd_json::{OwnedValue, json};
 use std::collections::VecDeque;
@@ -317,7 +317,7 @@ impl Worker {
         &mut self,
         workflow_type: impl Into<String>,
         wf_function: impl Into<WorkflowFunction>,
-        schema: (Vec<RootSchema>, RootSchema),
+        schema: (Vec<Schema>, Schema),
     ) {
         let mut registered_workflows = self.registered_workflows.lock().await;
         registered_workflows.insert(

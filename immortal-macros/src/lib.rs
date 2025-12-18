@@ -132,7 +132,7 @@ pub fn wf(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
 
     use schemars::schema_for;
-    use schemars::schema::RootSchema;
+    use schemars::Schema;
             // Original function
             #input
 
@@ -147,7 +147,7 @@ pub fn wf(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 let result = #fn_name(ctx, #(#arg_mappings_1),*).await;
                 result
             }
-            pub fn wf_schema() -> (Vec<schemars::schema::RootSchema>, schemars::schema::RootSchema) {
+            pub fn wf_schema() -> (Vec<schemars::Schema>, schemars::Schema) {
                 (vec![#(#arg_mappings_2),*], schema_for!(#out))
             }
         };
