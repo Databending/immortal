@@ -43,6 +43,7 @@ impl WorkflowHistoryMetadata {
     pub async fn get_opt(
         con: &mut MultiplexedConnection,
         workflow_id: &str,
+        full: bool,
     ) -> Result<Option<Self>> {
         let wf_meta = workflow_meta_key(workflow_id);
         let meta_val: redis::Value = redis::cmd("HGETALL")
@@ -104,15 +105,21 @@ impl WorkflowHistoryMetadata {
         let act_ids: Vec<String> = con
             .lrange(workflow_activities_list_key(workflow_id), 0, -1)
             .await?;
-        let mut activities = Vec::with_capacity(act_ids.len());
+        let mut activities;
+        if full {
+            activities = Vec::with_capacity(act_ids.len());
 
-        for (idx, act_id) in act_ids.into_iter().enumerate() {
-            if let Some(mut act) =
-                ActivityHistoryMetadata::get_opt(con, workflow_id, &act_id).await?
-            {
-                act.index = idx;
-                activities.push(act);
+            for (idx, act_id) in act_ids.into_iter().enumerate() {
+                if let Some(mut act) =
+                    ActivityHistoryMetadata::get_opt(con, workflow_id, &act_id).await?
+                {
+                    act.index = idx;
+                    activities.push(act);
+                }
             }
+        } else {
+
+            activities = vec![];
         }
 
         Ok(Some(Self {
@@ -264,6 +271,7 @@ impl WorkflowHistoryMetadata {
         task_queues: Option<Vec<String>>,
         worker_ids: Option<Vec<String>>,
         status: Option<Status>,
+        full: bool
     ) -> Result<Vec<Self>> {
         let ids: Vec<String> =
             Self::get_all_workflow_ids(con, limit, offset, task_queues, worker_ids, status).await?;
@@ -277,7 +285,7 @@ impl WorkflowHistoryMetadata {
 
         let mut workflows = vec![];
         for wf_id in ids {
-            if let Some(wf) = Self::get_opt(con, &wf_id).await? {
+            if let Some(wf) = Self::get_opt(con, &wf_id, full).await? {
                 workflows.push(wf);
             }
         }

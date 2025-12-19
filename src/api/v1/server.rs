@@ -151,6 +151,26 @@ pub async fn download_blob_ref(
     }
 }
 
+pub async fn get_wf_history(
+    State(state): State<AppState>,
+    Path(workflow_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let mut con = state.immortal_service.history.get_con().await.unwrap();
+    match WorkflowHistoryMetadata::get_opt(&mut con, &workflow_id.to_string(), true).await {
+        Ok(history) => {
+            // let mut api_histories: Vec<ApiWorkflowHistoryVersion> = vec![];
+            // for x in history {
+            //     api_histories.push(x.into());
+            // }
+            Json(history.map(|f| WorkflowHistoryMetadataVersion::V1(f)))
+        }
+        Err(e) => {
+            println!("{}", e);
+            Json(None)
+        }
+    }
+}
+
 pub async fn get_history(
     State(state): State<AppState>,
 
@@ -169,6 +189,7 @@ pub async fn get_history(
             .worker_ids
             .map(|f| f.split(",").map(|f| f.to_string()).collect()),
         params.status,
+        false,
     )
     .await
     {

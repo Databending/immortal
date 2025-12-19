@@ -23,6 +23,7 @@ pub fn router() -> Router<AppState> {
         .route("/history/blob/download", get(server::download_blob_ref))
         .route("/logs", post(server::get_logs))
         .route("/history/{id}", delete(server::delete_history))
+        .route("/history/{id}", get(server::get_wf_history))
         .route("/workers", get(server::get_workers))
         .route("/crons", get(cron::get_crons))
         .route("/crons", post(cron::create_cron))

@@ -1844,6 +1844,7 @@ dependencies = [
  "immortal-lib",
  "immortal-macros",
  "schemars 1.1.0",
+ "sentry",
  "serde",
  "simd-json",
  "sysinfo",

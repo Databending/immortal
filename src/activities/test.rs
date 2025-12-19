@@ -26,9 +26,11 @@ pub async fn hs_tariff_sync(_ctx: ActContext, _payload: WorkflowPayload) -> Resu
     
 
     info!("Hello from the test activity!");
-    for _x in 0..50 {
+    for x in 0..50 {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        // info!("Hello from the test activity! ({x})");
+
+        // panic!("test");
+        info!("Hello from the test activity! ({x})");
     }
     // let activity_data: &ActivityData = ctx.app_data().unwrap();
     Ok(ActivityOutput {

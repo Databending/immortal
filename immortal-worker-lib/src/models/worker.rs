@@ -14,6 +14,7 @@ use tokio::sync::{
 };
 use tokio::sync::{RwLock, watch};
 use tonic::transport::Channel;
+use tracing::error;
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id};
 use tracing::{Event, Subscriber};
@@ -282,6 +283,7 @@ impl Worker {
         let subscriber = Registry::default()
             .with(channel_layer)
             .with(tracing_subscriber::fmt::Layer::default())
+            .with(sentry::integrations::tracing::layer())
             .with(EnvFilter::from_default_env());
         tracing::subscriber::set_global_default(subscriber)
             .expect("Failed to set global subscriber");
@@ -477,7 +479,10 @@ impl Worker {
                         self.start_workflow_v1(&workflow).await;
                     }
                     Some(Action::StartActivity(activity)) => {
-                        println!("received start acitivity: run_id: {}", activity.activity_run_id);
+                        println!(
+                            "received start acitivity: run_id: {}",
+                            activity.activity_run_id
+                        );
                         self.start_activity(
                             &activity.workflow_id,
                             &activity.activity_type,
@@ -1228,17 +1233,24 @@ impl Worker {
             running_activity.join_handle.abort();
 
             // 2) Synthesize a "cancelled" result and send it into the normal path
-            let _ = self.activity_sender.send((
+            if let Err(e) = self.activity_sender.send((
                 running_activity.workflow_id.clone(),
                 running_activity.activity_id.clone(),
                 running_activity.run_id.clone(),
                 match timeout {
-                    true => Err(ActivityError::Retryable { source: anyhow!("Activity Timeout"), explicit_delay: None }),
-                    false => Err(ActivityError::Cancelled { details: None })
+                    true => Err(ActivityError::Retryable {
+                        source: anyhow!("Activity Timeout"),
+                        explicit_delay: None,
+                    }),
+                    false => Err(ActivityError::Cancelled { details: None }),
                 },
-            ));
+            )) {
+                println!("ERROR SENDING KILL ACTIVITY: {:#?}", e);
+                error!("ERROR SENDING KILL ACTIVITY: {:#?}", e);
+            }
         } else {
-            println!("COULD NOT FIND ACTIVITY: {activity_id}")
+            println!("COULD NOT FIND ACTIVITY: {activity_id}");
+
         }
     }
 

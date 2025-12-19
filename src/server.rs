@@ -470,7 +470,7 @@ async fn build_retry_activity_options(
 ) -> anyhow::Result<immortal::RequestStartActivityOptionsV1> {
     let mut con = history.get_con().await?;
     // use immortal_lib::common::Payload;
-    if let Some(workflow_metadata) = WorkflowHistoryMetadata::get_opt(&mut con, &workflow_id)
+    if let Some(workflow_metadata) = WorkflowHistoryMetadata::get_opt(&mut con, &workflow_id, true)
         .await
         .map_err(|e| {
             println!("Failed to get workflow history: {:?}", e);
@@ -520,6 +520,325 @@ async fn build_retry_activity_options(
 
 // Schedule a retry with exponential backoff (+ jitter)
 impl ImmortalService {
+
+    pub async fn completed_activity_inner(
+        &self,
+        activity_result: ActivityResultV1,
+    ) -> Result<(), Status> {
+
+        let (worker_id, tx, _) = match self
+            .running_activities
+            .write()
+            .await
+            .remove(&activity_result.activity_id)
+        {
+            Some(entry) => *entry,
+            None => return Err(Status::not_found("Activity not found")),
+        };
+
+        {
+            let mut workers = self.workers.write().await;
+            if let Some(worker) = workers.get_mut(&worker_id) {
+                if worker.activity_capacity < worker.max_activity_capacity {
+                    worker.activity_capacity += 1;
+                }
+            }
+        }
+        println!("workflow_id {:?}", activity_result.workflow_id);
+        println!("activity_id {:?}", activity_result.activity_id);
+
+        let mut con = self.history.get_con().await.map_err(|e| {
+            error!("Error fetching redis connection: {:?}", e);
+            Status::internal("Failed to fetch redis connection")
+        })?;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Fetch and update activity history
+        // let activity_opt = self
+        //     .history
+        //     .get_activity(&activity_result.workflow_id, &activity_result.activity_id)
+        //     .await
+        //     .map_err(|e| {
+        //         eprintln!("Error fetching activity: {:?}", e);
+        //         Status::internal("Failed to fetch activity history")
+        //     })?;
+
+        let activity_opt = ActivityHistoryMetadata::get_opt(
+            &mut con,
+            &activity_result.workflow_id,
+            &activity_result.activity_id,
+        )
+        .await
+        .map_err(|e| {
+            error!("Error fetching activity: {:?}", e);
+            Status::internal("Failed to fetch activity history")
+        })?;
+
+        let mut activity = match activity_opt {
+            Some(a) => a,
+            None => {
+                error!("Activity history not found for completed activity");
+                return Err(Status::not_found("Activity history not found"));
+            }
+        };
+
+        // {
+        let run = match activity
+            .runs
+            .iter_mut()
+            .find(|f| f.run_id == activity_result.activity_run_id)
+        {
+            Some(r) => r,
+            None => {
+                error!(
+                    "Run ID {} not found in activity history",
+                    activity_result.activity_run_id
+                );
+                return Err(Status::not_found(format!(
+                    "Run ID {} not found in activity history",
+                    activity_result.activity_run_id
+                )));
+            }
+        };
+
+        run.end_time = Some(chrono::Utc::now());
+
+        // println!("{:?}", activity_result.status);
+
+        let mut failed = false;
+        let run_path = run_output_blob_key(
+            &activity_result.workflow_id,
+            &activity_result.activity_id,
+            &run.run_id,
+        );
+        match &activity_result.status {
+            Some(immortal::activity_result_v1::Status::Completed(x)) => {
+                match &x.result {
+                    Some(result_data) => {
+                        run.status = HistoryStatus::Completed;
+                        self.history
+                            .store_activity_run_output(
+                                &activity_result.workflow_id,
+                                &activity_result.activity_id,
+                                &run.run_id,
+                                result_data.clone(),
+                            )
+                            .await
+                            .map_err(|e| {
+                                error!("Error storing activity run output: {:?}", e);
+                                Status::internal("Error storing activity run output")
+                            })?;
+                        run.output = Some(payload_to_blob_ref(run_path, &result_data));
+                    }
+                    None => {
+                        let error_message_json = simd_json::json!({
+                            "message": "Missing result payload"
+                        });
+                        let data = simd_json::to_vec(&error_message_json).unwrap();
+                        run.status = HistoryStatus::Failed;
+                        let payload = Payload {
+                            data,
+                            ..Default::default()
+                        };
+                        run.output = Some(payload_to_blob_ref(run_path, &payload));
+                        self.history
+                            .store_activity_run_output(
+                                &activity_result.workflow_id,
+                                &activity_result.activity_id,
+                                &run.run_id,
+                                payload,
+                            )
+                            .await
+                            .map_err(|e| {
+                                error!("Error storing activity run output: {:?}", e);
+                                Status::internal("Error storing activity run output")
+                            })?;
+                    }
+                }
+                // if let Ok(id) = Uuid::parse_str(&activity_result.workflow_id) {
+                //     if let Err(e) = self
+                //         .notification_tx
+                //         .send(Notification::ActivityRunCompleted(id, activity.clone()))
+                //     {
+                //         error!("Error sending ActivityRunCompleted notification: {:?}", e);
+                //     }
+                // }
+            }
+
+            Some(immortal::activity_result_v1::Status::Failed(x)) | Some(immortal::activity_result_v1::Status::Timeout(x)) => {
+                failed = true;
+                // Mark this run failed in history
+                run.status = HistoryStatus::Failed;
+                let payload = Payload::new(&x);
+                run.output = Some(payload_to_blob_ref(run_path, &payload));
+                self.history
+                    .store_activity_run_output(
+                        &activity_result.workflow_id,
+                        &activity_result.activity_id,
+                        &run.run_id,
+                        payload,
+                    )
+                    .await
+                    .map_err(|e| {
+                        error!("Error storing activity run output: {:?}", e);
+                        Status::internal("Error storing activity run output")
+                    })?;
+                // Count attempts so far (all runs for this activity)
+            },
+
+
+            Some(immortal::activity_result_v1::Status::Cancelled(x)) => {
+                run.status = HistoryStatus::Failed;
+                let payload = Payload::new(&x);
+                run.output = Some(payload_to_blob_ref(run_path, &payload));
+                self.history
+                    .store_activity_run_output(
+                        &activity_result.workflow_id,
+                        &activity_result.activity_id,
+                        &run.run_id,
+                        payload,
+                    )
+                    .await
+                    .map_err(|e| {
+                        error!("Error storing activity run output: {:?}", e);
+                        Status::internal("Error storing activity run output")
+                    })?;
+                // (No retry on cancelled by default; tweak if you want)
+            }
+
+            None => {
+                let error_message_json = simd_json::json!({
+                    "message": "Missing status field"
+                });
+                let data = simd_json::to_vec(&error_message_json).unwrap();
+                run.status = HistoryStatus::Failed;
+                let payload = Payload {
+                    data,
+                    ..Default::default()
+                };
+                run.output = Some(payload_to_blob_ref(run_path, &payload));
+                self.history
+                    .store_activity_run_output(
+                        &activity_result.workflow_id,
+                        &activity_result.activity_id,
+                        &run.run_id,
+                        payload,
+                    )
+                    .await
+                    .map_err(|e| {
+                        error!("Error storing activity run output: {:?}", e);
+                        Status::internal("Error storing activity run output")
+                    })?;
+            }
+        }
+        // let _ = self.notification_tx.send(Notification::ActivityRunCompleted(
+        //     Uuid::parse_str(&workflow_id).unwrap(),
+        //     activity.clone(),
+        // ));
+        // I THINK IT'S THIS MOTHERFUCKER RIGHT HERE OVERWRITING MY ACTIVITY DATA
+        run.store_run(
+            &mut con,
+            &activity_result.workflow_id,
+            &activity_result.activity_id,
+        )
+        .await
+        .map_err(|e| {
+            error!("Error storing activity run metadata: {:?}", e);
+            Status::internal("Error storing activity run metadata")
+        })?;
+        let attempts = activity.runs.len(); // includes this failed run
+
+        // Send a completion/failed notification for this run (kept as-is)
+        if let Ok(id) = Uuid::parse_str(&activity_result.workflow_id) {
+            if let Err(e) = self
+                .notification_tx
+                .send(Notification::ActivityRunCompleted(id, activity.clone()))
+            {
+                error!("Error sending ActivityRunCompleted notification: {:?}", e);
+            }
+        }
+        // if let Err(e) = self
+        //     .history
+        //     .update_activity(
+        //         &activity_result.workflow_id,
+        //         activity.clone(),
+        //         // activity.index,
+        //     )
+        //     .await
+        // {
+        //     println!("error");
+        //     eprintln!("Failed to update activity history: {:?}", e);
+        //     return Err(Status::internal("Failed to update activity history"));
+        // }
+
+        // I TRIED MOVING THIS HERE SO THAT WE FIRST UPDATE THE RUN WITH A FAILED
+        // STATUS AND THEN. IF WE CAN RUN AGAIN. WE WRITE A NEW ATTEMPT
+        // I MIGHT HAVE TO CREATE A SYSTEM WHERE WE ALWAYS FETCH THE LATEST REDIS DATA
+        // Decide retry
+        if failed && attempts < ACTIVITY_MAX_ATTEMPTS {
+            // inform_worker = false;
+            // Persist the failed run before we schedule the retry
+
+            // Build next options from history
+            match build_retry_activity_options(
+                &self.history,
+                &activity_result.workflow_id,
+                &activity,
+            )
+            .await
+            {
+                Ok(next_opts) => {
+                    // Next run_id is attempts as string (previous runs are 0..attempts-1)
+                    let next_run_id = attempts.to_string();
+
+                    // Schedule retry with exponential backoff
+                    self.schedule_activity_retry(
+                        next_opts,
+                        next_run_id,
+                        attempts - 1, // attempt_index: 0-based for first retry
+                        tx,
+                        activity.index,
+                    );
+
+                    // (Optional) You can emit a small notification here if you want:
+                    // let _ = self.notification_tx.send(Notification::ActivityRunStarted(...));
+                }
+                Err(err) => {
+                    error!("Could not build retry options: {:?}", err);
+                    let _ = tx.send(activity_result);
+                    // fall through: no retry ⇒ final failure (we already marked run as failed)
+                }
+            }
+        } else {
+            // }
+
+            // if inform_worker {
+            println!("INFORMING WORKER");
+            // Update the worker's activity capacity
+
+
+                // THIS IS WHERE WE TELL THE WORKER THE RESULT OF THE ACTIVITY
+                // IN THIS CASE. WHEN WE RETRY THE ACTIVITY. WE DON'T WANT TO INFORM THE WORKER
+                // JUST YET. I WILL ADD A BOOL CALLED INFORM_WORKER
+            if let Err(e) = tx.send(activity_result) {
+                error!("Failed to send activity result: {:?}", e);
+            }
+
+        }
+
+        println!("finished");
+
+        // (Move essentially everything inside completed_activity's V1 branch here)
+        // Replace `activity_result` references accordingly and return `Ok(())` at end.
+        // IMPORTANT: if you currently depend on `Request<ActivityResultVersion>`,
+        // you don’t need it here—just the decoded ActivityResultV1.
+        //
+        // The key win: watchdog can synthesize an ActivityResultV1 (Timeout/Failed/etc)
+        // and still go through the same “store runs / store output / retries / capacity” path.
+        Ok(())
+    }
+
+
+
     fn schedule_activity_retry(
         &self,
         options: immortal::RequestStartActivityOptionsV1,
@@ -640,7 +959,7 @@ impl ImmortalService {
         // scan recent set; tune page as desired
 
         let mut workflows =
-            WorkflowHistoryMetadata::get_all(&mut con, Some(500), Some(0), None, None, None)
+            WorkflowHistoryMetadata::get_all(&mut con, Some(500), Some(0), None, None, None, true)
                 .await?;
 
         for wf in &mut workflows {
@@ -777,12 +1096,13 @@ impl ImmortalService {
                     activity.runs[idx].status = HistoryStatus::Failed;
 
                     activity.runs[idx].end_time = Some(now);
+                    let run_id = activity.runs[idx].run_id.clone();
                     // let cloned = activity.clone();
                     history
                         .store_activity_run_output(
                             &wf.workflow_id,
                             &activity.activity_id,
-                            &idx.to_string(),
+                            &run_id,
                             Payload::new(&simd_json::json!({
                                 "message": "Orphaned"
                             })),
@@ -817,11 +1137,13 @@ impl ImmortalService {
                     // mark failed
                     activity.runs[idx].status = HistoryStatus::Failed;
                     activity.runs[idx].end_time = Some(now);
+
+                    let run_id = activity.runs[idx].run_id.clone();
                     history
                         .store_activity_run_output(
                             &wf.workflow_id,
                             &activity.activity_id,
-                            &idx.to_string(),
+                            &run_id,
                             Payload::new(&simd_json::json!({
                                 "message": "Orphaned"
                             })),
@@ -860,7 +1182,7 @@ impl ImmortalService {
     }
     async fn kill_workflow(&self, workflow_id: &str) -> anyhow::Result<()> {
         let mut con = self.history.get_con().await?;
-        if let Some(workflow) = WorkflowHistoryMetadata::get_opt(&mut con, workflow_id).await? {
+        if let Some(workflow) = WorkflowHistoryMetadata::get_opt(&mut con, workflow_id, true).await? {
             if let Some(worker_id) = workflow.worker_id {
                 {
                     let running_activities_stripped: Vec<_>;
@@ -931,119 +1253,181 @@ impl ImmortalService {
         }
         Ok(())
     }
-    fn watchdog(&self) {
-        let running_calls = Arc::clone(&self.running_calls);
-        let running_activities = Arc::clone(&self.running_activities);
-        let workers = Arc::clone(&self.workers);
+
+    pub fn watchdog(self: Arc<Self>) {
+        // Tune these as you like
+        const TICK_MS: u64 = 100;
+        const MAX_KILL_ATTEMPTS: i32 = 3;
+        // const WORKER_RPC_TIMEOUT_SECS: u64 = 2; // if you add ack later
+
+        #[derive(Clone, Debug)]
+        struct TimedOutActivity {
+            activity_id: String,
+            workflow_id: String,
+            run_id: String,
+            worker_id: String,
+        }
+
+        #[derive(Clone, Debug)]
+        struct TimedOutCall {
+            call_id: String,
+            worker_id: String,
+        }
+
         tokio::spawn(async move {
+            use chrono::Utc;
+            use std::collections::HashMap;
+            use tokio::time::{sleep, Duration as TokioDuration};
+
+            // Track how many times we’ve asked a worker to timeout/kill this activity
+            let mut activity_kill_attempts: HashMap<String, i32> = HashMap::new();
+
             loop {
-                {
-                    // let mut activities_to_remove = vec![];
-                    let mut activities_to_force_remove = vec![];
+                // -------------------------
+                // 1) Snapshot timed-out activities (no await inside loop holding locks)
+                // -------------------------
+                let timed_out_activities: Vec<TimedOutActivity> = {
+                    let guard = self.running_activities.read().await;
+                    let now = Utc::now();
 
-                    for (id, running_activity) in running_activities.read().await.iter() {
-                        let now = Utc::now();
-                        let max_time = running_activity.2.additional_properties.last_heartbeat
-                            + running_activity.2.heartbeat_timeout;
-                        if now > max_time {
-                            let available_worker = {
-                                let workers = workers.read().await;
-                                workers
-                                    .get(&running_activity.2.worker_id)
-                                    .map(|worker| (worker.worker_id.clone(), worker.tx.clone()))
-                            };
-                            if let Some(worker) = available_worker {
-                                if let Err(e) = worker
-                                    .1
-                                    .send(Ok(ImmortalWorkerActionVersion {
-                                        version: Some(immortal_worker_action_version::Version::V1(
-                                            ImmortalWorkerActionV1 {
-                                                action: Some(WorkerAction::TimeoutActivity(
-                                                    id.clone(),
-                                                )),
-                                            },
-                                        )),
-                                    }))
-                                    .await
-                                {
-                                    error!("FORCE REMOVING ACTIVITY: {:#?}", e);
-                                    activities_to_force_remove.push(id.clone());
-                                    //running_calls.write().await.remove(id);
-                                }
-                                println!("killing activity");
+                    guard
+                        .iter()
+                        .filter_map(|(activity_id, boxed)| {
+                            let props = &boxed.2.additional_properties;
+                            let max_time = props.last_heartbeat + boxed.2.heartbeat_timeout;
+
+                            if now > max_time {
+                                Some(TimedOutActivity {
+                                    activity_id: activity_id.clone(),
+                                    workflow_id: props.workflow_id.clone(),
+                                    run_id: props.latest_run_id.clone(),
+                                    worker_id: boxed.2.worker_id.clone(),
+                                })
+                            } else {
+                                None
                             }
-                            // kill it
+                        })
+                        .collect()
+                };
+
+                // -------------------------
+                // 2) Snapshot timed-out calls
+                // -------------------------
+                let timed_out_calls: Vec<TimedOutCall> = {
+                    let guard = self.running_calls.read().await;
+                    let now = Utc::now();
+
+                    guard
+                        .iter()
+                        .filter_map(|(call_id, boxed)| {
+                            let props = &boxed.1;
+                            if now > props.timeout {
+                                Some(TimedOutCall {
+                                    call_id: call_id.clone(),
+                                    worker_id: props.worker_id.clone(),
+                                })
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                };
+
+                // -------------------------
+                // 3) Handle timed-out activities
+                // -------------------------
+                for t in timed_out_activities {
+                    // increment attempts
+                    let attempts = activity_kill_attempts
+                        .entry(t.activity_id.clone())
+                        .and_modify(|v| *v += 1)
+                        .or_insert(1);
+
+                    let force = *attempts >= MAX_KILL_ATTEMPTS;
+
+                    // Best-effort: ask worker to timeout the activity
+                    let worker_tx = {
+                        let workers = self.workers.read().await;
+                        workers.get(&t.worker_id).map(|w| w.tx.clone())
+                    };
+
+                    let mut sent_to_worker = false;
+                    if let Some(tx) = worker_tx {
+                        let msg = ImmortalWorkerActionVersion {
+                            version: Some(immortal_worker_action_version::Version::V1(
+                                ImmortalWorkerActionV1 {
+                                    action: Some(WorkerAction::TimeoutActivity(t.activity_id.clone())),
+                                },
+                            )),
+                        };
+
+                        if tx.send(Ok(msg)).await.is_ok() {
+                            sent_to_worker = true;
                         }
                     }
-                    // I will temporarily remove this because I only want to remove activities from
-                    // the list once the worker confirmed that it has been killed. This might cause
-                    // issues I am not sure yet.
-                    // I also need to watch out with this. Because in the case of a deployment, if
-                    // we have another worker that joins, tries to grab the same name, the server
-                    // will think that this is the same worker, and not the old worker
-                    // reconnecting.
-                    if activities_to_force_remove.len() > 0 {
-                        let mut running_activities = running_activities.write().await;
-                        for activity_to_remove in activities_to_force_remove {
-                            if let Some(running_activity) =
-                                running_activities.remove(&activity_to_remove)
-                            {
-                                let (_worker_id, tx, props) = *running_activity;
-                                // this is also weird that this does not work. This should
-                                // technically remove the activity. Unless the worker cannot find
-                                // it inside reunning activities
-                                if let Err(e) = tx.send(ActivityResultV1 {
-                                    activity_id: activity_to_remove.clone(),
 
-                                    workflow_id: props.additional_properties.workflow_id.clone(),
-                                    activity_run_id: props.additional_properties.latest_run_id.clone(),
-
-                                    status: Some(immortal::activity_result_v1::Status::Timeout(
-                                        immortal::Failure {
-                                            failure: Some(failure::Failure {
-                                                message: "timeout (forced)".to_string(),
-                                                ..Default::default()
-                                            }),
+                    // If we *couldn’t* message the worker, or we hit the force threshold,
+                    // finalize it server-side through the same completion path.
+                    if !sent_to_worker || force {
+                        // Build a forced timeout ActivityResultV1
+                        let forced = ActivityResultV1 {
+                            activity_id: t.activity_id.clone(),
+                            workflow_id: t.workflow_id.clone(),
+                            activity_run_id: t.run_id.clone(),
+                            status: Some(immortal::activity_result_v1::Status::Timeout(
+                                immortal::Failure {
+                                    failure: Some(failure::Failure {
+                                        message: if force {
+                                            "timeout (forced by watchdog)".to_string()
+                                        } else {
+                                            "timeout (worker unreachable; watchdog)".to_string()
                                         },
-                                    )),
-                                }) {
-                                    error!("{:#?}", e);
-                                }
-                            }
-                        }
-                    }
-                    for (id, running_call) in running_calls.read().await.clone().iter() {
-                        let now = Utc::now();
-                        let max_time = running_call.1.timeout;
-                        if now > max_time {
-                            let available_worker = {
-                                let workers = workers.read().await;
-                                workers
-                                    .get(&running_call.1.worker_id)
-                                    .map(|worker| (worker.worker_id.clone(), worker.tx.clone()))
-                            };
-                            if let Some(worker) = available_worker {
-                                if let Err(e) = worker
-                                    .1
-                                    .send(Ok(ImmortalWorkerActionVersion {
-                                        version: Some(immortal_worker_action_version::Version::V1(
-                                            ImmortalWorkerActionV1 {
-                                                action: Some(WorkerAction::KillCall(id.clone())),
-                                            },
-                                        )),
-                                    }))
-                                    .await
-                                {
-                                    println!("{:#?}", e);
-                                }
+                                        ..Default::default()
+                                    }),
+                                },
+                            )),
+                        };
 
-                                running_calls.write().await.remove(id);
-                            }
-                            // kill it
-                        }
+                        // IMPORTANT:
+                        // This should call your extracted core logic (see my earlier suggestion):
+                        // `completed_activity_inner(self: &Arc<Self>, ActivityResultV1)`
+                        //
+                        // If you haven't extracted it yet, do that first—don't call the tonic handler.
+                        let _ = self.completed_activity_inner(forced).await;
+
+                        // Cleanup attempt tracking once it's finalized (best-effort)
+                        activity_kill_attempts.remove(&t.activity_id);
                     }
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                // -------------------------
+                // 4) Handle timed-out calls
+                // -------------------------
+                for t in timed_out_calls {
+                    // Best-effort: ask worker to kill call
+                    let worker_tx = {
+                        let workers = self.workers.read().await;
+                        workers.get(&t.worker_id).map(|w| w.tx.clone())
+                    };
+
+                    if let Some(tx) = worker_tx {
+                        let msg = ImmortalWorkerActionVersion {
+                            version: Some(immortal_worker_action_version::Version::V1(
+                                ImmortalWorkerActionV1 {
+                                    action: Some(WorkerAction::KillCall(t.call_id.clone())),
+                                },
+                            )),
+                        };
+                        let _ = tx.send(Ok(msg)).await;
+                    }
+
+                    // Always remove from running_calls so callers can proceed/fail appropriately.
+                    // (If you want symmetric handling like activities, extract a `completed_call_inner` too.)
+                    self.running_calls.write().await.remove(&t.call_id);
+                }
+
+                // Tick
+                sleep(TokioDuration::from_millis(TICK_MS)).await;
             }
         });
     }
@@ -1298,10 +1682,10 @@ impl ImmortalService {
                                             .unwrap_or(Duration::seconds(30)),
                                         additional_properties: ActivityProperties {
                                             // not sure this is right but we'll see
-                                            latest_run_id: "0".to_string(), 
+                                            latest_run_id: activity_run_id.clone(), 
                                             workflow_id: activity_options.workflow_id.clone(),
                                             last_heartbeat: now,
-                                            scheduled: now.clone(),
+                                            scheduled: scheduled.clone(),
                                             latest_run_start: None,
                                             index,
                                         },
@@ -1320,7 +1704,7 @@ impl ImmortalService {
                             activity_history.runs.push(ActivityRun::new(
                                 activity_options.workflow_id.clone(),
                                 activity_options.activity_id.clone(),
-                                "0".to_string(),
+                                activity_run_id.to_string(),
                             ));
 
                             match history
@@ -1351,24 +1735,10 @@ impl ImmortalService {
                                     activity_history = existing;
                                 }
                                 _ => {
-                                    // first ever run for this activity id
-                                    let mut activity_history = ActivityHistory::new(
-                                        activity_options.workflow_id.clone(),
-                                        activity_options.activity_type.clone(),
-                                        activity_options.activity_id.clone(),
-                                        activity_options.task_queue.clone(),
-                                        activity_options.activity_input.clone(),
-                                        index,
-                                    );
-                                    activity_history.runs.push(ActivityRun::new(
-                                        activity_options.workflow_id.clone(),
-                                        activity_options.activity_id.clone(),
-                                        activity_run_id.clone(),
-                                    ));
                                     if let Err(e) = history
                                         .add_activity(
                                             &activity_options.workflow_id,
-                                            activity_history,
+                                            activity_history.clone(),
                                         )
                                         .await
                                     {
@@ -1401,6 +1771,8 @@ impl ImmortalService {
                                 }))
                                 .await
                             {
+                                running_activities.write().await.remove(&activity_options.activity_id);
+
                                 error!("Failed to send StartActivity to worker: {:#?}", e);
                                 continue;
                             }
@@ -2231,307 +2603,11 @@ impl Immortal for ImmortalService {
         // let mut inform_worker = true;
         match activity_version.version {
             Some(activity_result_version::Version::V1(activity_result)) => {
+               self.completed_activity_inner(activity_result).await?; 
+                // self.com
                 // Remove the activity from the running map
                 // I think what is happening is that tx is being dropped
-                let (worker_id, tx, _) = match self
-                    .running_activities
-                    .write()
-                    .await
-                    .remove(&activity_result.activity_id)
-                {
-                    Some(entry) => *entry,
-                    None => return Err(Status::not_found("Activity not found")),
-                };
-
-                println!("workflow_id {:?}", activity_result.workflow_id);
-                println!("activity_id {:?}", activity_result.activity_id);
-
-                let mut con = self.history.get_con().await.map_err(|e| {
-                    error!("Error fetching redis connection: {:?}", e);
-                    Status::internal("Failed to fetch redis connection")
-                })?;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                // Fetch and update activity history
-                // let activity_opt = self
-                //     .history
-                //     .get_activity(&activity_result.workflow_id, &activity_result.activity_id)
-                //     .await
-                //     .map_err(|e| {
-                //         eprintln!("Error fetching activity: {:?}", e);
-                //         Status::internal("Failed to fetch activity history")
-                //     })?;
-
-                let activity_opt = ActivityHistoryMetadata::get_opt(
-                    &mut con,
-                    &activity_result.workflow_id,
-                    &activity_result.activity_id,
-                )
-                .await
-                .map_err(|e| {
-                    error!("Error fetching activity: {:?}", e);
-                    Status::internal("Failed to fetch activity history")
-                })?;
-
-                let mut activity = match activity_opt {
-                    Some(a) => a,
-                    None => {
-                        error!("Activity history not found for completed activity");
-                        return Err(Status::not_found("Activity history not found"));
-                    }
-                };
-
-                // {
-                let run = match activity
-                    .runs
-                    .iter_mut()
-                    .find(|f| f.run_id == activity_result.activity_run_id)
-                {
-                    Some(r) => r,
-                    None => {
-                        error!(
-                            "Run ID {} not found in activity history",
-                            activity_result.activity_run_id
-                        );
-                        return Err(Status::not_found(format!(
-                            "Run ID {} not found in activity history",
-                            activity_result.activity_run_id
-                        )));
-                    }
-                };
-
-                run.end_time = Some(chrono::Utc::now());
-
-                // println!("{:?}", activity_result.status);
-
-                let mut failed = false;
-                let run_path = run_output_blob_key(
-                    &activity_result.workflow_id,
-                    &activity_result.activity_id,
-                    &run.run_id,
-                );
-                match &activity_result.status {
-                    Some(immortal::activity_result_v1::Status::Completed(x)) => {
-                        match &x.result {
-                            Some(result_data) => {
-                                run.status = HistoryStatus::Completed;
-                                self.history
-                                    .store_activity_run_output(
-                                        &activity_result.workflow_id,
-                                        &activity_result.activity_id,
-                                        &run.run_id,
-                                        result_data.clone(),
-                                    )
-                                    .await
-                                    .map_err(|e| {
-                                        error!("Error storing activity run output: {:?}", e);
-                                        Status::internal("Error storing activity run output")
-                                    })?;
-                                run.output = Some(payload_to_blob_ref(run_path, &result_data));
-                            }
-                            None => {
-                                let error_message_json = simd_json::json!({
-                                    "message": "Missing result payload"
-                                });
-                                let data = simd_json::to_vec(&error_message_json).unwrap();
-                                run.status = HistoryStatus::Failed;
-                                let payload = Payload {
-                                    data,
-                                    ..Default::default()
-                                };
-                                run.output = Some(payload_to_blob_ref(run_path, &payload));
-                                self.history
-                                    .store_activity_run_output(
-                                        &activity_result.workflow_id,
-                                        &activity_result.activity_id,
-                                        &run.run_id,
-                                        payload,
-                                    )
-                                    .await
-                                    .map_err(|e| {
-                                        error!("Error storing activity run output: {:?}", e);
-                                        Status::internal("Error storing activity run output")
-                                    })?;
-                            }
-                        }
-                        // if let Ok(id) = Uuid::parse_str(&activity_result.workflow_id) {
-                        //     if let Err(e) = self
-                        //         .notification_tx
-                        //         .send(Notification::ActivityRunCompleted(id, activity.clone()))
-                        //     {
-                        //         error!("Error sending ActivityRunCompleted notification: {:?}", e);
-                        //     }
-                        // }
-                    }
-
-                    Some(immortal::activity_result_v1::Status::Failed(x)) | Some(immortal::activity_result_v1::Status::Timeout(x)) => {
-                        failed = true;
-                        // Mark this run failed in history
-                        run.status = HistoryStatus::Failed;
-                        let payload = Payload::new(&x);
-                        run.output = Some(payload_to_blob_ref(run_path, &payload));
-                        self.history
-                            .store_activity_run_output(
-                                &activity_result.workflow_id,
-                                &activity_result.activity_id,
-                                &run.run_id,
-                                payload,
-                            )
-                            .await
-                            .map_err(|e| {
-                                error!("Error storing activity run output: {:?}", e);
-                                Status::internal("Error storing activity run output")
-                            })?;
-                        // Count attempts so far (all runs for this activity)
-                    },
-
-
-                    Some(immortal::activity_result_v1::Status::Cancelled(x)) => {
-                        run.status = HistoryStatus::Failed;
-                        let payload = Payload::new(&x);
-                        run.output = Some(payload_to_blob_ref(run_path, &payload));
-                        self.history
-                            .store_activity_run_output(
-                                &activity_result.workflow_id,
-                                &activity_result.activity_id,
-                                &run.run_id,
-                                payload,
-                            )
-                            .await
-                            .map_err(|e| {
-                                error!("Error storing activity run output: {:?}", e);
-                                Status::internal("Error storing activity run output")
-                            })?;
-                        // (No retry on cancelled by default; tweak if you want)
-                    }
-
-                    None => {
-                        let error_message_json = simd_json::json!({
-                            "message": "Missing status field"
-                        });
-                        let data = simd_json::to_vec(&error_message_json).unwrap();
-                        run.status = HistoryStatus::Failed;
-                        let payload = Payload {
-                            data,
-                            ..Default::default()
-                        };
-                        run.output = Some(payload_to_blob_ref(run_path, &payload));
-                        self.history
-                            .store_activity_run_output(
-                                &activity_result.workflow_id,
-                                &activity_result.activity_id,
-                                &run.run_id,
-                                payload,
-                            )
-                            .await
-                            .map_err(|e| {
-                                error!("Error storing activity run output: {:?}", e);
-                                Status::internal("Error storing activity run output")
-                            })?;
-                    }
-                }
-                // let _ = self.notification_tx.send(Notification::ActivityRunCompleted(
-                //     Uuid::parse_str(&workflow_id).unwrap(),
-                //     activity.clone(),
-                // ));
-                // I THINK IT'S THIS MOTHERFUCKER RIGHT HERE OVERWRITING MY ACTIVITY DATA
-                run.store_run(
-                    &mut con,
-                    &activity_result.workflow_id,
-                    &activity_result.activity_id,
-                )
-                .await
-                .map_err(|e| {
-                    error!("Error storing activity run metadata: {:?}", e);
-                    Status::internal("Error storing activity run metadata")
-                })?;
-                let attempts = activity.runs.len(); // includes this failed run
-
-                // Send a completion/failed notification for this run (kept as-is)
-                if let Ok(id) = Uuid::parse_str(&activity_result.workflow_id) {
-                    if let Err(e) = self
-                        .notification_tx
-                        .send(Notification::ActivityRunCompleted(id, activity.clone()))
-                    {
-                        error!("Error sending ActivityRunCompleted notification: {:?}", e);
-                    }
-                }
-                // if let Err(e) = self
-                //     .history
-                //     .update_activity(
-                //         &activity_result.workflow_id,
-                //         activity.clone(),
-                //         // activity.index,
-                //     )
-                //     .await
-                // {
-                //     println!("error");
-                //     eprintln!("Failed to update activity history: {:?}", e);
-                //     return Err(Status::internal("Failed to update activity history"));
-                // }
-
-                // I TRIED MOVING THIS HERE SO THAT WE FIRST UPDATE THE RUN WITH A FAILED
-                // STATUS AND THEN. IF WE CAN RUN AGAIN. WE WRITE A NEW ATTEMPT
-                // I MIGHT HAVE TO CREATE A SYSTEM WHERE WE ALWAYS FETCH THE LATEST REDIS DATA
-                // Decide retry
-                if failed && attempts < ACTIVITY_MAX_ATTEMPTS {
-                    // inform_worker = false;
-                    // Persist the failed run before we schedule the retry
-
-                    // Build next options from history
-                    match build_retry_activity_options(
-                        &self.history,
-                        &activity_result.workflow_id,
-                        &activity,
-                    )
-                    .await
-                    {
-                        Ok(next_opts) => {
-                            // Next run_id is attempts as string (previous runs are 0..attempts-1)
-                            let next_run_id = attempts.to_string();
-
-                            // Schedule retry with exponential backoff
-                            self.schedule_activity_retry(
-                                next_opts,
-                                next_run_id,
-                                attempts - 1, // attempt_index: 0-based for first retry
-                                tx,
-                                activity.index,
-                            );
-
-                            // (Optional) You can emit a small notification here if you want:
-                            // let _ = self.notification_tx.send(Notification::ActivityRunStarted(...));
-                        }
-                        Err(err) => {
-                            error!("Could not build retry options: {:?}", err);
-                            // fall through: no retry ⇒ final failure (we already marked run as failed)
-                        }
-                    }
-                } else {
-                    // }
-
-                    // if inform_worker {
-                    println!("INFORMING WORKER");
-                    // Update the worker's activity capacity
-                    let mut workers = self.workers.write().await;
-                    //this is the root of my problems
-                    if let Some(worker) = workers.get_mut(&worker_id) {
-                        if worker.activity_capacity < worker.max_activity_capacity {
-                            worker.activity_capacity += 1;
-                        }
-
-                        // THIS IS WHERE WE TELL THE WORKER THE RESULT OF THE ACTIVITY
-                        // IN THIS CASE. WHEN WE RETRY THE ACTIVITY. WE DON'T WANT TO INFORM THE WORKER
-                        // JUST YET. I WILL ADD A BOOL CALLED INFORM_WORKER
-                        if let Err(e) = tx.send(activity_result) {
-                            error!("Failed to send activity result: {:?}", e);
-                        }
-                    } else {
-                        error!("Worker {} not found", worker_id);
-                    }
-                }
-
-                println!("finished");
-            }
+            },
 
             None => {
                 return Err(Status::invalid_argument("Missing activity result version"));
@@ -2593,7 +2669,7 @@ impl Immortal for ImmortalService {
         let mut con = self.history.get_con().await.unwrap();
 
         let workflow_metadata =
-            WorkflowHistoryMetadata::get_opt(&mut con, &workflow_result.workflow_id)
+            WorkflowHistoryMetadata::get_opt(&mut con, &workflow_result.workflow_id, true)
                 .await
                 .map_err(|e| {
                     println!("Failed to get workflow history: {:?}", e);
@@ -2914,7 +2990,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cron_manager = Arc::new(Mutex::new(CronManager::new(kube_client).await?));
     let (stream_tx, _) = broadcast::channel::<IdentifiableMetrics>(1024);
     let (notification_tx, notification_rx) = broadcast::channel(100);
-    let immortal_service = ImmortalService {
+    let immortal_service = Arc::new(ImmortalService {
         cron_manager: Arc::clone(&cron_manager),
         metrics_stream: stream_tx.clone(),
         notification_tx: Arc::new(notification_tx.clone()),
@@ -2933,22 +3009,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         workers: Arc::new(RwLock::new(HashMap::new())),
         running_activities: Arc::new(RwLock::new(HashMap::new())),
         running_calls: Arc::new(RwLock::new(HashMap::new())),
-    };
+    });
 
     let _ = immortal_service.orphaned_workflows().await;
 
     immortal_service.workflow_queue_thread();
     immortal_service.activity_queue_thread();
     immortal_service.call_queue_thread();
-    immortal_service.watchdog();
-    let svc = ImmortalServer::new(immortal_service.clone());
+    immortal_service.clone().watchdog();
+    let svc = ImmortalServer::new((*immortal_service).clone());
     // let (health_reporter, health_service) = tonic_health::server::health_reporter();
     // health_reporter
     //     .set_serving::<ImmortalServer<ImmortalService>>()
     //     .await;
 
     immortal_service.history.sync_workflow_index().await?;
-    let immortal_service = Arc::new(immortal_service);
+    // let immortal_service = Arc::new(immortal_service);
     // tokio::spawn(service_status(health_reporter.clone()));
     let use_tokio_console = std::env::var("ENABLE_TOKIO_CONSOLE").unwrap_or("false".to_string());
     if use_tokio_console.as_str() == "true" {

@@ -301,6 +301,8 @@ message ImmortalWorkerActionV1 {
     string timeout_activity = 11;
   }
 }
+
+
 enum Level {
   /// The "trace" level.
   ///

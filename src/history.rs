@@ -212,7 +212,7 @@ impl History {
             )
             .await?;
 
-        let wf_metadata = WorkflowHistoryMetadata::get_opt(&mut con, &wf_id).await?;
+        let wf_metadata = WorkflowHistoryMetadata::get_opt(&mut con, &wf_id, true).await?;
 
         // Find all activity ids
         let act_ids: Vec<String> = con
@@ -451,7 +451,7 @@ impl History {
             return Ok(None);
         }
 
-        let wf_metadata = WorkflowHistoryMetadata::get_opt(&mut con, workflow_id)
+        let wf_metadata = WorkflowHistoryMetadata::get_opt(&mut con, workflow_id, true)
             .await?
             .unwrap();
 
@@ -662,11 +662,7 @@ impl History {
             .lrange(workflow_activities_list_key(workflow_id), 0, -1)
             .await?;
 
-        println!("ACT IDS: {:?} - {workflow_id}.{activity_id}", act_ids);
-
         let index = act_ids.iter().position(|id| id == activity_id).unwrap_or(0);
-
-        println!("{index}");
 
         match self.load_activity(&mut con, workflow_id, activity_id).await {
             Ok(act) => {
@@ -674,7 +670,6 @@ impl History {
                     act.index = index;
                     Ok(Some(act))
                 } else {
-                    println!("RETURNED BLANK");
                     Ok(None)
                 }
             }
@@ -757,7 +752,6 @@ impl History {
         let base = activity_base_key(workflow_id, activity_id);
 
         if !con.exists(&base).await? {
-            println!("COULD NOT FIND: {base}");
             return Ok(None);
         }
 
