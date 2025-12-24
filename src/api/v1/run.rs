@@ -1,7 +1,7 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
-use immortal_lib::immortal::CallVersion;
+use immortal_lib::immortal::{CallVersion, ClientStartWorkflowOptionsVersion};
 
-use crate::{immortal::ClientStartWorkflowOptionsVersion, state::AppState};
+use crate::state::AppState;
 
 pub async fn run_workflow(
     State(state): State<AppState>,

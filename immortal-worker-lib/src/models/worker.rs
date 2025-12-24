@@ -6,6 +6,7 @@ use simd_json::{OwnedValue, json};
 use std::collections::VecDeque;
 use std::fmt::{Debug, Write};
 use std::{collections::HashMap, sync::Arc, time::Duration};
+use tokio::sync::Notify;
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{
@@ -55,6 +56,7 @@ use super::{
 
 pub struct RunningWorkflow {
     pub workflow_id: String,
+    pub epoch: u64,
     pub join_handle: JoinHandle<()>,
 }
 
@@ -79,13 +81,20 @@ pub struct RunningCall {
     pub join_handle: JoinHandle<()>,
 }
 
+enum OutboxItem {
+    Workflow(Arc<WorkflowResultV1>),
+    Activity(Arc<ActivityResultV1>),
+    Call(Arc<CallResultV1>),
+}
+
 // #[derive(Debug)]
 pub struct Worker {
+    pub instance_id: Uuid,
     pub task_queue: String,
     pub client: ImmortalClient<Channel>,
     pub config: WorkerConfig,
     pub server_channel: tokio::sync::broadcast::Sender<ImmortalServerActionV1>,
-    pub workflow_sender: UnboundedSender<(String, Result<WfExitValue<OwnedValue>, Error>)>,
+    pub workflow_sender: UnboundedSender<(String, Result<WfExitValue<OwnedValue>, Error>, u64)>,
     pub activity_sender: UnboundedSender<(
         String,
         String,
@@ -93,6 +102,8 @@ pub struct Worker {
         Result<ActExitValue<OwnedValue>, ActivityError>,
     )>,
 
+    outbox: Arc<Mutex<VecDeque<OutboxItem>>>,
+    outbox_notify: Arc<Notify>,
     pub call_sender:
         UnboundedSender<(String, String, Result<CallExitValue<OwnedValue>, CallError>)>,
     // pub client: Arc<dyn WorkerClient>,
@@ -289,6 +300,9 @@ impl Worker {
             .expect("Failed to set global subscriber");
         let client = ImmortalClient::connect(config.url.clone()).await?;
         let mut worker = Worker {
+            outbox_notify: Arc::new(Notify::new()),
+            outbox: Arc::new(Mutex::new(VecDeque::new())),
+            instance_id: Uuid::new_v4(),
             server_channel: stx,
             client,
             config: config.clone(),
@@ -311,6 +325,7 @@ impl Worker {
         };
         worker.workflow_thread(rx);
         worker.activity_thread(arx);
+        worker.outbox_thread();
         worker.call_thread(crx);
         Ok((worker, srx))
     }
@@ -454,6 +469,7 @@ impl Worker {
 
         println!("WORKER REGISTERED");
 
+        self.outbox_notify.notify_one();
         // info!("Worker registered");
         // on failure this needs to reconnect
         while let Some(feature) = stream.message().await? {
@@ -533,12 +549,35 @@ impl Worker {
         // let (tx, mut rx) = broadcast::channel(100);
         let rx = rx.resubscribe();
 
+        let running_workflows = {
+            let guard = self.running_workflows.lock().await;
+            guard
+                .iter()
+                .map(|(id, properties)| immortal_lib::immortal::RunningWorkflow {
+                    workflow_id: id.clone(),
+                    epoch: properties.epoch,
+                })
+                .collect()
+        };
+        let running_activities = {
+            let guard = self.running_activities.lock().await;
+            guard
+                .iter()
+                .map(|(id, properties)| immortal_lib::immortal::RunningActivity {
+                    activity_id: id.clone(),
+                    activity_run_id: properties.run_id.clone(),
+                })
+                .collect()
+        };
         let register_immortal_worker = RegisterImmortalWorkerV1 {
+            instance_id: self.instance_id.to_string(),
             workflow_capacity: self.workflow_capacity,
             activity_capacity: self.activity_capacity,
             task_queue: self.task_queue.clone(),
             worker_id: self.workery_key.clone(),
             worker_type: self.task_queue.clone(),
+            running_workflows,
+            running_activities,
             registered_notifications: self
                 .registered_notifications
                 .lock()
@@ -702,6 +741,7 @@ impl Worker {
                 if let Err(e) = sender.send((
                     workflow_id.to_string(),
                     Err(anyhow!("Workflow doesn't exist")),
+                    workflow_options.epoch,
                 )) {
                     eprintln!("Error sending to sender: {}", e.to_string())
                 }
@@ -712,10 +752,11 @@ impl Worker {
         let handle;
         {
             let workflow_id = workflow_id.clone();
+            let epoch = workflow_options.epoch;
             handle = tokio::spawn(async move {
                 let res = wf_handle.await;
 
-                if let Err(e) = sender.send((workflow_id.clone(), res)) {
+                if let Err(e) = sender.send((workflow_id.clone(), res, epoch)) {
                     eprintln!("Error sending to sender: {}", e.to_string());
                 }
                 // let res = tokio::spawn(wf_handle);
@@ -743,6 +784,7 @@ impl Worker {
 
         let running_workflow = RunningWorkflow {
             workflow_id: workflow_id.clone(),
+            epoch: workflow_options.epoch.clone(),
             join_handle: handle,
         };
         self.running_workflows
@@ -753,62 +795,59 @@ impl Worker {
 
     pub fn workflow_thread(
         &mut self,
-        mut rx: UnboundedReceiver<(String, Result<WfExitValue<OwnedValue>, Error>)>,
+        mut rx: UnboundedReceiver<(String, Result<WfExitValue<OwnedValue>, Error>, u64)>,
     ) {
-        let mut client = self.client.clone();
+        // new problem, what if a workflow get's rescheduled but just a different epoch???
         let running_workflows_arc = Arc::clone(&self.running_workflows);
+        let outbox = self.outbox.clone();
+        let instance_id = self.instance_id.clone();
         let worker_key = self.workery_key.clone();
+        let outbox_notify = self.outbox_notify.clone();
         tokio::spawn(async move {
             while let Some(result) = rx.recv().await {
-                match result.1 {
-                    Ok(res) => {
-                        if let Err(e) = client
-                            .completed_workflow(WorkflowResultVersion {
-                                version: Some(workflow_result_version::Version::V1(
-                                    WorkflowResultV1 {
-                                        worker_id: worker_key.clone(),
-                                        workflow_id: result.0.clone(),
-                                        status: Some(workflow_result_v1::Status::Completed(
-                                            ImmortalSuccess {
-                                                result: Some(Payload::new(&res)),
-                                            },
-                                        )),
-                                    },
-                                )),
-                            })
-                            .await
-                        {
-                            eprintln!("Error sending completed workflow: {}", e.to_string())
-                        }
-                    }
-                    Err(e) => {
-                        if let Err(e) = client
-                            .completed_workflow(WorkflowResultVersion {
-                                version: Some(workflow_result_version::Version::V1(
-                                    WorkflowResultV1 {
-                                        worker_id: worker_key.clone(),
-                                        workflow_id: result.0.clone(),
-                                        status: Some(workflow_result_v1::Status::Failed(
-                                            ImmortalFailure {
-                                                failure: Some(Failure {
-                                                    message: e.to_string(),
-                                                    source: "worker".to_string(),
-                                                    stack_trace: e.backtrace().to_string(),
-                                                    encoded_attributes: None,
-                                                    cause: None,
-                                                    failure_info: None,
-                                                }),
-                                            },
-                                        )),
-                                    },
-                                )),
-                            })
-                            .await
-                        {
-                            eprintln!("Error sending completed workflow: {}", e.to_string())
-                        }
-                    }
+                // NEW BUG. THIS UNWRAPS WHEN RUNNING WORKFLOW IS NO LONGER IN RUNNING
+                // THIS COULD BE BECAUSE OUTBOX NEVER SENDS THEN A KILL COMMAND IS SENT OUT
+                // I GUESS WE COULD GO AHEAD AND MOVE EPOCH TO RESULT
+                // let epoch = {
+                //     let running_workflows = running_workflows_arc.lock().await;
+                //     running_workflows.get(&result.0).unwrap().epoch
+                // };
+                let epoch = result.2;
+                let res = match result.1 {
+                    Ok(res) => WorkflowResultV1 {
+                        epoch,
+                        worker_instance_id: instance_id.to_string(),
+                        worker_id: worker_key.clone(),
+                        workflow_id: result.0.clone(),
+                        status: Some(workflow_result_v1::Status::Completed(ImmortalSuccess {
+                            result: Some(Payload::new(&res)),
+                        })),
+                    },
+                    Err(e) => WorkflowResultV1 {
+                        worker_id: worker_key.clone(),
+                        epoch,
+                        worker_instance_id: instance_id.to_string(),
+                        workflow_id: result.0.clone(),
+                        status: Some(workflow_result_v1::Status::Failed(ImmortalFailure {
+                            failure: Some(Failure {
+                                message: e.to_string(),
+                                source: "worker".to_string(),
+                                stack_trace: e.backtrace().to_string(),
+                                encoded_attributes: None,
+                                cause: None,
+                                failure_info: None,
+                            }),
+                        })),
+                    },
+                };
+                {
+                    outbox
+                        .lock()
+                        .await
+                        .push_back(OutboxItem::Workflow(Arc::new(res)));
+                    outbox_notify.notify_one();
                 }
+
                 let mut running_workflows = running_workflows_arc.lock().await;
                 // let running_workflow = running_workflows.get("test").unwrap();
                 // running_workflow.join_handle.abort();
@@ -828,14 +867,11 @@ impl Worker {
     ) {
         let running_activities_arc = Arc::clone(&self.running_activities);
 
-        let mut client = self.client.clone();
+        let outbox_notify = self.outbox_notify.clone();
+        let outbox = self.outbox.clone();
         tokio::spawn(async move {
             while let Some(result) = rx.recv().await {
                 let res = match result.3 {
-                    // Err(e) => ActivityExecutionResult::fail(Failure::application_failure(
-                    //     format!("Activity function panicked: {}", panic_formatter(e)),
-                    //     true,
-                    // )),
                     Ok(ActExitValue::Normal(p)) => ActivityResultV1::ok(
                         result.0.clone(),
                         result.1.clone(),
@@ -888,17 +924,15 @@ impl Worker {
                         ),
                     },
                 };
-                if let Err(e) = client
-                    .completed_activity(ActivityResultVersion {
-                        version: Some(activity_result_version::Version::V1(res)),
-                    })
-                    .await
                 {
-                    eprintln!("Error completing activity: {}", e);
+                    outbox
+                        .lock()
+                        .await
+                        .push_back(OutboxItem::Activity(Arc::new(res)));
+                    outbox_notify.notify_one();
                 }
+
                 let mut running_activities = running_activities_arc.lock().await;
-                // let running_activity = running_activities.get("test").unwrap();
-                // running_activity.join_handle.abort();
                 running_activities.remove(&result.0);
             }
         });
@@ -910,14 +944,11 @@ impl Worker {
     ) {
         let running_calls_arc = Arc::clone(&self.running_calls);
 
-        let mut client = self.client.clone();
+        let outbox_notify = self.outbox_notify.clone();
+        let outbox = self.outbox.clone();
         tokio::spawn(async move {
             while let Some(result) = rx.recv().await {
                 let res = match result.2 {
-                    // Err(e) => ActivityExecutionResult::fail(Failure::application_failure(
-                    //     format!("Activity function panicked: {}", panic_formatter(e)),
-                    //     true,
-                    // )),
                     Ok(CallExitValue::Normal(p)) => {
                         CallResultV1::ok(result.0.clone(), result.1.clone(), Some(Payload::new(&p)))
                     }
@@ -958,19 +989,93 @@ impl Worker {
                         ),
                     },
                 };
-                if let Err(e) = client
-                    .completed_call(CallResultVersion {
-                        version: Some(call_result_version::Version::V1(res)),
-                    })
-                    .await
                 {
-                    eprintln!("error completing call: {}", e.to_string());
+                    outbox
+                        .lock()
+                        .await
+                        .push_back(OutboxItem::Call(Arc::new(res)));
+
+                    outbox_notify.notify_one();
                 }
 
-                let mut running_activities = running_calls_arc.lock().await;
+                let mut running_calls = running_calls_arc.lock().await;
                 // let running_activity = running_activities.get("test").unwrap();
                 // running_activity.join_handle.abort();
-                running_activities.remove(&result.0);
+                running_calls.remove(&result.0);
+            }
+        });
+    }
+
+    // this is chatgpt'd and I am not sure if this is the best approach, seems a little
+    // dangerous...
+    fn unwrap_or_clone<T: Clone>(v: Arc<T>) -> T {
+        match Arc::try_unwrap(v) {
+            Ok(inner) => inner,
+            Err(shared) => (*shared).clone(),
+        }
+    }
+    pub fn outbox_thread(&mut self) {
+        let outbox = self.outbox.clone();
+        let notify = self.outbox_notify.clone();
+        let mut client = self.client.clone();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+            loop {
+                tokio::select! {
+                    _ = notify.notified() => {}
+                    _ = interval.tick() => {}
+                }
+
+                loop {
+                    let item = {
+                        let mut q = outbox.lock().await;
+                        q.pop_front()
+                    };
+
+                    let Some(item) = item else { break };
+
+                    let send_res = match &item {
+                        OutboxItem::Call(res) => {
+                            let owned = Self::unwrap_or_clone(Arc::clone(res));
+                            client
+                                .completed_call(CallResultVersion {
+                                    version: Some(call_result_version::Version::V1(owned)),
+                                })
+                                .await
+                        }
+                        OutboxItem::Activity(res) => {
+                            let owned = Self::unwrap_or_clone(Arc::clone(res));
+                            client
+                                .completed_activity(ActivityResultVersion {
+                                    version: Some(activity_result_version::Version::V1(owned)),
+                                })
+                                .await
+                        }
+                        OutboxItem::Workflow(res) => {
+                            let owned = Self::unwrap_or_clone(Arc::clone(res));
+                            client
+                                .completed_workflow(WorkflowResultVersion {
+                                    version: Some(workflow_result_version::Version::V1(owned)),
+                                })
+                                .await
+                        }
+                    };
+
+                    if let Err(e) = send_res {
+                        eprintln!("outbox send failed: {e}");
+
+                        {
+                            let mut q = outbox.lock().await;
+                            q.push_front(item);
+                        }
+
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        break; // stop draining on failure
+                    }
+                }
             }
         });
     }
@@ -1213,13 +1318,16 @@ impl Worker {
 
             if let Err(e) = self
                 .workflow_sender
-                .send((workflow_id.to_string(), Err(cancelled_err)))
+                .send((workflow_id.to_string(), Err(cancelled_err), running_workflow.epoch))
             {
                 eprintln!("Error sending cancelled workflow result: {}", e);
             }
             // let is_cancelled = join_handle.await.unwrap_err().is_cancelled();
 
             // println!("aborted {workflow_id} {is_cancelled}");
+            
+    
+            // DEFINITELY A RACE CONDITION
             running_workflows.remove(workflow_id);
         } else {
             println!("COULD NOT FIND WORKFLOW: {workflow_id}")
@@ -1250,7 +1358,6 @@ impl Worker {
             }
         } else {
             println!("COULD NOT FIND ACTIVITY: {activity_id}");
-
         }
     }
 

@@ -51,11 +51,13 @@ pub struct WorkflowHistory {
     pub workflow_id: String,
     pub workflow_type: String,
     pub status: Status,
+    pub epoch: u64,
     pub activities: Vec<ActivityHistory>,
     pub start_time: DateTime<Utc>,
     pub end_time: Option<DateTime<Utc>>,
-    pub task_queue: Option<String>,
+    pub task_queue: String,
     pub worker_id: Option<String>,
+    pub worker_instance_id: Option<Uuid>,
     // pub status: Status,
 }
 
@@ -66,17 +68,20 @@ impl WorkflowHistory {
         args: Vec<Payload>,
         task_queue: String,
         worker_id: String,
+        worker_instance_id: Uuid,
     ) -> Self {
         Self {
             args,
             output: None,
             workflow_type,
             workflow_id,
+            epoch: 0,
             status: Status::Running,
+            worker_instance_id: Some(worker_instance_id),
             activities: Vec::new(),
             start_time: chrono::Utc::now(),
             end_time: None,
-            task_queue: Some(task_queue),
+            task_queue: task_queue,
             worker_id: Some(worker_id),
         }
     }
@@ -355,7 +360,7 @@ impl History {
         // Optional TTL on top-level workflow metadata key
         let _: () = con.expire(&wf_meta, TTL).await?;
 
-        println!("WRITING TO REDIS (add workflow)");
+        // println!("WRITING TO REDIS (add workflow)");
         Ok(())
     }
 
@@ -436,7 +441,7 @@ impl History {
 
         let _: () = con.expire(&wf_meta, TTL).await?;
 
-        println!("WRITING TO REDIS (update workflow)");
+        // println!("WRITING TO REDIS (update workflow)");
         Ok(())
     }
 
@@ -493,6 +498,8 @@ impl History {
         }
 
         let wf = WorkflowHistory {
+            epoch: wf_metadata.epoch,
+            worker_instance_id: wf_metadata.owner.map(|f| f.instance_id),
             args,
             output,
             workflow_id: workflow_id.to_string(),
@@ -576,13 +583,7 @@ impl History {
             workflows = workflows
                 .into_iter()
                 .filter(|f| match f {
-                    WorkflowHistoryVersion::V1(v1) => {
-                        if let Some(history_task_queue) = &v1.task_queue {
-                            task_queues.contains(history_task_queue)
-                        } else {
-                            false
-                        }
-                    }
+                    WorkflowHistoryVersion::V1(v1) => task_queues.contains(&v1.task_queue),
                 })
                 .collect();
         }
@@ -623,7 +624,7 @@ impl History {
         self.store_activity(&mut con, &wf_id, &act_id, &activity, true)
             .await?;
 
-        println!("WRITING TO REDIS (add activity)");
+        // println!("WRITING TO REDIS (add activity)");
         Ok(())
     }
 
@@ -643,7 +644,7 @@ impl History {
         // this might not always be true
         self.store_activity(&mut con, &wf_id, &act_id, &activity, true)
             .await?;
-        println!("WRITING TO REDIS (update activity)");
+        // println!("WRITING TO REDIS (update activity)");
         Ok(())
     }
 
@@ -1109,11 +1110,12 @@ mod tests {
             args.clone(),
             "default".to_string(),
             "worker_1".to_string(),
+            Uuid::new_v4(),
         );
 
         assert_eq!(wf.workflow_type, "test_workflow");
         assert_eq!(wf.workflow_id, "wf_id_1");
-        assert_eq!(wf.task_queue, Some("default".to_string()));
+        assert_eq!(wf.task_queue, "default".to_string());
         assert_eq!(wf.worker_id, Some("worker_1".to_string()));
         assert_eq!(wf.status, Status::Running);
         assert_eq!(wf.activities.len(), 0);

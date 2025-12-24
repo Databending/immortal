@@ -1,4 +1,8 @@
-use crate::{cron::{CronSpec, CronStatus}, error::AnyhowError, state::AppState};
+use crate::{
+    cron::{CronSpec, CronStatus},
+    error::AnyhowError,
+    state::AppState,
+};
 use axum::{
     extract::{Path, State},
     response::IntoResponse,
@@ -6,16 +10,11 @@ use axum::{
 };
 use uuid::Uuid;
 
-
 pub async fn get_crons(State(state): State<AppState>) -> impl IntoResponse {
     let crons: Vec<CronSpec>;
     {
         let cron_manager = state.immortal_service.cron_manager.lock().await;
-        crons = cron_manager
-            .installed3
-            .iter()
-            .map(|f| f.clone())
-            .collect();
+        crons = cron_manager.installed3.iter().map(|f| f.clone()).collect();
     }
     Json(crons)
 }
@@ -27,7 +26,11 @@ pub async fn get_cron(
     let cron;
     {
         let cron_manager = state.immortal_service.cron_manager.lock().await;
-        cron = cron_manager.installed3.iter().find(|f| f.id == cron_id).cloned();
+        cron = cron_manager
+            .installed3
+            .iter()
+            .find(|f| f.id == cron_id)
+            .cloned();
     }
     Json(cron)
 }

@@ -168,6 +168,8 @@ message WorkflowResultV1 {
     Failure failed = 4;
     Cancellation cancelled = 5;
   }
+  string worker_instance_id = 6;
+  uint64 epoch = 7;
 }
 
 message WorkflowResultVersion {
@@ -181,6 +183,7 @@ message StartWorkflowOptionsV1 {
   string task_queue = 4;
   string workflow_id = 5;
   repeated ActivityCache cache = 6;
+  uint64 epoch = 7;
 }
 
 message ClientStartWorkflowOptionsVersion {
@@ -245,6 +248,16 @@ message RequestStartActivityOptionsVersion {
   oneof version { RequestStartActivityOptionsV1 V1 = 1; }
 }
 
+message RunningWorkflow {
+  string workflow_id = 1;
+  uint64 epoch = 2;
+}
+
+message RunningActivity {
+  string activity_id = 1;
+  string activity_run_id = 2;
+}
+
 message RegisterImmortalWorkerV1 {
   string worker_id = 1;
   string worker_type = 2;
@@ -255,6 +268,9 @@ message RegisterImmortalWorkerV1 {
   int32 workflow_capacity = 7;
   int32 activity_capacity = 8;
   string task_queue = 9;
+  string instance_id = 10;
+  repeated RunningWorkflow running_workflows = 11;
+  repeated RunningActivity running_activities = 12;
 }
 
 message RegisteredWorkflow {

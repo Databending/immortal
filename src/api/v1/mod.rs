@@ -1,5 +1,5 @@
 use axum::{
-    routing::{get, post, delete, patch},
+    routing::{delete, get, patch, post},
     Router,
 };
 
@@ -32,8 +32,14 @@ pub fn router() -> Router<AppState> {
         .route("/crons/{id}/status", patch(cron::update_cron_status))
         .route("/crons/{id}", get(cron::get_cron))
         .route("/task-queues", get(server::get_task_queues))
-        .route("/workflows/{task_queue}", get(server::get_registered_workflows))
-        .route("/activities/{task_queue}", get(server::get_registered_activities))
+        .route(
+            "/workflows/{task_queue}",
+            get(server::get_registered_workflows),
+        )
+        .route(
+            "/activities/{task_queue}",
+            get(server::get_registered_activities),
+        )
         .route("/workflow-queue", get(server::get_workflow_queue))
         .route("/activity-queue", get(server::get_activity_queue))
         .route("/running-activities", get(server::running_activities))

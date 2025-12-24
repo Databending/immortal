@@ -1,6 +1,7 @@
 use axum::{
     http::StatusCode,
-    response::{IntoResponse, Response}, Json,
+    response::{IntoResponse, Response},
+    Json,
 };
 use bb8_redis::bb8::RunError;
 use redis::RedisError;
@@ -29,7 +30,6 @@ macro_rules! impl_from_error_for_custom_error {
     };
 }
 
-
 #[derive(Error, Debug, Display)]
 pub enum AppError {
     InvalidUuid(#[from] uuid::Error),
@@ -41,7 +41,6 @@ pub enum AppError {
 impl_from_error_for_apperror!(VarError);
 impl_from_error_for_apperror!(RedisError);
 impl_from_error_for_apperror!(RunError<RedisError>);
-
 
 // Tell axum how to convert `AppError` into a response.
 // impl IntoResponse for AppError {
@@ -142,7 +141,6 @@ where
         Self(err.into())
     }
 }
-
 
 // This enables using `?` on functions that return `Result<_, anyhow::Error>` to turn them into
 // `Result<_, AppError>`. That way you don't need to do that manually.

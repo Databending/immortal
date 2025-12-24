@@ -12,6 +12,7 @@ use redis::AsyncCommands;
 use redis::Script;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, str::FromStr};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "version", content = "spec")]
@@ -20,8 +21,16 @@ pub enum WorkflowHistoryMetadataVersion {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerOwner {
+    pub worker_id: String,
+    pub instance_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowHistoryMetadata {
     pub workflow_id: String,
+    pub epoch: u64,
+    pub owner: Option<WorkerOwner>,
     // pub args_metadata: Vec<HashMap<String, Vec<u8>>>,
     pub args: Vec<BlobRef>,
     // pub output_metadata: Option<HashMap<String, Vec<u8>>>,
@@ -31,7 +40,7 @@ pub struct WorkflowHistoryMetadata {
     pub activities: Vec<ActivityHistoryMetadata>,
     pub start_time: DateTime<Utc>,
     pub end_time: Option<DateTime<Utc>>,
-    pub task_queue: Option<String>,
+    pub task_queue: String,
     pub worker_id: Option<String>,
 }
 
@@ -52,6 +61,7 @@ impl WorkflowHistoryMetadata {
             .await?;
         let meta: std::collections::HashMap<String, String> = redis::from_redis_value(&meta_val)?;
 
+        let owner = meta.get("owner").map(|f| serde_json::from_str(f).unwrap());
         let workflow_type = meta.get("workflow_type").cloned().unwrap_or_default();
         let status = Status::from_str(
             &meta
@@ -63,10 +73,14 @@ impl WorkflowHistoryMetadata {
             .get("start_time")
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(Utc::now);
+        let epoch = meta.get("epoch").and_then(|f| f.parse().ok()).unwrap_or(0);
         let end_time: Option<DateTime<Utc>> =
             meta.get("end_time")
                 .and_then(|s| if s.is_empty() { None } else { s.parse().ok() });
-        let task_queue = meta.get("task_queue").cloned();
+        let task_queue = meta
+            .get("task_queue")
+            .cloned()
+            .unwrap_or("default".to_string());
         let worker_id = meta.get("worker_id").cloned();
         // let mut args_metadata = vec![];
         let mut args = vec![];
@@ -118,13 +132,14 @@ impl WorkflowHistoryMetadata {
                 }
             }
         } else {
-
             activities = vec![];
         }
 
         Ok(Some(Self {
+            owner,
             args,
             output,
+            epoch,
             workflow_id: workflow_id.to_string(),
             workflow_type,
             status,
@@ -176,7 +191,7 @@ impl WorkflowHistoryMetadata {
                     .unwrap_or_else(String::new),
             )
             .arg("task_queue")
-            .arg(self.task_queue.clone().unwrap_or_default())
+            .arg(self.task_queue.clone())
             .arg("worker_id")
             .arg(self.worker_id.clone().unwrap_or_default())
             .arg("args_metadata")
@@ -192,6 +207,12 @@ impl WorkflowHistoryMetadata {
             query
                 .arg("output_metadata")
                 .arg(simd_json::to_string(&output.metadata)?);
+        }
+        if let Some(owner) = &self.owner {
+            query
+                .arg("worker_instance_id")
+                .arg(owner.instance_id.to_string());
+            query.arg("owner").arg(simd_json::to_string(&owner)?);
         }
 
         let _: () = query.ignore().query_async(&mut *con).await?;
@@ -214,7 +235,7 @@ impl WorkflowHistoryMetadata {
         // Optional TTL on top-level workflow metadata key
         let _: () = con.expire(&wf_meta, TTL).await?;
 
-        println!("WRITING TO REDIS (store workflow metadata)");
+        // println!("WRITING TO REDIS (store workflow metadata)");
         Ok(())
     }
 
@@ -224,6 +245,7 @@ impl WorkflowHistoryMetadata {
         offset: Option<usize>,
         task_queues: Option<Vec<String>>,
         worker_ids: Option<Vec<String>>,
+        worker_instance_ids: Option<Vec<String>>,
         status: Option<Status>,
     ) -> redis::RedisResult<Vec<String>> {
         let limit = limit.unwrap_or(10) as isize;
@@ -241,6 +263,7 @@ impl WorkflowHistoryMetadata {
 
         let task_queues = task_queues.unwrap_or_default();
         let worker_ids = worker_ids.unwrap_or_default();
+        let worker_instance_ids = worker_instance_ids.unwrap_or_default();
 
         let lua = Script::new(include_str!("lua/get_all_workflows.lua"));
         let mut lua_key = lua.key(index_key);
@@ -261,6 +284,11 @@ impl WorkflowHistoryMetadata {
             script = script.arg(wid);
         }
 
+        script = script.arg(worker_instance_ids.len() as i64);
+        for wid in &worker_instance_ids {
+            script = script.arg(wid);
+        }
+
         script.invoke_async(con).await
     }
 
@@ -270,11 +298,20 @@ impl WorkflowHistoryMetadata {
         offset: Option<usize>,
         task_queues: Option<Vec<String>>,
         worker_ids: Option<Vec<String>>,
+        worker_instance_ids: Option<Vec<String>>,
         status: Option<Status>,
-        full: bool
+        full: bool,
     ) -> Result<Vec<Self>> {
-        let ids: Vec<String> =
-            Self::get_all_workflow_ids(con, limit, offset, task_queues, worker_ids, status).await?;
+        let ids: Vec<String> = Self::get_all_workflow_ids(
+            con,
+            limit,
+            offset,
+            task_queues,
+            worker_ids,
+            worker_instance_ids,
+            status,
+        )
+        .await?;
         //
         // ids.sort();
         // ids.dedup();
@@ -325,10 +362,22 @@ impl From<&WorkflowHistory> for WorkflowHistoryMetadata {
                 metadata: Some(wf_output.metadata.clone()),
             });
         }
+        let owner = match &wf.worker_id {
+            Some(worker_id) => match &wf.worker_instance_id {
+                Some(instance_id) => Some(WorkerOwner {
+                    worker_id: worker_id.clone(),
+                    instance_id: instance_id.clone(),
+                }),
+                None => None,
+            },
+            None => None,
+        };
 
         Self {
             args,
             output,
+            epoch: wf.epoch,
+            owner,
             worker_id: wf.worker_id.clone(),
             workflow_type: wf.workflow_type.clone(),
             // args_metadata,
@@ -361,7 +410,16 @@ impl Into<WorkflowHistoryMetadata> for WorkflowHistory {
             }
         }
         let mut output = None;
-
+        let owner = match &self.worker_id {
+            Some(worker_id) => match &self.worker_instance_id {
+                Some(instance_id) => Some(WorkerOwner {
+                    worker_id: worker_id.clone(),
+                    instance_id: instance_id.clone(),
+                }),
+                None => None,
+            },
+            None => None,
+        };
         if let Some(wf_output) = &self.output {
             output = Some(BlobRef {
                 path: workflow_output_key(&self.workflow_id),
@@ -374,6 +432,8 @@ impl Into<WorkflowHistoryMetadata> for WorkflowHistory {
         }
         WorkflowHistoryMetadata {
             args,
+            owner,
+            epoch: self.epoch,
             output,
             worker_id: self.worker_id,
             workflow_type: self.workflow_type,

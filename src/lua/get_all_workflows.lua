@@ -10,6 +10,8 @@
 -- ARGV[5 .. 4 + N_tq] = task_queue values
 -- ARGV[5 + N_tq]     = num_worker_ids
 -- ARGV[6 + N_tq .. ] = worker_id values
+-- ARGV[7 + N_tq]     = num_worker_instance_ids
+-- ARGV[8 + N_tq .. ] = worker_instance_id values
 
 local offset = tonumber(ARGV[1]) or 0
 local limit  = tonumber(ARGV[2]) or 10
@@ -35,6 +37,14 @@ idx = idx + 1
 local worker_ids = {}
 for i = 1, num_worker_ids do
     worker_ids[i] = ARGV[idx]
+    idx = idx + 1
+end
+
+local num_worker_instance_ids = tonumber(ARGV[idx]) or 0
+idx = idx + 1
+local worker_instance_ids = {}
+for i = 1, num_worker_instance_ids do
+    worker_instance_ids[i] = ARGV[idx]
     idx = idx + 1
 end
 
@@ -76,6 +86,7 @@ for i = 0, index_len - 1 do
         local wf_status     = redis.call("HGET", wf_key, "status")
         local wf_task_queue = redis.call("HGET", wf_key, "task_queue")
         local wf_worker_id  = redis.call("HGET", wf_key, "worker_id")
+        local wf_worker_instance_id  = redis.call("HGET", wf_key, "worker_instance_id")
 
         -- if hash exists at all
         if wf_status ~= false or wf_task_queue ~= false or wf_worker_id ~= false then
@@ -98,6 +109,13 @@ for i = 0, index_len - 1 do
             -- worker_id filter
             if ok and num_worker_ids > 0 then
                 if (wf_worker_id == false) or (not contains(worker_ids, wf_worker_id)) then
+                    ok = false
+                end
+            end
+
+            -- worker_id filter
+            if ok and num_worker_instance_ids > 0 then
+                if (wf_worker_instance_id == false) or (not contains(worker_instance_ids, wf_worker_instance_id)) then
                     ok = false
                 end
             end

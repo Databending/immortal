@@ -20,7 +20,8 @@ use std::collections::HashMap;
 use uuid::Uuid;
 #[derive(Debug, Clone, Default, Serialize)]
 struct Worker {
-    id: String,
+    id: Uuid,
+    worker_id: String,
     registered_on: DateTime<Utc>,
     task_queue: String,
     workflows: HashMap<String, WfSchema>,
@@ -36,6 +37,7 @@ struct Worker {
 #[derive(Deserialize, Debug)]
 pub struct HistoryFilter {
     worker_ids: Option<String>,
+    worker_instance_ids: Option<String>,
     task_queues: Option<String>,
     status: Option<Status2>,
 }
@@ -188,6 +190,9 @@ pub async fn get_history(
         params
             .worker_ids
             .map(|f| f.split(",").map(|f| f.to_string()).collect()),
+        params
+            .worker_instance_ids
+            .map(|f| f.split(",").map(|f| f.to_string()).collect()),
         params.status,
         false,
     )
@@ -246,10 +251,11 @@ pub async fn get_workers(
 
     // println!("workers read");
     let mut registered_workers = Vec::new();
-    for (worker_id, worker) in workers.iter() {
+    for (instance_id, worker) in workers.iter() {
         registered_workers.push(Worker {
             registered_on: worker.registered_on,
-            id: worker_id.clone(),
+            id: instance_id.clone(),
+            worker_id: worker.worker_id.clone(),
             workflows: worker.registered_workflows.clone(),
             activities: worker.registered_activities.clone(),
             task_queue: worker.task_queue.clone(),
