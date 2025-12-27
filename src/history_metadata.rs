@@ -3,6 +3,7 @@ use crate::history::{
     run_output_blob_key, workflow_activities_list_key, workflow_meta_key, workflow_output_key,
     ActivityHistory, ActivityRun, Status, WorkflowHistory,
 };
+
 use crate::history::{workflow_args_key, BlobRef};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -192,6 +193,8 @@ impl WorkflowHistoryMetadata {
             )
             .arg("task_queue")
             .arg(self.task_queue.clone())
+            .arg("epoch")
+            .arg(self.epoch)
             .arg("worker_id")
             .arg(self.worker_id.clone().unwrap_or_default())
             .arg("args_metadata")
@@ -258,6 +261,7 @@ impl WorkflowHistoryMetadata {
             Some(Status::Failed) => "Failed",
             Some(Status::Running) => "Running",
             Some(Status::Completed) => "Completed",
+            Some(Status::Orphaned) => "Orphaned",
             None => "",
         };
 
@@ -457,12 +461,33 @@ pub struct ActivityHistoryMetadata {
     pub input: Option<BlobRef>,
     pub runs: Vec<ActivityRunHistoryMetadata>,
     pub index: usize,
+    pub hash: String,
 
     // NEED THIS FOR INTO
     pub workflow_id: String,
+    pub start_time: DateTime<Utc>,
 }
 
 impl ActivityHistoryMetadata {
+    pub async fn get_by_hash_opt(
+        con: &mut MultiplexedConnection,
+        workflow_id: &str,
+        hash: &str,
+    ) -> Result<Option<Self>> {
+        let act_ids: Vec<String> = con
+            .lrange(workflow_activities_list_key(workflow_id), 0, -1)
+            .await?;
+
+        for activity_id in &act_ids {
+            if let Some(activity) = Self::get_opt(con, workflow_id, activity_id).await? {
+                if activity.hash == hash {
+                    return Ok(Some(activity));
+                }
+            }
+        }
+
+        Ok(None)
+    }
     pub async fn get_opt(
         con: &mut MultiplexedConnection,
         workflow_id: &str,
@@ -479,6 +504,11 @@ impl ActivityHistoryMetadata {
 
         let activity_type = meta.get("activity_type").cloned().unwrap_or_default();
         let task_queue = meta.get("task_queue").cloned();
+        let hash = meta.get("hash").cloned().unwrap_or_default();
+        let start_time: DateTime<Utc> = meta
+            .get("start_time")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(Utc::now);
 
         // load runs list
         let run_ids: Vec<String> = con
@@ -512,7 +542,9 @@ impl ActivityHistoryMetadata {
             activity_id: activity_id.to_string(),
             activity_type,
             task_queue,
+            hash,
             runs,
+            start_time,
             input,
             index: 0, // caller fills actual index based on activities list
         }))
@@ -534,8 +566,12 @@ impl ActivityHistoryMetadata {
             .arg(&self.activity_id)
             .arg("activity_type")
             .arg(&self.activity_type)
+            .arg("hash")
+            .arg(&self.hash)
             .arg("task_queue")
-            .arg(self.task_queue.clone().unwrap_or_default());
+            .arg(self.task_queue.clone().unwrap_or_default())
+            .arg("start_time")
+            .arg(self.start_time.to_rfc3339());
         if let Some(input) = &self.input {
             query
                 .arg("input_metadata")
@@ -577,9 +613,10 @@ impl Into<ActivityHistoryMetadata> for ActivityHistory {
                 data: None,
                 metadata: Some(f.metadata.clone()),
             }),
+            start_time: self.start_time,
             activity_id: self.activity_id,
             workflow_id: self.workflow_id,
-
+            hash: self.hash,
             activity_type: self.activity_type,
             task_queue: self.task_queue,
             index: self.index,
@@ -610,6 +647,8 @@ impl From<&ActivityHistory> for ActivityHistoryMetadata {
 
         Self {
             input,
+            start_time: activity_history.start_time.clone(),
+            hash: activity_history.hash.clone(),
             activity_type: activity_history.activity_type.clone(),
             activity_id: activity_history.activity_id.clone(),
             workflow_id: activity_history.workflow_id.clone(),

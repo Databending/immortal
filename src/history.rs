@@ -6,6 +6,7 @@ use bb8_redis::{
     bb8::{Pool, PooledConnection, RunError},
     RedisConnectionManager,
 };
+use blake3::Hasher;
 use chrono::{DateTime, Utc};
 use const_format::formatcp;
 use immortal_lib::common::Payload;
@@ -36,6 +37,7 @@ pub enum Status {
     Running,
     Completed,
     Failed,
+    Orphaned,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,13 +71,14 @@ impl WorkflowHistory {
         task_queue: String,
         worker_id: String,
         worker_instance_id: Uuid,
+        epoch: u64,
     ) -> Self {
         Self {
             args,
             output: None,
             workflow_type,
             workflow_id,
-            epoch: 0,
+            epoch,
             status: Status::Running,
             worker_instance_id: Some(worker_instance_id),
             activities: Vec::new(),
@@ -91,6 +94,8 @@ impl WorkflowHistory {
 pub struct ActivityHistory {
     pub activity_id: String,
     pub activity_type: String,
+    pub hash: String,
+    pub start_time: DateTime<Utc>,
     // pub args: Option<Payload>,
     // pub output: Option<Payload>,
     pub task_queue: Option<String>,
@@ -104,6 +109,24 @@ pub struct ActivityHistory {
 }
 
 impl ActivityHistory {
+    pub fn hash(activity_type: &str, input: &Option<Payload>) -> String {
+        let mut h = Hasher::new();
+        h.update(activity_type.as_bytes());
+
+        if let Some(p) = input {
+            h.update(&p.data);
+
+            // metadata must be deterministic
+            let mut kv: Vec<_> = p.metadata.iter().collect();
+            kv.sort_by(|a, b| a.0.cmp(b.0));
+            for (k, v) in kv {
+                h.update(k.as_bytes());
+                h.update(v);
+            }
+        }
+
+        h.finalize().to_hex().to_string()
+    }
     pub fn new(
         workflow_id: String,
         activity_type: String,
@@ -111,11 +134,18 @@ impl ActivityHistory {
         task_queue: String,
         input: Option<Payload>,
         index: usize,
+        idempotency_key: String,
     ) -> Self {
         Self {
+            hash: if idempotency_key == "" {
+                Self::hash(&activity_type, &input)
+            } else {
+                idempotency_key
+            },
             activity_id,
             activity_type,
             workflow_id,
+            start_time: Utc::now(),
             // args,
             input,
             task_queue: Some(task_queue),
@@ -321,7 +351,16 @@ impl History {
         let wf_meta = workflow_meta_key(&wf_id);
 
         if con.exists(&wf_meta).await? {
-            return Err(anyhow!("Workflow already exists"));
+            // check and see if it's the next epoch  (safe to unwrap as it exists)
+            let existing_wf = WorkflowHistoryMetadata::get_opt(&mut con, &wf_id, false)
+                .await?
+                .unwrap();
+            if workflow.epoch <= existing_wf.epoch
+                && workflow.task_queue == existing_wf.task_queue
+                && workflow.workflow_type == existing_wf.workflow_type
+            {
+                return Err(anyhow!("Workflow already exists"));
+            }
         }
 
         // Add to workflow index (for pagination)
@@ -783,9 +822,11 @@ impl History {
             }
         }
 
-        Ok(Some(ActivityHistory {
+        Ok(Some(ActivityHistory { 
+            start_time: activity_metadata.start_time,
             workflow_id: workflow_id.to_string(),
             activity_id: activity_id.to_string(),
+            hash: activity_metadata.hash,
             activity_type: activity_metadata.activity_type,
             task_queue: activity_metadata.task_queue,
             input,
@@ -1052,6 +1093,24 @@ pub struct BlobRef {
     pub metadata: Option<HashMap<String, Vec<u8>>>,
 }
 
+impl BlobRef {
+    pub async fn to_payload(&self, con: &mut MultiplexedConnection) -> Result<Payload> {
+        let metadata = self.metadata.clone().unwrap_or_default();
+        if self.loaded {
+            Ok(Payload {
+                metadata,
+                data: self.data.clone().unwrap_or_default(),
+            })
+        } else {
+            let data = get_blob_raw::<Vec<u8>>(con, &self.path).await?;
+            Ok(Payload {
+                metadata,
+                data: data.unwrap_or_default(),
+            })
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "version", content = "spec")]
 pub enum WorkflowHistoryVersionSummary {
@@ -1111,6 +1170,7 @@ mod tests {
             "default".to_string(),
             "worker_1".to_string(),
             Uuid::new_v4(),
+            0,
         );
 
         assert_eq!(wf.workflow_type, "test_workflow");
@@ -1131,6 +1191,7 @@ mod tests {
             "default".to_string(),
             Some(Payload::new(&"input")),
             0,
+            "".to_string(),
         );
 
         assert_eq!(activity.activity_id, "act_id_1");

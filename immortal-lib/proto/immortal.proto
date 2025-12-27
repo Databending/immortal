@@ -182,7 +182,7 @@ message StartWorkflowOptionsV1 {
   common.Payloads input = 3;
   string task_queue = 4;
   string workflow_id = 5;
-  repeated ActivityCache cache = 6;
+  // repeated ActivityCache cache = 6;
   uint64 epoch = 7;
 }
 
@@ -206,7 +206,7 @@ message StartWorkflowOptionsVersion {
 
 
 message RequestStartActivityOptionsV1 {
-  string activity_id = 1;
+  // string activity_id = 1;
   string activity_type = 2;
   common.Payload activity_input = 3;
   string workflow_id = 4;
@@ -217,6 +217,7 @@ message RequestStartActivityOptionsV1 {
   optional google.protobuf.Duration heartbeat_timeout = 9;
   ActivityCancellationType cancellation_type = 10;
   RetryPolicy retry_policy = 11;
+  string idempotency_key = 12;
 }
 
 message StartActivityOptionsV1 {
@@ -256,6 +257,7 @@ message RunningWorkflow {
 message RunningActivity {
   string activity_id = 1;
   string activity_run_id = 2;
+  string workflow_id = 3;
 }
 
 message RegisterImmortalWorkerV1 {
@@ -416,12 +418,12 @@ message CallV1 {
   optional bool stackable = 5;
 }
 
-message ActivityCache {
-  common.Payload input = 1;
-  common.Payload output = 2;
-  string activity_type = 3;
-  optional string task_queue = 4;
-}
+// message ActivityCache {
+//   common.Payload input = 1;
+//   common.Payload output = 2;
+//   string activity_type = 3;
+//   optional string task_queue = 4;
+// }
 
 message WorkerCallVersion {
   oneof version { WorkerCallV1 v1 = 1; }

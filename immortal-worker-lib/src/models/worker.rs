@@ -104,6 +104,8 @@ pub struct Worker {
 
     outbox: Arc<Mutex<VecDeque<OutboxItem>>>,
     outbox_notify: Arc<Notify>,
+    connected_tx: tokio::sync::watch::Sender<bool>,
+    connected_rx: tokio::sync::watch::Receiver<bool>,
     pub call_sender:
         UnboundedSender<(String, String, Result<CallExitValue<OwnedValue>, CallError>)>,
     // pub client: Arc<dyn WorkerClient>,
@@ -117,7 +119,7 @@ pub struct Worker {
     pub registered_calls: Arc<Mutex<HashMap<String, (CallFunction, CallSchema)>>>,
     pub registered_notifications:
         Arc<Mutex<HashMap<String, (NotificationFunction, NotificationSchema)>>>,
-    pub app_data: Option<AppData>,
+    pub app_data: Arc<AppData>,
     pub workflow_capacity: i32,
     pub activity_capacity: i32,
 }
@@ -278,12 +280,31 @@ where
 }
 
 impl Worker {
+    pub fn is_connected(&self) -> bool {
+        *self.connected_rx.borrow()
+    }
+
+    pub async fn wait_until_connected(&mut self) {
+        // Fast path
+        if *self.connected_rx.borrow() {
+            return;
+        }
+
+        // Wait for a change to true
+        while self.connected_rx.changed().await.is_ok() {
+            if *self.connected_rx.borrow() {
+                return;
+            }
+        }
+        // If sender is dropped, the worker is shutting down.
+    }
     pub async fn new(
         config: WorkerConfig,
     ) -> anyhow::Result<(Self, Receiver<ImmortalServerActionV1>)> {
         let (tx, rx) = mpsc::unbounded_channel();
         let (atx, arx) = mpsc::unbounded_channel();
         let (ctx, crx) = mpsc::unbounded_channel();
+        let (connected_tx, connected_rx) = tokio::sync::watch::channel(false);
 
         let (stx, srx) = broadcast::channel(100);
         let stx2 = stx.clone();
@@ -306,6 +327,8 @@ impl Worker {
             server_channel: stx,
             client,
             config: config.clone(),
+            connected_tx,
+            connected_rx,
             workflow_sender: tx,
             activity_sender: atx,
             call_sender: ctx,
@@ -321,7 +344,7 @@ impl Worker {
             workflow_capacity: config.workflow_capacity,
             activity_capacity: config.activity_capacity,
             // previous_workflows: Arc::new(Mutex::new(HashMap::new())),
-            app_data: Some(AppData::default()),
+            app_data: Arc::new(AppData::default()),
         };
         worker.workflow_thread(rx);
         worker.activity_thread(arx);
@@ -427,7 +450,13 @@ impl Worker {
 
     /// Insert Custom App Context for Workflows and Activities
     pub fn insert_app_data<T: Send + Sync + 'static>(&mut self, data: T) {
-        self.app_data.as_mut().map(|a| a.insert(data));
+        if let Some(app_data) = Arc::get_mut(&mut self.app_data) {
+            app_data.insert(data);
+        } else {
+            // If you *do* want to allow inserts after clones exist,
+            // switch AppData to interior mutability (see note below).
+            tracing::warn!("insert_app_data called after worker started; ignoring");
+        }
     }
 
     async fn main_thread2(
@@ -468,7 +497,7 @@ impl Worker {
             .into_inner();
 
         println!("WORKER REGISTERED");
-
+        let _ = self.connected_tx.send(true);
         self.outbox_notify.notify_one();
         // info!("Worker registered");
         // on failure this needs to reconnect
@@ -537,6 +566,7 @@ impl Worker {
                 _ => {}
             }
         }
+
         Ok(())
     }
 
@@ -565,6 +595,7 @@ impl Worker {
                 .iter()
                 .map(|(id, properties)| immortal_lib::immortal::RunningActivity {
                     activity_id: id.clone(),
+                    workflow_id: properties.workflow_id.clone(),
                     activity_run_id: properties.run_id.clone(),
                 })
                 .collect()
@@ -623,12 +654,7 @@ impl Worker {
                 .collect(),
         };
 
-        let safe_app_data = Arc::new(
-            self.app_data
-                .take()
-                .ok_or_else(|| anyhow!("app_data should exist on run"))
-                .unwrap(),
-        );
+        let safe_app_data = Arc::clone(&self.app_data);
 
         let server_sender = self.server_channel.clone();
         let handle = tokio::spawn(async move {
@@ -654,8 +680,13 @@ impl Worker {
             .main_thread2(rx, register_immortal_worker, &safe_app_data)
             .await
         {
-            Ok(_) => {}
-            Err(_) => {}
+            Ok(_) => {
+                // println!("1");
+            }
+            Err(_e) => {
+
+                // println!("2 {:#?}", e);
+            }
         }
         // we can probably just move this up a level instead of spawning and canceling
         handle.abort();
@@ -666,10 +697,10 @@ impl Worker {
         //     })
         //     .map(Ok);
 
-        self.app_data = Some(
-            Arc::try_unwrap(safe_app_data)
-                .map_err(|_| anyhow!("some references of AppData exist on worker shutdown"))?,
-        );
+        // self.app_data = Some(
+        //     Arc::try_unwrap(safe_app_data)
+        //         .map_err(|_| anyhow!("some references of AppData exist on worker shutdown"))?,
+        // );
         Ok(())
     }
 
@@ -680,12 +711,12 @@ impl Worker {
         let serverless_mode = std::env::var("SERVERLESS_MODE").unwrap_or_default();
         if serverless_mode == "true" {
             println!("Starting serverless mode");
-            let _safe_app_data = Arc::new(
-                self.app_data
-                    .take()
-                    .ok_or_else(|| anyhow!("app_data should exist on run"))
-                    .unwrap(),
-            );
+            // let _safe_app_data = Arc::new(
+            //     self.app_data
+            //         .take()
+            //         .ok_or_else(|| anyhow!("app_data should exist on run"))
+            //         .unwrap(),
+            // );
             // let _ = serverless::main(self, safe_app_data).await;
         } else {
             let (latest_tx, _latest_rx) = watch::channel(Metrics {
@@ -702,6 +733,7 @@ impl Worker {
             tokio::spawn(sampler(latest_tx, stream_tx.clone(), history.clone()));
 
             loop {
+                let _ = self.connected_tx.send(false);
                 let _ = self.main_thread3(&rx, &stream_tx).await;
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 println!("Main thread loop. Reconnecting...");
@@ -722,6 +754,7 @@ impl Worker {
         {
             let mut wf2 = registered_workflows.lock().await;
             if let Some(wf) = wf2.get_mut(&workflow_type) {
+                let connected_rx = self.connected_rx.clone();
                 wf_handle = wf.0.start_workflow(
                     client,
                     workflow_options
@@ -732,10 +765,7 @@ impl Worker {
                     workflow_id.clone(),
                     self.config.namespace.clone(),
                     self.config.task_queue.clone(),
-                    match workflow_options.cache.len() {
-                        0 => None,
-                        _ => Some(workflow_options.cache.clone()),
-                    },
+                    connected_rx,
                 );
             } else {
                 if let Err(e) = sender.send((
@@ -933,7 +963,7 @@ impl Worker {
                 }
 
                 let mut running_activities = running_activities_arc.lock().await;
-                running_activities.remove(&result.0);
+                running_activities.remove(&result.1);
             }
         });
     }
@@ -1019,6 +1049,7 @@ impl Worker {
         let notify = self.outbox_notify.clone();
         let mut client = self.client.clone();
 
+        let connected_rx = self.connected_rx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(500));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1027,6 +1058,11 @@ impl Worker {
                 tokio::select! {
                     _ = notify.notified() => {}
                     _ = interval.tick() => {}
+                }
+
+                let is_connected = *connected_rx.borrow();
+                if !is_connected {
+                    continue;
                 }
 
                 loop {
@@ -1080,64 +1116,95 @@ impl Worker {
         });
     }
 
+    pub fn is_retryable_rpc_error(e: &tonic::Status) -> bool {
+        use tonic::Code;
+        match e.code() {
+            Code::Unavailable | Code::DeadlineExceeded => true,
+            Code::Unknown => {
+                // This is what you're seeing: "transport error" + hyper ConnectionReset
+                let msg = e.message().to_ascii_lowercase();
+                msg.contains("transport error")
+                    || msg.contains("connection reset")
+                    || msg.contains("broken pipe")
+                    || msg.contains("tcp")
+                    || msg.contains("io error")
+            }
+            _ => false,
+        }
+    }
+
     pub async fn activity(
         &mut self,
         workflow_id: String,
         activity_options: ActivityOptions,
     ) -> anyhow::Result<OwnedValue> {
-        let mut temp = RequestStartActivityOptionsV1 {
-            activity_id: activity_options
-                .activity_id
-                .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        // let idempotency_key = format!(
+        //     "{}:{}:{}",
+        //     workflow_id,
+        //     activity_options.activity_type,
+        //     // for MVP you can hash the input bytes
+        //     blake3::hash(&activity_options.input.data).to_hex()
+        // );
+
+        let mut req = RequestStartActivityOptionsV1 {
             activity_type: activity_options.activity_type,
             activity_input: Some(activity_options.input),
-            schedule_to_close_timeout: activity_options
-                .schedule_to_close_timeout
-                .map(|x| x.try_into().unwrap()),
-            schedule_to_start_timeout: activity_options
-                .schedule_to_start_timeout
-                .map(|x| x.try_into().unwrap()),
-            start_to_close_timeout: activity_options
-                .start_to_close_timeout
-                .map(|x| x.try_into().unwrap()),
-            heartbeat_timeout: activity_options
-                .heartbeat_timeout
-                .map(|x| x.try_into().unwrap()),
-            retry_policy: activity_options.retry_policy.map(|x| x.try_into().unwrap()),
-            workflow_id,
+            workflow_id: workflow_id.clone(),
             task_queue: activity_options
                 .task_queue
                 .unwrap_or(self.task_queue.clone()),
+            // add your idempotency key to the request (see note below)
+            // idempotency_key: idempotency_key.clone(),
             ..Default::default()
         };
-        temp.set_cancellation_type(activity_options.cancellation_type);
-        match self
-            .client
-            .start_activity(RequestStartActivityOptionsVersion {
-                version: Some(request_start_activity_options_version::Version::V1(temp)),
-            })
-            .await
-        {
-            Ok(activity_result) => {
-                println!("received Activity completed: {:?}", activity_result);
-                match activity_result.into_inner().version {
-                    Some(activity_result_version::Version::V1(x)) => match x.status {
-                        Some(activity_result_v1::Status::Failed(x)) => Err(anyhow!("{:#?}", x)),
-                        Some(activity_result_v1::Status::Timeout(x)) => Err(anyhow!("{:#?}", x)),
-                        Some(activity_result_v1::Status::Cancelled(x)) => Err(anyhow!("{:#?}", x)),
-                        Some(activity_result_v1::Status::Completed(y)) => {
-                            Ok(simd_json::from_slice(
-                                &mut y.result.ok_or(anyhow!("No payload"))?.data,
-                            )?)
-                        }
+        req.set_cancellation_type(activity_options.cancellation_type);
 
-                        None => Err(anyhow!("Activity failed")),
+        let mut backoff = Duration::from_millis(200);
+        let max_backoff = Duration::from_secs(5);
+
+        loop {
+            // Don’t even try if offline
+            self.wait_until_connected().await;
+
+            match self
+                .client
+                .start_activity(RequestStartActivityOptionsVersion {
+                    version: Some(request_start_activity_options_version::Version::V1(
+                        req.clone(),
+                    )),
+                })
+                .await
+            {
+                Ok(activity_result) => match activity_result.into_inner().version {
+                    Some(activity_result_version::Version::V1(x)) => match x.status {
+                        Some(activity_result_v1::Status::Failed(x)) => {
+                            return Err(anyhow!("{:#?}", x));
+                        }
+                        Some(activity_result_v1::Status::Timeout(x)) => {
+                            return Err(anyhow!("{:#?}", x));
+                        }
+                        Some(activity_result_v1::Status::Cancelled(x)) => {
+                            return Err(anyhow!("{:#?}", x));
+                        }
+                        Some(activity_result_v1::Status::Completed(y)) => {
+                            return Ok(simd_json::from_slice(
+                                &mut y.result.ok_or(anyhow!("No payload"))?.data,
+                            )?);
+                        }
+                        None => return Err(anyhow!("Activity failed")),
                     },
-                    // Some(x) => Ok(serde_json::from_str(&x)?),
-                    None => Err(anyhow!("Activity failed")),
+                    None => return Err(anyhow!("Activity failed")),
+                },
+                Err(e) if Self::is_retryable_rpc_error(&e) => {
+                    // We treat this as "disconnected"
+                    // let _ = self.connected_tx.send(false);
+
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                    continue;
                 }
+                Err(e) => return Err(anyhow!("Activity failed: {:?}", e)),
             }
-            Err(e) => Err(anyhow!("Activity failed: {:?}", e)),
         }
     }
 
@@ -1285,6 +1352,7 @@ impl Worker {
             activity_id.to_string(),
             activity_run_id.to_string(),
         );
+
         let handle = tokio::spawn(async move {
             let res = act_handle.await;
 
@@ -1316,17 +1384,17 @@ impl Worker {
             println!("aborting {workflow_id}");
             let cancelled_err = anyhow!("workflow {workflow_id} cancelled");
 
-            if let Err(e) = self
-                .workflow_sender
-                .send((workflow_id.to_string(), Err(cancelled_err), running_workflow.epoch))
-            {
+            if let Err(e) = self.workflow_sender.send((
+                workflow_id.to_string(),
+                Err(cancelled_err),
+                running_workflow.epoch,
+            )) {
                 eprintln!("Error sending cancelled workflow result: {}", e);
             }
             // let is_cancelled = join_handle.await.unwrap_err().is_cancelled();
 
             // println!("aborted {workflow_id} {is_cancelled}");
-            
-    
+
             // DEFINITELY A RACE CONDITION
             running_workflows.remove(workflow_id);
         } else {

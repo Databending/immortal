@@ -214,5 +214,7 @@ immortal:history:workflow:<wf_id>:activity:<activity_id>:runs    (bytes, Vec<Act
 [ ] Auto-scaling system 
 [X] Migrate from storing history as string and instead as json
 [ ] Multi-tenancy
-[ ] Security (RBAC)
-[ ] HA (clustering) 
+[ ] Security (Casbin)
+[ ] HA (clustering)
+[ ] Sleep
+[ ] S3 storage

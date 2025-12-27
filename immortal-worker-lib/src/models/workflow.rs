@@ -2,7 +2,7 @@ use anyhow::{Error, anyhow};
 use futures::future::{BoxFuture, FutureExt};
 use immortal_lib::common::Payloads;
 use immortal_lib::immortal::{
-    ActivityCache, RequestStartActivityOptionsV1, RequestStartActivityOptionsVersion, RetryPolicy,
+    RequestStartActivityOptionsV1, RequestStartActivityOptionsVersion, RetryPolicy,
 };
 use immortal_lib::immortal::{
     activity_result_v1::Status, activity_result_version, immortal_client::ImmortalClient,
@@ -12,11 +12,13 @@ use serde::Deserialize;
 use serde::{Serialize, de::DeserializeOwned};
 use simd_json::OwnedValue;
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use tokio::sync::watch;
 use tonic::transport::Channel;
 use tracing::Instrument;
 use tracing::info_span;
 use tracing::instrument::Instrumented;
-use uuid::Uuid;
+
+use crate::models::worker::Worker;
 
 use super::activity::ActivityOptions;
 
@@ -40,7 +42,8 @@ pub struct WfContext {
     pub client: ImmortalClient<Channel>,
     pub args: Arc<Payloads>,
     pub id: String,
-    pub cache: Option<Vec<ActivityCache>>,
+    pub activity_seq: u32,
+    pub connected_rx: watch::Receiver<bool>,
     // pub app_data: Option<AppData>,
     // chan: Sender<RustWfCmd>,
     // am_cancelled: watch::Receiver<bool>,
@@ -50,24 +53,52 @@ pub struct WfContext {
 }
 
 impl WfContext {
+    async fn wait_until_connected(&mut self) {
+        // Fast path
+        if *self.connected_rx.borrow() {
+            return;
+        }
+
+        // Wait for a change to true
+        while self.connected_rx.changed().await.is_ok() {
+            if *self.connected_rx.borrow() {
+                return;
+            }
+        }
+        // If sender is dropped, the worker is shutting down.
+    }
+    fn next_activity_seq(&mut self) -> u32 {
+        let s = self.activity_seq;
+        self.activity_seq = self.activity_seq.wrapping_add(1);
+        s
+    }
     pub async fn activity<T: DeserializeOwned>(
         &mut self,
         options: ActivityOptions,
     ) -> anyhow::Result<T> {
+        let seq = self.next_activity_seq();
+        let idempotency_key = format!(
+            "{}:{}:{}:{}",
+            self.id,
+            options.activity_type,
+            seq,
+            // for MVP you can hash the input bytes
+            blake3::hash(&options.input.data).to_hex()
+        );
         // strip cache once it is done and remove some of the clones
-        if let Some(cache) = &self.cache {
-            for item in cache {
-                if item.input == Some(options.input.clone())
-                    && item.activity_type == options.activity_type
-                    && item.task_queue == options.task_queue
-                {
-                    return Ok(item.output.clone().unwrap().to()?);
-                }
-            }
-        }
+        // if let Some(cache) = &self.cache {
+        //     for item in cache {
+        //         if item.input == Some(options.input.clone())
+        //             && item.activity_type == options.activity_type
+        //             && item.task_queue == options.task_queue
+        //         {
+        //             return Ok(item.output.clone().unwrap().to()?);
+        //         }
+        //     }
+        // }
 
         let mut request = RequestStartActivityOptionsV1 {
-            activity_id: Uuid::new_v4().to_string(),
+            // activity_id: Uuid::new_v4().to_string(),
             activity_type: options.activity_type.to_string(),
             activity_input: Some(options.input),
             workflow_id: self.id.clone(),
@@ -83,45 +114,56 @@ impl WfContext {
             heartbeat_timeout: options.heartbeat_timeout.map(|x| x.try_into().unwrap()),
             retry_policy: options.retry_policy.map(|x| x.try_into().unwrap()),
             task_queue: options.task_queue.unwrap_or(self.task_queue.clone()),
+            idempotency_key,
             ..Default::default()
         };
         request.set_cancellation_type(options.cancellation_type.into());
-        match self
-            .client
-            .start_activity(RequestStartActivityOptionsVersion {
-                version: Some(request_start_activity_options_version::Version::V1(request)),
-            })
-            .await
-        {
-            Ok(activity_result) => match activity_result.into_inner().version {
-                Some(activity_result_version::Version::V1(x)) => match x.status {
-                    Some(Status::Failed(x)) => Err(anyhow!("{:#?}", x)),
-                    Some(Status::Timeout(x)) => Err(anyhow!("{:#?}", x)),
-                    Some(Status::Cancelled(x)) => Err(anyhow!("{:#?}", x)),
-                    Some(Status::Completed(y)) => {
-                        match y.result {
-                            Some(mut x) => Ok(x.to()?),
-                            None => Err(anyhow!("Paylaod empty")),
+
+        let mut backoff = Duration::from_millis(200);
+        let max_backoff = Duration::from_secs(5);
+
+        loop {
+            // Don’t even try if offline
+            self.wait_until_connected().await;
+
+            match self
+                .client
+                .start_activity(RequestStartActivityOptionsVersion {
+                    version: Some(request_start_activity_options_version::Version::V1(
+                        request.clone(),
+                    )),
+                })
+                .await
+            {
+                Ok(activity_result) => match activity_result.into_inner().version {
+                    Some(activity_result_version::Version::V1(x)) => match x.status {
+                        Some(Status::Failed(x)) => {
+                            return Err(anyhow!("{:#?}", x));
                         }
-                        // let result: ActExitValue<T> = serde_json::from_slice(&y.result.unwrap().data)?;
-                        // match result {
-                        // ActExitValue::Normal(x) => Ok(x),
-                        // ActExitValue::WillCompleteAsync => {
-                        //     Err(anyhow!("Activity was cancelled"))
-                        // }
-                        // }
-                    }
-                    None => {
-                        Err(anyhow!("Activity failed"))
-                    }
+                        Some(Status::Timeout(x)) => {
+                            return Err(anyhow!("{:#?}", x));
+                        }
+                        Some(Status::Cancelled(x)) => {
+                            return Err(anyhow!("{:#?}", x));
+                        }
+                        Some(Status::Completed(y)) => {
+                            return Ok(simd_json::from_slice(
+                                &mut y.result.ok_or(anyhow!("No payload"))?.data,
+                            )?);
+                        }
+                        None => return Err(anyhow!("Activity failed")),
+                    },
+                    None => return Err(anyhow!("Activity failed")),
                 },
-                // Some(x) => Ok(serde_json::from_str(&x)?),
-                None => {
-                    Err(anyhow!("Activity failed"))
+                Err(e) if Worker::is_retryable_rpc_error(&e) => {
+                    // We treat this as "disconnected"
+                    // let _ = self.connected_tx.send(false);
+
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                    continue;
                 }
-            },
-            Err(e) => {
-                Err(anyhow!("Activity failed: {:?}", e))
+                Err(e) => return Err(anyhow!("Activity failed: {:?}", e)),
             }
         }
     }
@@ -246,7 +288,7 @@ impl WorkflowFunction {
         workflow_id: String,
         namespace: String,
         task_queue: String,
-        cache: Option<Vec<ActivityCache>>,
+        connected_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Instrumented<Pin<Box<dyn Future<Output = Result<WfExitValue<OwnedValue>, Error>> + Send>>>
     {
         let span = info_span!(
@@ -261,7 +303,8 @@ impl WorkflowFunction {
             client,
             args: Arc::new(args),
             id: workflow_id,
-            cache,
+            activity_seq: 0,
+            connected_rx,
         })
         .instrument(span);
         handle

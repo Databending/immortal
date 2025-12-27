@@ -629,7 +629,61 @@ impl Immortal for ImmortalService {
             // QUEUE SO IT WILL NOT PILE UP WITH HANGING RESULTS.
             // this should also be done in a separate tokio task to avoid blocking the main thread
             let running_workflows = worker_details.running_workflows;
+            let running_activities = worker_details.running_activities;
             let mut con = self.redis_pool.get().await.unwrap();
+
+            let now = Utc::now();
+            {
+                for running_activity in running_activities {
+                    let mut guard = self.running_activities.write().await;
+                    let activity_id = running_activity.activity_id;
+                    let workflow_id = running_activity.workflow_id;
+                    let activity_run_id = running_activity.activity_run_id;
+                    let activity_metadata =
+                        ActivityHistoryMetadata::get_opt(&mut con, &workflow_id, &activity_id)
+                            .await
+                            .unwrap();
+
+                    if let Some(activity_metadata) = activity_metadata {
+                        let latest_run_id = activity_metadata
+                            .runs
+                            .get(activity_metadata.runs.len() - 1)
+                            .unwrap()
+                            .run_id
+                            .to_string();
+                        if latest_run_id == activity_run_id {
+                            guard.insert(
+                                activity_id,
+                                Box::new((
+                                    worker_instance_id.clone(),
+                                    vec![],
+                                    // probably turn this into a vec
+                                    RunningProperties {
+                                        start: activity_metadata.start_time.clone(),
+                                        worker_id: worker_details.worker_id.clone(),
+                                        worker_instance_id: worker_instance_id.clone(),
+                                        max_duration: Duration::seconds(30),
+                                        heartbeat_timeout: Duration::seconds(30),
+                                        timeout: activity_metadata.start_time
+                                            + Duration::seconds(30),
+                                        kill_state: KillState::Healthy,
+                                        additional_properties: ActivityProperties {
+                                            workflow_id: workflow_id.clone(),
+                                            latest_run_id: latest_run_id,
+                                            index: activity_metadata.index,
+                                            last_heartbeat: now.clone(),
+                                            // THIS IS INCORRECT
+                                            scheduled: now,
+                                            latest_run_start: None,
+                                        },
+                                    },
+                                )),
+                            );
+                        }
+                    }
+                }
+            }
+
             for running_workflow in running_workflows {
                 let wf =
                     WorkflowHistoryMetadata::get_opt(&mut con, &running_workflow.workflow_id, true)
@@ -639,8 +693,7 @@ impl Immortal for ImmortalService {
                     if matches!(wf.status, HistoryStatus::Completed) {
                         // IGNORE
                     } else if running_workflow.epoch != wf.epoch {
-                        let _ = self.kill_workflow(&running_workflow.workflow_id)
-                            .await;
+                        let _ = self.kill_workflow(&running_workflow.workflow_id).await;
                         // KILL AND IGNORE
                     } else {
                         // FINAL ADD WF BACK TO RUNNING WORKFLOWS
@@ -683,8 +736,7 @@ impl Immortal for ImmortalService {
                         );
                     }
                 } else {
-                    let _ = self.kill_workflow(&running_workflow.workflow_id)
-                        .await;
+                    let _ = self.kill_workflow(&running_workflow.workflow_id).await;
                     // KILL
                 }
             }
@@ -732,9 +784,19 @@ impl Immortal for ImmortalService {
 
                 let mut running_workflows = running_workflows.write().await;
 
-                for (_wf_id, running_workflow) in running_workflows.iter_mut() {
+                for (wf_id, running_workflow) in running_workflows.iter_mut() {
                     if running_workflow.0 == worker_instance_id {
-                        running_workflow.1.kill_state = KillState::Orphaned { first_seen: now }
+                        running_workflow.1.kill_state = KillState::Orphaned { first_seen: now };
+
+                        println!(
+                            "wf {wf_id} set to orphaned because {} == {}",
+                            running_workflow.0, worker_instance_id
+                        )
+                    } else {
+                        println!(
+                            "wf {wf_id} not set to orphaned because {} != {}",
+                            running_workflow.0, worker_instance_id
+                        )
                     }
                 }
 
@@ -759,7 +821,7 @@ impl Immortal for ImmortalService {
         let (tx, _rx) = watch::channel::<i32>(0);
         let workflow_id = Uuid::parse_str(
             &self
-                .start_workflow_internal(workflow_options, Some(tx), None)
+                .start_workflow_internal(workflow_options, Some(tx))
                 .await?,
         )
         .map_err(|e| tonic::Status::invalid_argument(format!("Invalid UUID: {}", e)))?;
@@ -814,7 +876,7 @@ impl Immortal for ImmortalService {
     ) -> Result<Response<ClientStartWorkflowResponse>, Status> {
         let workflow_options = request.into_inner();
         let workflow_id = self
-            .start_workflow_internal(workflow_options, None, None)
+            .start_workflow_internal(workflow_options, None)
             .await?;
 
         println!("started workflow: {workflow_id}");
@@ -887,6 +949,7 @@ impl Immortal for ImmortalService {
             Some(workflow_result_version::Version::V1(workflow_result)) => {
                 // give it a time to let activities sync with redis
                 tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                println!("COMPLETD WORKFLOW");
                 self.completed_workflow_inner(workflow_result).await?;
                 // self.com
                 // Remove the activity from the running map
@@ -926,21 +989,21 @@ impl Immortal for ImmortalService {
                     match activity_queues.get_mut(&activity_options.task_queue) {
                         Some(queue) => {
                             queue.push_back(Box::new((
-                                "0".to_string(),
                                 activity_options.clone(),
-                                tx,
+                                vec![tx],
                                 now,
                                 activity_index,
+                                None,
                             )));
                         }
                         None => {
                             let mut queue = VecDeque::new();
                             queue.push_back(Box::new((
-                                "0".to_string(),
                                 activity_options.clone(),
-                                tx,
+                                vec![tx],
                                 now,
                                 activity_index,
+                                None,
                             )));
                             activity_queues.insert(activity_options.task_queue.clone(), queue);
                         }
@@ -952,7 +1015,10 @@ impl Immortal for ImmortalService {
                     Ok(payload) => Ok(Response::new(ActivityResultVersion {
                         version: Some(activity_result_version::Version::V1(payload)),
                     })),
-                    Err(_) => Err(Status::internal("Activity failed")),
+                    Err(e) =>  {
+                        println!("{:#?}", e);
+                        Err(Status::internal("Activity failed"))
+                    }
                 }
             }
             None => Err(Status::internal("unsupported version")),
@@ -1025,6 +1091,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // let _ = immortal_service.orphaned_workflows().await;
 
+    immortal_service.clone().resurrect();
     immortal_service.workflow_queue_thread();
     immortal_service.activity_queue_thread();
     immortal_service.call_queue_thread();
