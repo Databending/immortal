@@ -16,6 +16,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use strum::{AsRefStr, EnumString};
 use uuid::Uuid;
 
+use crate::history_metadata::WorkerOwner;
 use crate::history_metadata::{
     ActivityHistoryMetadata, ActivityRunHistoryMetadata, WorkflowHistoryMetadata,
 };
@@ -175,6 +176,7 @@ pub struct ActivityRun {
     pub workflow_id: String,
     pub activity_id: String,
     pub run_id: String,
+    pub owner: Option<WorkerOwner>,
     pub status: Status,
     pub output: Option<Payload>,
     pub start_time: DateTime<Utc>,
@@ -182,8 +184,14 @@ pub struct ActivityRun {
 }
 
 impl ActivityRun {
-    pub fn new(workflow_id: String, activity_id: String, run_id: String) -> Self {
+    pub fn new(
+        workflow_id: String,
+        activity_id: String,
+        run_id: String,
+        owner: Option<WorkerOwner>,
+    ) -> Self {
         Self {
+            owner,
             workflow_id,
             activity_id,
             run_id,
@@ -822,7 +830,7 @@ impl History {
             }
         }
 
-        Ok(Some(ActivityHistory { 
+        Ok(Some(ActivityHistory {
             start_time: activity_metadata.start_time,
             workflow_id: workflow_id.to_string(),
             activity_id: activity_id.to_string(),
@@ -893,6 +901,7 @@ impl History {
         }
 
         Ok(Some(ActivityRun {
+            owner: activity_run_metadata.owner,
             workflow_id: workflow_id.to_string(),
             activity_id: activity_id.to_string(),
             run_id: run_id.to_string(),
@@ -1202,6 +1211,7 @@ mod tests {
             "wf_id_1".to_string(),
             "act_id_1".to_string(),
             "run_id_1".to_string(),
+            None,
         );
 
         activity.add_run(run.clone());
@@ -1222,6 +1232,7 @@ mod tests {
             "wf_id_1".to_string(),
             "act_id_1".to_string(),
             "run_id_1".to_string(),
+            None,
         );
 
         assert_eq!(run.workflow_id, "wf_id_1");

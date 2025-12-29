@@ -18,12 +18,12 @@ macro_rules! register_workflow {
 use anyhow::anyhow;
 use common::{Payload, Payloads};
 use immortal::{
-    call_result_v1, immortal_client::ImmortalClient, CallV1, CallVersion,
-    ClientStartWorkflowOptionsV1, ClientStartWorkflowOptionsVersion, ClientStartWorkflowResponse,
-    NotifyV1, NotifyVersion, WorkflowResultV1,
+    CallV1, CallVersion, ClientStartWorkflowOptionsV1, ClientStartWorkflowOptionsVersion,
+    ClientStartWorkflowResponse, NotifyV1, NotifyVersion, WorkflowResultV1, call_result_v1,
+    immortal_client::ImmortalClient,
 };
 use serde::de::DeserializeOwned;
-use tonic::transport::Channel;
+use tonic::{codec::CompressionEncoding, transport::Channel};
 
 #[derive(Clone)]
 pub struct Client {
@@ -32,7 +32,10 @@ pub struct Client {
 
 impl Client {
     pub async fn connect(addr: String) -> Result<Self, tonic::transport::Error> {
-        let inner = ImmortalClient::connect(addr).await?;
+        let mut inner = ImmortalClient::connect(addr).await?;
+        inner = inner
+            .send_compressed(CompressionEncoding::Zstd)
+            .accept_compressed(CompressionEncoding::Zstd);
         Ok(Self { inner })
     }
 
@@ -116,8 +119,7 @@ impl Client {
         call_type: &str,
         task_queue: &str,
     ) -> anyhow::Result<()> {
-        self
-            .inner
+        self.inner
             .call_async(CallVersion {
                 version: Some(immortal::call_version::Version::V1(CallV1 {
                     input,
@@ -191,9 +193,9 @@ impl Client {
 
 pub mod immortal {
     tonic::include_proto!("immortal");
-    use serde::{de::DeserializeOwned, Serialize};
+    use serde::{Serialize, de::DeserializeOwned};
 
-    use super::failure::{failure, CanceledFailureInfo, Failure as APIFailure};
+    use super::failure::{CanceledFailureInfo, Failure as APIFailure, failure};
 
     use crate::{
         common::{Payload, Payloads},
@@ -455,13 +457,13 @@ mod tests {
             value: 42,
         };
         let vec_data = vec![data.clone()];
-        
+
         // Test creation
         let mut payloads = Payloads::new(vec_data.iter().collect());
-        
+
         // Test extraction
         let extracted: Vec<TestData> = payloads.to().expect("Failed to deserialize payloads");
-        
+
         assert_eq!(extracted.len(), 1);
         assert_eq!(extracted[0], data);
     }
@@ -470,9 +472,9 @@ mod tests {
     fn test_failure_creation() {
         let msg = "Something went wrong".to_string();
         let failure = Failure::application_failure(msg.clone(), true);
-        
+
         assert_eq!(failure.message, msg);
-        
+
         let app_failure = failure.maybe_application_failure();
         assert!(app_failure.is_some());
         assert!(app_failure.unwrap().non_retryable);

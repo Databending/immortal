@@ -4,7 +4,7 @@ use crate::history::{
     get_blob_raw, payload_to_blob_ref, run_output_blob_key, ActivityHistory, ActivityRun,
     Status as HistoryStatus, WorkflowHistory,
 };
-use crate::history_metadata::{ActivityHistoryMetadata, WorkflowHistoryMetadata};
+use crate::history_metadata::{ActivityHistoryMetadata, WorkerOwner, WorkflowHistoryMetadata};
 use crate::metrics::IdentifiableMetrics;
 use crate::{
     ActivityProperties, CallProperties, KillState, Notification, RegisteredWorker,
@@ -27,7 +27,7 @@ use rand::Rng;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, Notify, RwLock};
+use tokio::sync::{broadcast, mpsc, watch, Mutex, Notify, RwLock};
 use tonic::Status;
 use tracing::{error, info};
 use uuid::Uuid;
@@ -159,123 +159,6 @@ enum AdjustCapacity {
     Activity,
 }
 
-async fn fail_entire_workflow(
-    history: &History,
-    wf: &mut WorkflowHistoryMetadata,
-    now: DateTime<Utc>,
-) -> anyhow::Result<()> {
-    let mut con = history.get_con().await?;
-    for (_i, activity) in wf.activities.iter_mut().enumerate() {
-        for run in &mut activity.runs {
-            if matches!(run.status, HistoryStatus::Running) {
-                run.status = HistoryStatus::Failed;
-                history
-                    .store_activity_run_output(
-                        &wf.workflow_id,
-                        &activity.activity_id,
-                        &run.run_id,
-                        Payload::new(&simd_json::json!({
-                            "message": "Orphaned"
-                        })),
-                    )
-                    .await?;
-                // run.status = HistoryStatus::Failed("Orphaned".to_string());
-
-                run.end_time = Some(now);
-                run.store_run(&mut con, &wf.workflow_id, &activity.activity_id)
-                    .await?;
-            }
-        }
-
-        // if changed {
-        //     let activity_clone = activity.clone();
-        //     history
-        //         .update_activity(&v1.workflow_id, activity_clone)
-        //         .await?;
-        // }
-    }
-    wf.status = HistoryStatus::Failed;
-    history
-        .store_workflow_output(
-            &wf.workflow_id,
-            Payload::new(&simd_json::json!({
-                "message": "Orphaned"
-            })),
-        )
-        .await?;
-    wf.end_time = Some(now);
-    wf.store(&mut con, false).await?;
-    // history.update_workflow(&v1.workflow_id, v1.clone()).await?;
-    Ok(())
-}
-
-async fn rehydrate_activity_if_absent(
-    running_activities: &Arc<
-        RwLock<
-            HashMap<
-                String,
-                Box<(
-                    Uuid,
-                    Vec<tokio::sync::oneshot::Sender<ActivityResultV1>>,
-                    RunningProperties<ActivityProperties>,
-                )>,
-            >,
-        >,
-    >,
-    workers: &Arc<RwLock<HashMap<Uuid, RegisteredWorker>>>,
-    worker_id: &str,
-    worker_instance_id: &Uuid,
-    workflow_id: &str,
-    activity: &ActivityHistoryMetadata,
-    last_run_start: Option<DateTime<Utc>>,
-) {
-    let mut running = running_activities.write().await;
-    if running.contains_key(&activity.activity_id) {
-        return;
-    }
-    let (tx, _rx) = tokio::sync::oneshot::channel::<ActivityResultV1>();
-    let now = Utc::now();
-    running.insert(
-        activity.activity_id.clone(),
-        Box::new((
-            worker_instance_id.clone(),
-            vec![tx],
-            RunningProperties {
-                kill_state: KillState::Healthy,
-                worker_instance_id: worker_instance_id.clone(),
-                start: last_run_start.unwrap_or(now),
-                timeout: now + Duration::seconds(30),
-                max_duration: Duration::seconds(30),
-                worker_id: worker_id.to_string(),
-                heartbeat_timeout: Duration::seconds(30),
-                additional_properties: ActivityProperties {
-                    // not sure if this is correct
-                    latest_run_id: activity
-                        .runs
-                        .get(activity.runs.len() - 1)
-                        .unwrap()
-                        .run_id
-                        .to_string(),
-                    index: activity.index,
-                    workflow_id: workflow_id.to_string(),
-                    last_heartbeat: now,
-                    scheduled: last_run_start.unwrap_or(now),
-                    latest_run_start: last_run_start,
-                },
-            },
-        )),
-    );
-
-    // decrement activity capacity (best-effort)
-    ImmortalService::adjust_capacity(
-        Arc::clone(workers),
-        worker_instance_id,
-        -1,
-        AdjustCapacity::Activity,
-    )
-    .await;
-}
-
 // --- Activity retry policy (tweak as needed) ---
 const ACTIVITY_MAX_ATTEMPTS: usize = 3;
 const ACTIVITY_BACKOFF_BASE_MS: u64 = 1_000; // 1s
@@ -365,6 +248,7 @@ impl ImmortalService {
         //         Status::internal("Failed to get workflow history")
         //     })?;
 
+        self.workflow_notify.notify_one();
         let mut workflow = match workflow_metadata {
             Some(wf) => wf,
             None => {
@@ -585,6 +469,8 @@ impl ImmortalService {
                 );
             }
         }
+
+        self.workflow_notify.notify_one();
 
         Ok(())
     }
@@ -941,282 +827,6 @@ impl ImmortalService {
     // 2.2) If the activity is no longer running, depending on the retry policy, we either rerun it
     //   or fail everything
 
-    // async fn _continue_workflow(&self, workflow_id: &str) -> anyhow::Result<()> {
-    //     if let Some(workflow) = self.history.get_workflow(workflow_id).await? {
-    //         let activities_cache: Vec<_> = workflow
-    //             .activities
-    //             .iter()
-    //             .map(|f| ActivityCache {
-    //                 input: f.input.clone(),
-    //                 // output: f.output.as_ref().map(|x| Payload::new(x)),
-    //                 output: None,
-    //                 activity_type: f.activity_type.clone(),
-    //                 task_queue: f.task_queue.clone(),
-    //             })
-    //             .collect();
-    //         self.start_workflow_internal(
-    //             ClientStartWorkflowOptionsVersion {
-    //                 version: Some(client_start_workflow_options_version::Version::V1(
-    //                     ClientStartWorkflowOptionsV1 {
-    //                         workflow_type: workflow.workflow_type.clone(),
-    //                         workflow_version: "V1".to_string(),
-    //                         input: Some(Payloads::new(workflow.args.iter().map(|f| f).collect())),
-    //                         task_queue: workflow.task_queue.clone(),
-    //                         workflow_id: Some(workflow_id.to_string()),
-    //                     },
-    //                 )),
-    //             },
-    //             None,
-    //             Some(activities_cache),
-    //         )
-    //         .await?;
-    //     }
-    //
-    //     Ok(())
-    // }
-
-    // this should be deleted soon
-    async fn orphaned_workflows(&self) -> anyhow::Result<()> {
-        use tokio::time::{timeout, Duration as TokioDuration};
-
-        let running_activities = Arc::clone(&self.running_activities);
-        let orphaned_activities = Arc::clone(&self.orphaned_activities);
-        let orphaned_workflows = Arc::clone(&self.orphaned_workflows);
-        let workers = Arc::clone(&self.workers);
-        let history = self.history.clone();
-
-        let mut con = history.get_con().await?;
-        // scan recent set; tune page as desired
-
-        let mut workflows = WorkflowHistoryMetadata::get_all(
-            &mut con,
-            Some(500),
-            Some(0),
-            None,
-            None,
-            None,
-            None,
-            true,
-        )
-        .await?;
-
-        for wf in &mut workflows {
-            if !matches!(wf.status, HistoryStatus::Running) {
-                continue;
-            }
-
-            let now = Utc::now();
-            let Some(worker_id) = wf.worker_id.clone() else {
-                // nothing owns it: fail everything
-                fail_entire_workflow(&history, wf, now).await?;
-                continue;
-            };
-            let Some(owner) = wf.owner.clone() else {
-                // nothing owns it: fail everything
-                fail_entire_workflow(&history, wf, now).await?;
-                continue;
-            };
-
-            // ensure worker exists & matches queue + can run the workflow type
-            let (worker_tx, can_run_workflow) = {
-                let guard = workers.read().await;
-                if let Some(w) = guard.get(&owner.instance_id) {
-                    let queue_ok = wf.task_queue == w.task_queue;
-                    let wf_ok = w.registered_workflows.contains_key(&wf.workflow_type);
-                    (Some(w.tx.clone()), queue_ok && wf_ok)
-                } else {
-                    (None, false)
-                }
-            };
-
-            if worker_tx.is_none() || !can_run_workflow {
-                fail_entire_workflow(&history, wf, now).await?;
-                continue;
-            }
-
-            // Ask the worker if this workflow is actually still running.
-            let (tx_wf, rx_wf) = oneshot::channel::<bool>();
-            {
-                let mut map = orphaned_workflows.write().await;
-                map.insert(wf.workflow_id.clone(), tx_wf);
-            }
-
-            // fire-and-wait (bounded)
-            if let Err(_e) = worker_tx
-                .as_ref()
-                .unwrap()
-                .send(Ok(ImmortalWorkerActionVersion {
-                    version: Some(immortal_worker_action_version::Version::V1(
-                        ImmortalWorkerActionV1 {
-                            action: Some(WorkerAction::CheckWorkflow(wf.workflow_id.clone())),
-                        },
-                    )),
-                }))
-                .await
-            {
-                // can’t ask => consider orphaned
-                fail_entire_workflow(&history, wf, now).await?;
-                continue;
-            }
-
-            let running = timeout(TokioDuration::from_secs(2), rx_wf)
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or(false);
-
-            if !running {
-                // worker said "no" (or timed out) => fail everything
-                fail_entire_workflow(&history, wf, now).await?;
-                continue;
-            }
-
-            // Workflow is running: check each Running activity run.
-            for activity in &mut wf.activities {
-                // Only check the *latest* running run (if any)
-                let maybe_latest_running_idx = activity
-                    .runs
-                    .iter()
-                    .rposition(|r| matches!(r.status, HistoryStatus::Running));
-
-                let Some(idx) = maybe_latest_running_idx else {
-                    continue;
-                };
-                // let run_id = activity.runs[idx].run_id.clone();
-
-                // Ensure worker can run this activity on this queue
-                let can_resume_activity = {
-                    let guard = workers.read().await;
-                    if let Some(w) = guard.get(&owner.instance_id) {
-                        wf.task_queue == w.task_queue
-                            && w.registered_activities
-                                .contains_key(&activity.activity_type)
-                    } else {
-                        false
-                    }
-                };
-
-                if !can_resume_activity {
-                    // Mark that run failed
-                    activity.runs[idx].status = HistoryStatus::Failed;
-                    activity.runs[idx].end_time = Some(now);
-                    activity.store(&mut con, &wf.workflow_id, false).await?;
-                    // let cloned = activity.clone();
-
-                    // history.update_activity(&wf.workflow_id, cloned).await?;
-                    continue;
-                }
-
-                // Ask the worker about the activity
-                let (tx_act, rx_act) = oneshot::channel::<bool>();
-                {
-                    let mut map = orphaned_activities.write().await;
-                    map.insert(activity.activity_id.clone(), tx_act);
-                }
-
-                if let Err(_e) = worker_tx
-                    .as_ref()
-                    .unwrap()
-                    .send(Ok(ImmortalWorkerActionVersion {
-                        version: Some(immortal_worker_action_version::Version::V1(
-                            ImmortalWorkerActionV1 {
-                                action: Some(WorkerAction::CheckActivity(
-                                    activity.activity_id.clone(),
-                                )),
-                            },
-                        )),
-                    }))
-                    .await
-                {
-                    // treat as not running
-                    activity.runs[idx].status = HistoryStatus::Failed;
-
-                    activity.runs[idx].end_time = Some(now);
-                    let run_id = activity.runs[idx].run_id.clone();
-                    // let cloned = activity.clone();
-                    history
-                        .store_activity_run_output(
-                            &wf.workflow_id,
-                            &activity.activity_id,
-                            &run_id,
-                            Payload::new(&simd_json::json!({
-                                "message": "Orphaned"
-                            })),
-                        )
-                        .await?;
-                    activity.runs[idx]
-                        .store_run(&mut con, &wf.workflow_id, &activity.activity_id)
-                        .await?;
-                    // history.update_activity(&v1.workflow_id, cloned).await?;
-                    continue;
-                }
-
-                let act_running = timeout(TokioDuration::from_secs(2), rx_act)
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .unwrap_or(false);
-
-                if act_running {
-                    // rehydrate into memory so watchdog & logs update heartbeats again
-                    let last_run_start = activity.runs[idx].start_time;
-                    rehydrate_activity_if_absent(
-                        &running_activities,
-                        &workers,
-                        &worker_id,
-                        &owner.instance_id,
-                        &wf.workflow_id,
-                        activity,
-                        Some(last_run_start),
-                    )
-                    .await;
-                } else {
-                    // mark failed
-                    activity.runs[idx].status = HistoryStatus::Failed;
-                    activity.runs[idx].end_time = Some(now);
-
-                    let run_id = activity.runs[idx].run_id.clone();
-                    history
-                        .store_activity_run_output(
-                            &wf.workflow_id,
-                            &activity.activity_id,
-                            &run_id,
-                            Payload::new(&simd_json::json!({
-                                "message": "Orphaned"
-                            })),
-                        )
-                        .await?;
-                    activity.runs[idx]
-                        .store_run(&mut con, &wf.workflow_id, &activity.activity_id)
-                        .await?;
-                }
-            }
-
-            // If *all* activities ended up not running anymore, it’s safer to fail the workflow too.
-            let any_running_left = wf.activities.iter().any(|a| {
-                a.runs
-                    .iter()
-                    .any(|r| matches!(r.status, HistoryStatus::Running))
-            });
-
-            if !any_running_left {
-                wf.status = HistoryStatus::Failed;
-                history
-                    .store_workflow_output(
-                        &wf.workflow_id,
-                        Payload::new(&simd_json::json!({
-                            "message": "Orphaned"
-                        })),
-                    )
-                    .await?;
-                wf.end_time = Some(now);
-                wf.store(&mut con, false).await?;
-                // history.update_workflow(&wf.workflow_id, v1.clone()).await?;
-            }
-        }
-
-        Ok(())
-    }
     pub async fn kill_workflow(&self, workflow_id: &str) -> anyhow::Result<()> {
         let mut con = self.history.get_con().await?;
         if let Some(workflow) =
@@ -1520,11 +1130,7 @@ impl ImmortalService {
                             .contains(&wf.workflow_id)
                         {
                             if let Some(queue) = wf_queue.get_mut(&wf.opts.task_queue) {
-                                queue.push_back(Box::new((
-                                    wf.workflow_id.clone(),
-                                    wf.opts,
-                                    None,
-                                )));
+                                queue.push_back(Box::new((wf.workflow_id.clone(), wf.opts, None)));
                             }
                         }
                     } else {
@@ -1899,6 +1505,44 @@ impl ImmortalService {
                                             entry.2.additional_properties.scheduled = scheduled;
                                             entry.2.additional_properties.index = index;
                                             continue;
+                                            // we should also check here on the latest run
+                                            // heartbeat
+                                        } else if let Some(owner) = &latest_run.owner {
+                                            let now = Utc::now();
+                                            let duration = Duration::seconds(30);
+                                            let timeout = now + duration;
+                                            running.insert(
+                                                activity_id.clone(),
+                                                Box::new((
+                                                    owner.instance_id.clone(),
+                                                    txs,
+                                                    RunningProperties {
+                                                        start: now,
+                                                        timeout,
+                                                        max_duration: duration,
+                                                        worker_id: owner.worker_id.clone(),
+                                                        worker_instance_id: owner.instance_id.clone(),
+                                                        kill_state: KillState::Healthy,
+                                                        heartbeat_timeout: activity_options
+                                                            .heartbeat_timeout
+                                                            .map(|f| f.into())
+                                                            .unwrap_or(Duration::seconds(30)),
+                                                        additional_properties: ActivityProperties {
+                                                            latest_run_id: latest_run
+                                                                .run_id
+                                                                .clone(),
+                                                            workflow_id: activity_options
+                                                                .workflow_id
+                                                                .clone(),
+                                                            last_heartbeat: now,
+                                                            scheduled,
+                                                            latest_run_start: None,
+                                                            index,
+                                                        },
+                                                    },
+                                                )),
+                                            );
+                                            continue;
                                         }
 
                                         // Requeue to try later (history says running but not in memory)
@@ -2050,6 +1694,10 @@ impl ImmortalService {
                         activity_options.workflow_id.clone(),
                         activity_id.clone(),
                         run_id.clone(),
+                        Some(WorkerOwner {
+                            worker_id: worker.1.clone(),
+                            instance_id: worker.0.clone(),
+                        }),
                     );
 
                     match history
@@ -2176,12 +1824,7 @@ impl ImmortalService {
                                     }
                                 }
 
-                                out = Some((
-                                    queue_name.clone(),
-                                    workflow_id,
-                                    client_opts,
-                                    sender,
-                                ));
+                                out = Some((queue_name.clone(), workflow_id, client_opts, sender));
                                 break;
                             }
                             if out.is_some() {
@@ -2226,6 +1869,7 @@ impl ImmortalService {
                                 w.task_queue == queue_name
                                     && w.registered_workflows
                                         .contains_key(&workflow_options.workflow_type)
+                                    && w.workflow_capacity > 0
                             })
                             .map(|(_, w)| (w.instance_id, w.worker_id.clone(), w.tx.clone()))
                             .collect()
@@ -2238,11 +1882,7 @@ impl ImmortalService {
                             queues
                                 .entry(queue_name.clone())
                                 .or_insert_with(VecDeque::new)
-                                .push_front(Box::new((
-                                    workflow_id,
-                                    client_opts,
-                                    sender,
-                                )));
+                                .push_front(Box::new((workflow_id, client_opts, sender)));
                         }
                         break;
                     }

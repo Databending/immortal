@@ -1,5 +1,5 @@
 fn main() {
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .type_attribute(".", "#[derive(serde::Deserialize, serde::Serialize)]")
         .enum_attribute(".", "#[serde(tag = \"type\", content = \"spec\")]")
         .extern_path(".google.protobuf.Any", "::prost_wkt_types::Any")

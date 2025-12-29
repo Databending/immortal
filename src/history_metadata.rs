@@ -666,6 +666,8 @@ pub struct ActivityRunHistoryMetadata {
     pub start_time: DateTime<Utc>,
     pub end_time: Option<DateTime<Utc>>,
     pub output: Option<BlobRef>,
+
+    pub owner: Option<WorkerOwner>,
 }
 
 impl ActivityRunHistoryMetadata {
@@ -684,6 +686,7 @@ impl ActivityRunHistoryMetadata {
         let meta_val: redis::Value = redis::cmd("HGETALL").arg(&base).query_async(con).await?;
         let meta: std::collections::HashMap<String, String> = redis::from_redis_value(&meta_val)?;
 
+        let owner = meta.get("owner").map(|f| serde_json::from_str(f).unwrap());
         let status = Status::from_str(
             &meta
                 .get("status")
@@ -719,6 +722,7 @@ impl ActivityRunHistoryMetadata {
             start_time,
             end_time,
             output,
+            owner
         }))
     }
     pub async fn store_run(
@@ -746,6 +750,9 @@ impl ActivityRunHistoryMetadata {
                     .map(|t| t.to_rfc3339())
                     .unwrap_or_else(String::new),
             );
+        if let Some(owner) = &self.owner {
+            query.arg("owner").arg(simd_json::to_string(&owner)?);
+        }
         if let Some(output) = &self.output {
             query
                 .arg("output_metadata")
@@ -779,6 +786,7 @@ impl Into<ActivityRunHistoryMetadata> for ActivityRun {
             start_time: self.start_time,
             end_time: self.end_time,
             output,
+            owner: self.owner.clone(),
         }
     }
 }
@@ -802,6 +810,7 @@ impl From<&ActivityRun> for ActivityRunHistoryMetadata {
             status: activity_run.status.clone(),
             start_time: activity_run.start_time,
             end_time: activity_run.end_time,
+            owner: activity_run.owner.clone(),
             output,
         }
     }

@@ -1,5 +1,6 @@
 use immortal_lib::common::Payloads;
 use regex::Regex;
+use tonic::codec::CompressionEncoding;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
@@ -875,9 +876,7 @@ impl Immortal for ImmortalService {
         request: Request<ClientStartWorkflowOptionsVersion>,
     ) -> Result<Response<ClientStartWorkflowResponse>, Status> {
         let workflow_options = request.into_inner();
-        let workflow_id = self
-            .start_workflow_internal(workflow_options, None)
-            .await?;
+        let workflow_id = self.start_workflow_internal(workflow_options, None).await?;
 
         println!("started workflow: {workflow_id}");
         Ok(Response::new(ClientStartWorkflowResponse { workflow_id }))
@@ -986,6 +985,14 @@ impl Immortal for ImmortalService {
                             ))
                         })?;
 
+                    // so new kind of bug when a server starts up a worker sends it it's finished
+                    // activities.
+                    // it is a race condition because the outbox doesn't send before
+                    // the new workflow calls the activity again. Because of this
+                    // the activity isn't set in running_activities (memory) because
+                    // the activity is in the outbox and no longer running. A solution would be to
+                    // side step the running_activities in memory and instead refer to the database
+
                     match activity_queues.get_mut(&activity_options.task_queue) {
                         Some(queue) => {
                             queue.push_back(Box::new((
@@ -1015,7 +1022,7 @@ impl Immortal for ImmortalService {
                     Ok(payload) => Ok(Response::new(ActivityResultVersion {
                         version: Some(activity_result_version::Version::V1(payload)),
                     })),
-                    Err(e) =>  {
+                    Err(e) => {
                         println!("{:#?}", e);
                         Err(Status::internal("Activity failed"))
                     }
@@ -1096,7 +1103,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     immortal_service.activity_queue_thread();
     immortal_service.call_queue_thread();
     immortal_service.clone().watchdog();
-    let svc = ImmortalServer::new((*immortal_service).clone());
+    let svc = ImmortalServer::new((*immortal_service).clone())
+        .send_compressed(CompressionEncoding::Zstd)
+        .accept_compressed(CompressionEncoding::Zstd);
     // let (health_reporter, health_service) = tonic_health::server::health_reporter();
     // health_reporter
     //     .set_serving::<ImmortalServer<ImmortalService>>()
