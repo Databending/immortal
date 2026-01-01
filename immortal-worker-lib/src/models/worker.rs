@@ -1551,26 +1551,26 @@ impl Worker {
         let notification_type = notification_type.to_string();
 
         let mut act2 = registered_notifications.lock().await;
-        let act = act2.get_mut(&notification_type).unwrap();
+        if let Some(act) = act2.get_mut(&notification_type) {
+            let act_handle = act.0.start_notification(
+                payload,
+                safe_app_data.clone(),
+                notification_type,
+                notification_id.to_string(),
+            );
+            tokio::spawn(async move {
+                let res = tokio::spawn(act_handle);
+                match res.await {
+                    Err(e) => {
+                        println!("ERROR IN NOTIFICATION: {}", e.to_string());
+                    }
+
+                    _ => {}
+                }
+            });
+        }
 
         // let nid = notification_id.to_string();
-
-        let act_handle = act.0.start_notification(
-            payload,
-            safe_app_data.clone(),
-            notification_type,
-            notification_id.to_string(),
-        );
-        tokio::spawn(async move {
-            let res = tokio::spawn(act_handle);
-            match res.await {
-                Err(e) => {
-                    println!("ERROR IN NOTIFICATION: {}", e.to_string());
-                }
-
-                _ => {}
-            }
-        });
     }
 }
 
