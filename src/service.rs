@@ -633,7 +633,7 @@ impl ImmortalService {
             }
 
             Some(immortal::activity_result_v1::Status::Cancelled(x)) => {
-                failed = true;
+                failed = false;
                 run.status = HistoryStatus::Failed;
                 let payload = Payload::new(&x);
                 run.output = Some(payload_to_blob_ref(run_path, &payload));
