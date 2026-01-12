@@ -6,6 +6,7 @@ use crate::history::{
 };
 use crate::history_metadata::{ActivityHistoryMetadata, WorkerOwner, WorkflowHistoryMetadata};
 use crate::metrics::IdentifiableMetrics;
+use crate::timeline::{WorkflowTimelineEntryV1, WorkflowTimelineEventV1};
 use crate::{
     ActivityProperties, CallProperties, KillState, Notification, RegisteredWorker,
     RunningProperties,
@@ -176,7 +177,7 @@ async fn build_retry_activity_options(
 ) -> anyhow::Result<immortal::RequestStartActivityOptionsV1> {
     let mut con = history.get_con().await?;
     // use immortal_lib::common::Payload;
-    if let Some(workflow_metadata) = WorkflowHistoryMetadata::get_opt(&mut con, &workflow_id, true)
+    if let Some(_workflow_metadata) = WorkflowHistoryMetadata::get_opt(&mut con, &workflow_id, true)
         .await
         .map_err(|e| {
             println!("Failed to get workflow history: {:?}", e);
@@ -195,8 +196,7 @@ async fn build_retry_activity_options(
             // activity_id: activity_id.clone(),
             activity_type: activity.activity_type.clone(),
             activity_input,
-            // Use the same queue as the workflow by default
-            task_queue: workflow_metadata.task_queue,
+            task_queue: activity.task_queue.clone().unwrap_or("".to_string()),
             // Reasonable defaults; override if you persist these in history
             heartbeat_timeout: None,
             schedule_to_start_timeout: None,
@@ -288,6 +288,11 @@ impl ImmortalService {
 
         // Set status and send specific notification
         match workflow_result.status {
+            Some(workflow_result_v1::Status::Sleep(_x)) => {
+                workflow.status = HistoryStatus::Sleeping;
+                workflow_output = None;
+
+            }
             Some(workflow_result_v1::Status::Completed(x)) => {
                 match x.result {
                     Some(result_data) => {
@@ -583,6 +588,17 @@ impl ImmortalService {
                             error!("Error storing activity run output: {:?}", e);
                             Status::internal("Error storing activity run output")
                         })?;
+                    let _ = WorkflowTimelineEntryV1::new(
+                        &activity_result.workflow_id,
+                        activity_result.workflow_epoch,
+                        WorkflowTimelineEventV1::ActivityRunFinished {
+                            activity_id: activity_result.activity_id.clone(),
+                            run_id: run.run_id.clone(),
+                            status: HistoryStatus::Completed,
+                        },
+                    )
+                    .append(&mut con)
+                    .await;
                     run.output = Some(payload_to_blob_ref(run_path, &result_data));
                 }
                 None => {
@@ -596,6 +612,17 @@ impl ImmortalService {
                         data,
                         ..Default::default()
                     };
+                    let _ = WorkflowTimelineEntryV1::new(
+                        &activity_result.workflow_id,
+                        activity_result.workflow_epoch,
+                        WorkflowTimelineEventV1::ActivityRunFinished {
+                            activity_id: activity_result.activity_id.clone(),
+                            run_id: run.run_id.clone(),
+                            status: HistoryStatus::Failed,
+                        },
+                    )
+                    .append(&mut con)
+                    .await;
                     run.output = Some(payload_to_blob_ref(run_path, &payload));
                     self.history
                         .store_activity_run_output(
@@ -618,6 +645,17 @@ impl ImmortalService {
                 run.status = HistoryStatus::Failed;
                 let payload = Payload::new(&x);
                 run.output = Some(payload_to_blob_ref(run_path, &payload));
+                let _ = WorkflowTimelineEntryV1::new(
+                    &activity_result.workflow_id,
+                    activity_result.workflow_epoch,
+                    WorkflowTimelineEventV1::ActivityRunFinished {
+                        activity_id: activity_result.activity_id.clone(),
+                        run_id: run.run_id.clone(),
+                        status: HistoryStatus::Failed,
+                    },
+                )
+                .append(&mut con)
+                .await;
                 self.history
                     .store_activity_run_output(
                         &activity_result.workflow_id,
@@ -637,6 +675,17 @@ impl ImmortalService {
                 run.status = HistoryStatus::Failed;
                 let payload = Payload::new(&x);
                 run.output = Some(payload_to_blob_ref(run_path, &payload));
+                let _ = WorkflowTimelineEntryV1::new(
+                    &activity_result.workflow_id,
+                    activity_result.workflow_epoch,
+                    WorkflowTimelineEventV1::ActivityRunFinished {
+                        activity_id: activity_result.activity_id.clone(),
+                        run_id: run.run_id.clone(),
+                        status: HistoryStatus::Failed,
+                    },
+                )
+                .append(&mut con)
+                .await;
                 self.history
                     .store_activity_run_output(
                         &activity_result.workflow_id,
@@ -663,6 +712,17 @@ impl ImmortalService {
                     ..Default::default()
                 };
                 run.output = Some(payload_to_blob_ref(run_path, &payload));
+                let _ = WorkflowTimelineEntryV1::new(
+                    &activity_result.workflow_id,
+                    activity_result.workflow_epoch,
+                    WorkflowTimelineEventV1::ActivityRunFinished {
+                        activity_id: activity_result.activity_id.clone(),
+                        run_id: run.run_id.clone(),
+                        status: HistoryStatus::Failed,
+                    },
+                )
+                .append(&mut con)
+                .await;
                 self.history
                     .store_activity_run_output(
                         &activity_result.workflow_id,
@@ -710,7 +770,9 @@ impl ImmortalService {
             .map(|r| r.run_id == activity_result.activity_run_id)
             .unwrap_or(false);
 
+        println!("{failed} {is_latest_run} {attempts} {ACTIVITY_MAX_ATTEMPTS}");
         if failed && is_latest_run && attempts < ACTIVITY_MAX_ATTEMPTS {
+            println!("RETRYING");
             match build_retry_activity_options(
                 &self.history,
                 &activity_result.workflow_id,
@@ -917,6 +979,7 @@ impl ImmortalService {
             kill_state: KillState,
             // worker_id: String,
             worker_instance_id: Uuid,
+            workflow_epoch: u64,
         }
 
         #[derive(Clone, Debug)]
@@ -991,6 +1054,7 @@ impl ImmortalService {
                                     run_id: props.latest_run_id.clone(),
                                     // worker_id: boxed.2.worker_id.clone(),
                                     worker_instance_id: boxed.2.worker_instance_id.clone(),
+                                    workflow_epoch: props.workflow_epoch,
                                 })
                             } else {
                                 None
@@ -1110,6 +1174,7 @@ impl ImmortalService {
                                     }),
                                 },
                             )),
+                            workflow_epoch: t.workflow_epoch.clone(),
                         };
 
                         // IMPORTANT:
@@ -1396,43 +1461,38 @@ impl ImmortalService {
                     // ---- PROCESS ITEM (NO activity_queue lock held) ----
                     let (activity_options, mut txs, scheduled, index, activity_id_opt) =
                         *queued_item;
-
-                    let activity_hash = if activity_options.idempotency_key == "" {
-                        ActivityHistory::hash(
-                            &activity_options.activity_type,
-                            &activity_options.activity_input,
-                        )
-                    } else {
-                        activity_options.idempotency_key.clone()
-                    };
+                    //
+                    // let activity_idempotency_key = if activity_options.idempotency_key == "" {
+                    //     ActivityHistory::hash(
+                    //         &activity_options.activity_type,
+                    //         &activity_options.activity_input,
+                    //     )
+                    // } else {
+                    //     activity_options.idempotency_key.clone()
+                    // };
 
                     let mut con = history.get_con().await.unwrap();
 
                     // if activity_id is present that means it was scheduled for a retry
-                    let mut existing_by_hash = None;
+                    // let mut existing_by_hash = None;
                     let activity_id = if let Some(id) = &activity_id_opt {
-                        id.clone()
+                        id.clone() // retry path keeps same id
                     } else {
-                        if let Some(activity) = ActivityHistoryMetadata::get_by_hash_opt(
-                            &mut con,
-                            &activity_options.workflow_id,
-                            &activity_hash,
-                        )
-                        .await
-                        .unwrap()
-                        {
-                            existing_by_hash = Some(activity.clone());
-                            activity.activity_id.clone()
-                        } else {
-                            Uuid::new_v4().to_string()
-                        }
+                        activity_options.idempotency_key.clone()
                     };
+                    let existing = ActivityHistoryMetadata::get_opt(
+                        &mut con,
+                        &activity_options.workflow_id,
+                        &activity_id,
+                    )
+                    .await
+                    .unwrap();
 
                     // ---------------------------
                     // 1) ATTACH / EARLY RETURN PATHS
                     // ---------------------------
                     if activity_id_opt.is_none() {
-                        if let Some(activity) = &existing_by_hash {
+                        if let Some(activity) = &existing {
                             if let Some(latest_run) = activity.runs.last() {
                                 match latest_run.status {
                                     HistoryStatus::Completed => {
@@ -1453,6 +1513,7 @@ impl ImmortalService {
                                                         immortal::Success { result: payload.clone() },
                                                     ),
                                                 ),
+                                                workflow_epoch: latest_run.workflow_epoch.clone()
                                             });
                                             }
                                         }
@@ -1477,6 +1538,7 @@ impl ImmortalService {
                                                 activity_id: activity.activity_id.clone(),
                                                 activity_run_id: latest_run.run_id.clone(),
                                                 workflow_id: activity_options.workflow_id.clone(),
+                                                workflow_epoch: latest_run.workflow_epoch.clone(),
                                                 status: Some(
                                                     immortal::activity_result_v1::Status::Failed(
                                                         immortal::Failure {
@@ -1521,7 +1583,9 @@ impl ImmortalService {
                                                         timeout,
                                                         max_duration: duration,
                                                         worker_id: owner.worker_id.clone(),
-                                                        worker_instance_id: owner.instance_id.clone(),
+                                                        worker_instance_id: owner
+                                                            .instance_id
+                                                            .clone(),
                                                         kill_state: KillState::Healthy,
                                                         heartbeat_timeout: activity_options
                                                             .heartbeat_timeout
@@ -1538,6 +1602,9 @@ impl ImmortalService {
                                                             scheduled,
                                                             latest_run_start: None,
                                                             index,
+                                                            workflow_epoch: latest_run
+                                                                .workflow_epoch
+                                                                .clone(),
                                                         },
                                                     },
                                                 )),
@@ -1586,6 +1653,7 @@ impl ImmortalService {
                                     activity_id: activity_id.clone(),
                                     workflow_id: activity_options.workflow_id.clone(),
                                     activity_run_id: Uuid::new_v4().to_string(),
+                                    workflow_epoch: activity_options.workflow_epoch,
                                     status: Some(immortal::activity_result_v1::Status::Failed(
                                         immortal::Failure {
                                             failure: Some(failure::Failure {
@@ -1605,6 +1673,7 @@ impl ImmortalService {
                     // ---------------------------
                     let available_workers: Vec<_> = {
                         let workers_guard = workers.read().await;
+
                         workers_guard
                             .iter()
                             .filter(|(_, worker)| {
@@ -1625,6 +1694,7 @@ impl ImmortalService {
                     };
 
                     if available_workers.is_empty() {
+                        println!("NO AVAILABLE WORKERS");
                         // Requeue (NO lock held across await)
                         {
                             let mut activity_queues = activity_queue.lock().await;
@@ -1685,6 +1755,7 @@ impl ImmortalService {
                                     scheduled,
                                     latest_run_start: None,
                                     index,
+                                    workflow_epoch: activity_options.workflow_epoch,
                                 },
                             },
                         )),
@@ -1698,6 +1769,7 @@ impl ImmortalService {
                             worker_id: worker.1.clone(),
                             instance_id: worker.0.clone(),
                         }),
+                        activity_options.workflow_epoch,
                     );
 
                     match history
@@ -1740,6 +1812,7 @@ impl ImmortalService {
                                             activity_input: activity_options.activity_input.clone(),
                                             workflow_id: activity_options.workflow_id.clone(),
                                             activity_run_id: run_id.clone(),
+                                            workflow_epoch: activity_options.workflow_epoch,
                                         },
                                     )),
                                 },
@@ -1775,7 +1848,17 @@ impl ImmortalService {
                         AdjustCapacity::Activity,
                     )
                     .await;
-
+                    let _ = WorkflowTimelineEntryV1::new(
+                        &activity_options.workflow_id,
+                        activity_options.workflow_epoch,
+                        WorkflowTimelineEventV1::ActivityRunStarted {
+                            activity_id: activity_options.idempotency_key.clone(),
+                            run_id,
+                            attempt: None,
+                        },
+                    )
+                    .append(&mut con)
+                    .await;
                     let _ = notification_tx.send(Notification::ActivityRunStarted(
                         Uuid::parse_str(&activity_options.workflow_id).unwrap_or_default(),
                         activity_history,
@@ -1895,6 +1978,18 @@ impl ImmortalService {
                         let mut running = running_workflows.write().await;
                         let now = Utc::now();
                         let timeout = now + Duration::seconds(30);
+
+                        let mut con = pool.get().await.unwrap();
+                        let _ = WorkflowTimelineEntryV1::new(
+                            &workflow_id,
+                            epoch,
+                            WorkflowTimelineEventV1::WorkflowStarted {
+                                workflow_type: client_opts.workflow_type.clone(),
+                                task_queue: client_opts.task_queue.clone(),
+                            },
+                        )
+                        .append(&mut con)
+                        .await;
 
                         running.insert(
                             workflow_id.clone(),

@@ -444,9 +444,7 @@ pub async fn get_activity_queue(
             .map(|f| {
                 (
                     f.0.clone(),
-                    f.1.iter()
-                        .map(|f| f.0.clone())
-                        .collect::<Vec<_>>(),
+                    f.1.iter().map(|f| f.0.clone()).collect::<Vec<_>>(),
                 )
             })
             .collect::<HashMap<_, _>>(),

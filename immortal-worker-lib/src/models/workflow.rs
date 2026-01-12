@@ -42,6 +42,7 @@ pub struct WfContext {
     pub client: ImmortalClient<Channel>,
     pub args: Arc<Payloads>,
     pub id: String,
+    pub epoch: u64,
     pub activity_seq: u32,
     pub connected_rx: watch::Receiver<bool>,
     // pub app_data: Option<AppData>,
@@ -72,6 +73,13 @@ impl WfContext {
         self.activity_seq = self.activity_seq.wrapping_add(1);
         s
     }
+    pub async fn sleep(
+        &mut self,
+        options: ActivityOptions,
+    ) -> anyhow::Result<()> {
+
+        Ok(())
+    }
     pub async fn activity<T: DeserializeOwned>(
         &mut self,
         options: ActivityOptions,
@@ -80,11 +88,13 @@ impl WfContext {
         let idempotency_key = format!(
             "{}:{}:{}:{}",
             self.id,
+            self.epoch,
             options.activity_type,
             seq,
             // for MVP you can hash the input bytes
-            blake3::hash(&options.input.data).to_hex()
+            // blake3::hash(&options.input.data).to_hex()
         );
+        let fingerprint = blake3::hash(&options.input.data).to_hex();
         // strip cache once it is done and remove some of the clones
         // if let Some(cache) = &self.cache {
         //     for item in cache {
@@ -115,6 +125,7 @@ impl WfContext {
             retry_policy: options.retry_policy.map(|x| x.try_into().unwrap()),
             task_queue: options.task_queue.unwrap_or(self.task_queue.clone()),
             idempotency_key,
+            fingerprint: fingerprint.to_string(),
             ..Default::default()
         };
         request.set_cancellation_type(options.cancellation_type.into());
@@ -289,6 +300,7 @@ impl WorkflowFunction {
         namespace: String,
         task_queue: String,
         connected_rx: tokio::sync::watch::Receiver<bool>,
+        epoch: u64,
     ) -> Instrumented<Pin<Box<dyn Future<Output = Result<WfExitValue<OwnedValue>, Error>> + Send>>>
     {
         let span = info_span!(
@@ -305,6 +317,7 @@ impl WorkflowFunction {
             id: workflow_id,
             activity_seq: 0,
             connected_rx,
+            epoch,
         })
         .instrument(span);
         handle

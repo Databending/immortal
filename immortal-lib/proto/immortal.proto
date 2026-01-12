@@ -140,6 +140,7 @@ message ActivityResultV1 {
   }
 
   string workflow_id = 7;
+  uint64 workflow_epoch = 8;
 }
 
 message ActivityResultVersion {
@@ -167,6 +168,7 @@ message WorkflowResultV1 {
     Success completed = 3;
     Failure failed = 4;
     Cancellation cancelled = 5;
+    string sleep = 8;
   }
   string worker_instance_id = 6;
   uint64 epoch = 7;
@@ -218,6 +220,8 @@ message RequestStartActivityOptionsV1 {
   ActivityCancellationType cancellation_type = 10;
   RetryPolicy retry_policy = 11;
   string idempotency_key = 12;
+  string fingerprint = 13;
+  uint64 workflow_epoch = 14;
 }
 
 message StartActivityOptionsV1 {
@@ -226,6 +230,7 @@ message StartActivityOptionsV1 {
   common.Payload activity_input = 3;
   string workflow_id = 4;
   string activity_run_id = 5;
+  uint64 workflow_epoch = 6;
 }
 
 message StartCallOptionsV1 {
@@ -317,6 +322,7 @@ message ImmortalWorkerActionV1 {
     string check_activity = 9;
     string check_workflow = 10;
     string timeout_activity = 11;
+    string sleep_workflow = 12;
   }
 }
 
@@ -445,6 +451,8 @@ service Immortal {
       returns (WorkflowResultVersion) {}
   rpc StartActivity(RequestStartActivityOptionsVersion)
       returns (ActivityResultVersion) {}
+  // rpc Sleep(RequestSleepOptionsVersion)
+  //     returns (google.protobuf.Empty) {}
   rpc CompletedActivity(ActivityResultVersion) returns (google.protobuf.Empty) {
   }
   rpc CompletedWorkflow(WorkflowResultVersion) returns (google.protobuf.Empty) {

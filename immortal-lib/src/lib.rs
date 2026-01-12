@@ -296,12 +296,14 @@ pub mod immortal {
             activity_id: String,
             activity_run_id: String,
             result: Option<Payload>,
+            workflow_epoch: u64
         ) -> Self {
             Self {
                 workflow_id,
                 activity_id,
                 activity_run_id,
                 status: Some(Status::Completed(Success { result })),
+                workflow_epoch
             }
         }
 
@@ -310,6 +312,7 @@ pub mod immortal {
             activity_id: String,
             activity_run_id: String,
             fail: super::failure::Failure,
+            workflow_epoch: u64
         ) -> Self {
             Self {
                 workflow_id,
@@ -318,6 +321,7 @@ pub mod immortal {
                 status: Some(Status::Failed(Failure {
                     failure: Some(fail),
                 })),
+                workflow_epoch
             }
         }
 
@@ -326,12 +330,15 @@ pub mod immortal {
             activity_id: String,
             activity_run_id: String,
             payload: Option<Vec<Vec<u8>>>,
+
+            workflow_epoch: u64
         ) -> Self {
             Self {
                 workflow_id,
                 activity_id,
                 activity_run_id,
                 status: Some(Status::Cancelled(Cancellation::from_details(payload))),
+                workflow_epoch
             }
         }
 

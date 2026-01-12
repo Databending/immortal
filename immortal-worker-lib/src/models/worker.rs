@@ -73,6 +73,7 @@ pub struct RunningActivity {
     pub activity_id: String,
     pub run_id: String,
     pub join_handle: JoinHandle<()>,
+    pub workflow_epoch: u64
 }
 
 pub struct RunningCall {
@@ -100,6 +101,7 @@ pub struct Worker {
         String,
         String,
         Result<ActExitValue<OwnedValue>, ActivityError>,
+        u64
     )>,
 
     outbox: Arc<Mutex<VecDeque<OutboxItem>>>,
@@ -537,6 +539,7 @@ impl Worker {
                                 .activity_input
                                 .unwrap_or(Payload::new(&None::<String>)),
                             safe_app_data,
+                            activity.workflow_epoch
                         )
                         .await;
                     }
@@ -766,6 +769,7 @@ impl Worker {
                     self.config.namespace.clone(),
                     self.config.task_queue.clone(),
                     connected_rx,
+                    workflow_options.epoch,
                 );
             } else {
                 if let Err(e) = sender.send((
@@ -893,6 +897,7 @@ impl Worker {
             String,
             String,
             Result<ActExitValue<OwnedValue>, ActivityError>,
+            u64,
         )>,
     ) {
         let running_activities_arc = Arc::clone(&self.running_activities);
@@ -907,6 +912,7 @@ impl Worker {
                         result.1.clone(),
                         result.2.clone(),
                         Some(Payload::new(&p)),
+                        result.4,
                     ),
 
                     Err(err) => match err {
@@ -928,6 +934,7 @@ impl Worker {
                                 }
                                 f
                             },
+                            result.4,
                         ),
                         ActivityError::Cancelled { details } => {
                             ActivityResultV1::cancel_from_details(
@@ -944,6 +951,7 @@ impl Worker {
                                     }
                                     None => None,
                                 },
+                                result.4,
                             )
                         }
                         ActivityError::NonRetryable(nre) => ActivityResultV1::fail(
@@ -951,6 +959,7 @@ impl Worker {
                             result.1.clone(),
                             result.2.clone(),
                             Failure::application_failure_from_error(nre, true),
+                            result.4,
                         ),
                     },
                 };
@@ -1216,6 +1225,7 @@ impl Worker {
         activity_run_id: &str,
         payload: Payload,
         safe_app_data: &Arc<AppData>,
+        workflow_epoch: u64,
     ) -> anyhow::Result<ActivityResultV1> {
         let registered_activities = Arc::clone(&self.registered_activities);
         let running_activities_arc = Arc::clone(&self.running_activities);
@@ -1242,7 +1252,7 @@ impl Worker {
         let handle = tokio::spawn(async move {
             let res = act_handle.await;
 
-            if let Err(e) = atx.send((wid.to_string(), aid, aid_run, res)) {
+            if let Err(e) = atx.send((wid.to_string(), aid, aid_run, res, workflow_epoch)) {
                 eprintln!("Error atx send: {}", e.to_string())
             }
         });
@@ -1251,6 +1261,7 @@ impl Worker {
             activity_id: activity_id.to_string(),
             run_id: activity_run_id.to_string(),
             join_handle: handle,
+            workflow_epoch
         };
         self.running_activities
             .lock()
@@ -1268,6 +1279,7 @@ impl Worker {
                         result.1.clone(),
                         result.2.clone(),
                         Some(Payload::new(&p)),
+                        result.4.clone(),
                     ),
 
                     Err(err) => match err {
@@ -1289,6 +1301,7 @@ impl Worker {
                                 }
                                 f
                             },
+                            result.4.clone(),
                         ),
                         ActivityError::Cancelled { details } => {
                             ActivityResultV1::cancel_from_details(
@@ -1299,6 +1312,7 @@ impl Worker {
                                     Some(d) => Some(vec![simd_json::to_vec(&d).unwrap()]),
                                     None => None,
                                 },
+                                result.4.clone(),
                             )
                         }
                         ActivityError::NonRetryable(nre) => ActivityResultV1::fail(
@@ -1306,6 +1320,7 @@ impl Worker {
                             result.1.clone(),
                             result.2.clone(),
                             Failure::application_failure_from_error(nre, true),
+                            result.4.clone(),
                         ),
                     },
                 };
@@ -1332,6 +1347,7 @@ impl Worker {
         activity_run_id: &str,
         payload: Payload,
         safe_app_data: &Arc<AppData>,
+        workflow_epoch: u64
     ) {
         let registered_activities = Arc::clone(&self.registered_activities);
         let activity_type = activity_type.to_string();
@@ -1356,7 +1372,7 @@ impl Worker {
         let handle = tokio::spawn(async move {
             let res = act_handle.await;
 
-            if let Err(e) = sender.send((wid.clone(), aid, aid_run, res)) {
+            if let Err(e) = sender.send((wid.clone(), aid, aid_run, res, workflow_epoch)) {
                 eprintln!("{}", e);
             }
         });
@@ -1365,6 +1381,7 @@ impl Worker {
             activity_id: activity_id.to_string(),
             run_id: activity_run_id.to_string(),
             join_handle: handle,
+            workflow_epoch
         };
         self.running_activities
             .lock()
@@ -1420,6 +1437,7 @@ impl Worker {
                     }),
                     false => Err(ActivityError::Cancelled { details: None }),
                 },
+                running_activity.workflow_epoch
             )) {
                 println!("ERROR SENDING KILL ACTIVITY: {:#?}", e);
                 error!("ERROR SENDING KILL ACTIVITY: {:#?}", e);

@@ -83,6 +83,8 @@ use crate::service::CallOptions;
 use crate::service::ImmortalService;
 use crate::state::AppState;
 use crate::state::JwtPublicBytes;
+use crate::timeline::WorkflowTimelineEntryV1;
+use crate::timeline::WorkflowTimelineEventV1;
 use crate::ws::on_connect;
 use crate::ws::WsState;
 use serde::Serialize;
@@ -100,6 +102,8 @@ pub mod metrics;
 pub mod models;
 pub mod service;
 pub mod state;
+pub mod timeline;
+pub mod timer;
 pub mod utils;
 pub mod ws;
 
@@ -208,6 +212,7 @@ pub struct ActivityProperties {
     pub last_heartbeat: DateTime<Utc>,
     pub scheduled: DateTime<Utc>,
     pub latest_run_start: Option<DateTime<Utc>>,
+    pub workflow_epoch: u64,
 }
 
 #[tonic::async_trait]
@@ -646,12 +651,12 @@ impl Immortal for ImmortalService {
                             .unwrap();
 
                     if let Some(activity_metadata) = activity_metadata {
-                        let latest_run_id = activity_metadata
+                        let x = activity_metadata
                             .runs
                             .get(activity_metadata.runs.len() - 1)
-                            .unwrap()
-                            .run_id
-                            .to_string();
+                            .unwrap();
+                        let (latest_run_id, workflow_epoch) =
+                            (x.run_id.to_string(), x.workflow_epoch);
                         if latest_run_id == activity_run_id {
                             guard.insert(
                                 activity_id,
@@ -673,6 +678,7 @@ impl Immortal for ImmortalService {
                                             latest_run_id: latest_run_id,
                                             index: activity_metadata.index,
                                             last_heartbeat: now.clone(),
+                                            workflow_epoch,
                                             // THIS IS INCORRECT
                                             scheduled: now,
                                             latest_run_start: None,
@@ -985,6 +991,20 @@ impl Immortal for ImmortalService {
                             ))
                         })?;
 
+                    let mut con = self.redis_pool.get().await.unwrap();
+                    let _ = WorkflowTimelineEntryV1::new(
+                        &activity_options.workflow_id,
+                        activity_options.workflow_epoch,
+                        WorkflowTimelineEventV1::ActivityScheduled {
+                            activity_id: activity_options.idempotency_key.clone(),
+                            activity_type: activity_options.activity_type.clone(),
+                            task_queue: Some(activity_options.task_queue.clone()),
+                            hash: Some(activity_options.fingerprint.clone()),
+                        },
+                    )
+                    .append(&mut con)
+                    .await;
+
                     // so new kind of bug when a server starts up a worker sends it it's finished
                     // activities.
                     // it is a race condition because the outbox doesn't send before
@@ -1063,7 +1083,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let redis_host = std::env::var("REDIS_HOST").unwrap_or("127.0.0.1".to_string());
     let redis_port = std::env::var("REDIS_PORT").unwrap_or("30379".to_string());
     let redis_url = format!("redis://{redis_username}:{redis_password}@{redis_host}:{redis_port}/");
-    println!("redis_url = {:?}", redis_url);
     // let (tx, _rx) = broadcast::channel(100);
 
     // let log_streams = Arc::new(Mutex::new(HashMap::new()));

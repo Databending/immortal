@@ -262,6 +262,7 @@ impl WorkflowHistoryMetadata {
             Some(Status::Running) => "Running",
             Some(Status::Completed) => "Completed",
             Some(Status::Orphaned) => "Orphaned",
+            Some(Status::Sleeping) => "Sleeping",
             None => "",
         };
 
@@ -666,8 +667,8 @@ pub struct ActivityRunHistoryMetadata {
     pub start_time: DateTime<Utc>,
     pub end_time: Option<DateTime<Utc>>,
     pub output: Option<BlobRef>,
-
     pub owner: Option<WorkerOwner>,
+    pub workflow_epoch: u64,
 }
 
 impl ActivityRunHistoryMetadata {
@@ -698,6 +699,10 @@ impl ActivityRunHistoryMetadata {
             .get("start_time")
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(Utc::now);
+        let workflow_epoch: u64 = meta
+            .get("workflow_epoch")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         let end_time: Option<DateTime<Utc>> =
             meta.get("end_time")
                 .and_then(|s| if s.is_empty() { None } else { s.parse().ok() });
@@ -722,7 +727,8 @@ impl ActivityRunHistoryMetadata {
             start_time,
             end_time,
             output,
-            owner
+            owner,
+            workflow_epoch,
         }))
     }
     pub async fn store_run(
@@ -787,6 +793,7 @@ impl Into<ActivityRunHistoryMetadata> for ActivityRun {
             end_time: self.end_time,
             output,
             owner: self.owner.clone(),
+            workflow_epoch: self.workflow_epoch,
         }
     }
 }
@@ -812,6 +819,7 @@ impl From<&ActivityRun> for ActivityRunHistoryMetadata {
             end_time: activity_run.end_time,
             owner: activity_run.owner.clone(),
             output,
+            workflow_epoch: activity_run.workflow_epoch,
         }
     }
 }

@@ -39,6 +39,7 @@ pub enum Status {
     Completed,
     Failed,
     Orphaned,
+    Sleeping,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +182,7 @@ pub struct ActivityRun {
     pub output: Option<Payload>,
     pub start_time: DateTime<Utc>,
     pub end_time: Option<DateTime<Utc>>,
+    pub workflow_epoch: u64,
 }
 
 impl ActivityRun {
@@ -189,6 +191,7 @@ impl ActivityRun {
         activity_id: String,
         run_id: String,
         owner: Option<WorkerOwner>,
+        workflow_epoch: u64,
     ) -> Self {
         Self {
             owner,
@@ -199,6 +202,7 @@ impl ActivityRun {
             start_time: chrono::Utc::now(),
             end_time: None,
             output: None,
+            workflow_epoch,
         }
     }
 }
@@ -207,7 +211,7 @@ impl ActivityRun {
 pub struct History(Pool<RedisConnectionManager>);
 const BASE_REDIS_KEY: &str = "immortal:history";
 const TTL: i64 = 259_200;
-const WORKFLOW_BASE_REDIS_KEY: &str = formatcp!("{}:workflow", BASE_REDIS_KEY);
+pub const WORKFLOW_BASE_REDIS_KEY: &str = formatcp!("{}:workflow", BASE_REDIS_KEY);
 impl History {
     pub fn new(pool: &Pool<RedisConnectionManager>) -> Self {
         Self(pool.clone())
@@ -909,6 +913,7 @@ impl History {
             start_time: activity_run_metadata.start_time,
             end_time: activity_run_metadata.end_time,
             output,
+            workflow_epoch: activity_run_metadata.workflow_epoch,
         }))
     }
 }
@@ -1212,6 +1217,7 @@ mod tests {
             "act_id_1".to_string(),
             "run_id_1".to_string(),
             None,
+            0,
         );
 
         activity.add_run(run.clone());
@@ -1233,6 +1239,7 @@ mod tests {
             "act_id_1".to_string(),
             "run_id_1".to_string(),
             None,
+            0,
         );
 
         assert_eq!(run.workflow_id, "wf_id_1");
