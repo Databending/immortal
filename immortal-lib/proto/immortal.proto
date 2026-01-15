@@ -254,6 +254,18 @@ message RequestStartActivityOptionsVersion {
   oneof version { RequestStartActivityOptionsV1 V1 = 1; }
 }
 
+
+message RequestSleepOptionsVersion {
+  oneof version { RequestSleepOptionsV1 V1 = 1; }
+}
+
+message RequestSleepOptionsV1 {
+  string workflow_id = 1;
+  uint64 epoch = 2;
+  string idempotency_key = 3;
+  uint64 duration = 4;
+}
+
 message RunningWorkflow {
   string workflow_id = 1;
   uint64 epoch = 2;
@@ -451,8 +463,8 @@ service Immortal {
       returns (WorkflowResultVersion) {}
   rpc StartActivity(RequestStartActivityOptionsVersion)
       returns (ActivityResultVersion) {}
-  // rpc Sleep(RequestSleepOptionsVersion)
-  //     returns (google.protobuf.Empty) {}
+  rpc Sleep(RequestSleepOptionsVersion)
+      returns (google.protobuf.Empty) {}
   rpc CompletedActivity(ActivityResultVersion) returns (google.protobuf.Empty) {
   }
   rpc CompletedWorkflow(WorkflowResultVersion) returns (google.protobuf.Empty) {

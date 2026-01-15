@@ -1,4 +1,5 @@
 use immortal_lib::common::Payloads;
+use immortal_lib::immortal::RequestSleepOptionsVersion;
 use regex::Regex;
 use tonic::codec::CompressionEncoding;
 use tracing_subscriber::prelude::*;
@@ -219,6 +220,9 @@ pub struct ActivityProperties {
 impl Immortal for ImmortalService {
     type RegisterWorkerStream = ReceiverStream<Result<ImmortalWorkerActionVersion, Status>>;
 
+    async fn sleep(&self, request: Request<RequestSleepOptionsVersion>) -> Result<Response<()>, Status> {
+        Ok(Response::new(()))
+    }
     async fn call_async(&self, request: Request<CallVersion>) -> Result<Response<()>, Status> {
         match request.into_inner().version {
             Some(call_version::Version::V1(call)) => {
