@@ -4,7 +4,7 @@ use regex::Regex;
 use tonic::codec::CompressionEncoding;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
-
+use tracing::info;
 use immortal_lib::immortal::immortal_worker_action_v1::Action as WorkerAction;
 // use redis::RedisError;
 use socketioxide::SocketIo;
@@ -63,6 +63,7 @@ use simd_json::OwnedValue;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
 use tokio::sync::{broadcast, Notify, RwLock};
@@ -107,6 +108,17 @@ pub mod timeline;
 pub mod timer;
 pub mod utils;
 pub mod ws;
+
+static IMMORTAL_TTL: OnceLock<i64> = OnceLock::new();
+
+pub fn immortal_ttl() -> i64 {
+    *IMMORTAL_TTL.get_or_init(|| {
+        std::env::var("IMMORTAL_TTL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(259_200)
+    })
+}
 
 fn matches_any(patterns: &[String], input: &str) -> bool {
     for pattern in patterns {
@@ -545,7 +557,7 @@ impl Immortal for ImmortalService {
                                             error!("Error appending to logs: {}", e);
                                         }
                                         // TODO: don't ignore this
-                                        if let Err(e) = con.expire::<&str, ()>(&key, 259_200).await
+                                        if let Err(e) = con.expire::<&str, ()>(&key, immortal_ttl()).await
                                         {
                                             error!("Error setting exp for logs: {}", e);
                                         }
@@ -1082,8 +1094,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // tracing::subscriber::set_global_default(FmtSubscriber::default())?;
     let addr = "0.0.0.0:10000".parse().unwrap();
 
-    let redis_username = std::env::var("REDIS_USERNAME").unwrap_or("".to_string());
-    let redis_password = std::env::var("REDIS_PASSWORD").unwrap_or("pine5apple".to_string());
+    let redis_username = std::env::var("REDIS_USERNAME").unwrap_or("default".to_string());
+    let redis_password = std::env::var("REDIS_PASSWORD").unwrap_or("".to_string());
     let redis_host = std::env::var("REDIS_HOST").unwrap_or("127.0.0.1".to_string());
     let redis_port = std::env::var("REDIS_PORT").unwrap_or("30379".to_string());
     let redis_url = format!("redis://{redis_username}:{redis_password}@{redis_host}:{redis_port}/");
@@ -1209,6 +1221,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+
+    info!("Immortal Server Started");
 
     Server::builder()
         .add_service(svc)

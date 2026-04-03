@@ -1,5 +1,6 @@
 use crate::history::Status;
 use crate::history::WORKFLOW_BASE_REDIS_KEY;
+use crate::immortal_ttl;
 use chrono::{DateTime, Utc};
 use redis::{aio::MultiplexedConnection, AsyncCommands};
 use serde::{Deserialize, Serialize};
@@ -17,8 +18,14 @@ impl WorkflowTimelineEntryVersion {
         };
         let _: () = con
             .lpush(
-                format!("{WORKFLOW_BASE_REDIS_KEY}:{workflow_id}:timeline",),
+                format!("{WORKFLOW_BASE_REDIS_KEY}:{workflow_id}:timeline"),
                 simd_json::to_vec(&self)?,
+            )
+            .await?;
+        let _: () = con
+            .expire(
+                format!("{WORKFLOW_BASE_REDIS_KEY}:{workflow_id}:timeline"),
+                immortal_ttl(),
             )
             .await?;
         Ok(())

@@ -5,6 +5,7 @@ use crate::history::{
 };
 
 use crate::history::{workflow_args_key, BlobRef};
+use crate::immortal_ttl;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use const_format::formatcp;
@@ -45,7 +46,6 @@ pub struct WorkflowHistoryMetadata {
     pub worker_id: Option<String>,
 }
 
-const TTL: i64 = 259_200;
 const BASE_REDIS_KEY: &str = "immortal:history";
 const WORKFLOW_BASE_REDIS_KEY: &str = formatcp!("{}:workflow", BASE_REDIS_KEY);
 
@@ -236,7 +236,7 @@ impl WorkflowHistoryMetadata {
         }
 
         // Optional TTL on top-level workflow metadata key
-        let _: () = con.expire(&wf_meta, TTL).await?;
+        let _: () = con.expire(&wf_meta, immortal_ttl()).await?;
 
         // println!("WRITING TO REDIS (store workflow metadata)");
         Ok(())
@@ -591,13 +591,13 @@ impl ActivityHistoryMetadata {
             for run in &self.runs {
                 // append id to list
                 let _: () = con.rpush(&runs_list_key, &run.run_id).await?;
-                let _: () = con.expire(&runs_list_key, TTL).await?;
+                let _: () = con.expire(&runs_list_key, immortal_ttl()).await?;
                 // store run separately
                 run.store_run(con, workflow_id, &self.activity_id).await?;
             }
         }
 
-        let _: () = con.expire(&base, TTL).await?;
+        let _: () = con.expire(&base, immortal_ttl()).await?;
 
         Ok(())
     }
@@ -767,7 +767,7 @@ impl ActivityRunHistoryMetadata {
 
         let _: () = query.ignore().query_async(&mut *con).await?;
 
-        let _: () = con.expire(&base, TTL).await?;
+        let _: () = con.expire(&base, immortal_ttl()).await?;
         Ok(())
     }
 }

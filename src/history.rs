@@ -20,6 +20,7 @@ use crate::history_metadata::WorkerOwner;
 use crate::history_metadata::{
     ActivityHistoryMetadata, ActivityRunHistoryMetadata, WorkflowHistoryMetadata,
 };
+use crate::immortal_ttl;
 
 // STRUCTS
 
@@ -210,7 +211,7 @@ impl ActivityRun {
 #[derive(Debug, Clone)]
 pub struct History(Pool<RedisConnectionManager>);
 const BASE_REDIS_KEY: &str = "immortal:history";
-const TTL: i64 = 259_200;
+
 pub const WORKFLOW_BASE_REDIS_KEY: &str = formatcp!("{}:workflow", BASE_REDIS_KEY);
 impl History {
     pub fn new(pool: &Pool<RedisConnectionManager>) -> Self {
@@ -409,7 +410,7 @@ impl History {
         }
 
         // Optional TTL on top-level workflow metadata key
-        let _: () = con.expire(&wf_meta, TTL).await?;
+        let _: () = con.expire(&wf_meta, immortal_ttl()).await?;
 
         // println!("WRITING TO REDIS (add workflow)");
         Ok(())
@@ -490,7 +491,7 @@ impl History {
             }
         }
 
-        let _: () = con.expire(&wf_meta, TTL).await?;
+        let _: () = con.expire(&wf_meta, immortal_ttl()).await?;
 
         // println!("WRITING TO REDIS (update workflow)");
         Ok(())
@@ -670,7 +671,7 @@ impl History {
             .await?;
 
         let _: () = con
-            .expire(&workflow_activities_list_key(&wf_id), TTL)
+            .expire(&workflow_activities_list_key(&wf_id), immortal_ttl())
             .await?;
         self.store_activity(&mut con, &wf_id, &act_id, &activity, true)
             .await?;
@@ -781,13 +782,13 @@ impl History {
             for run in &activity.runs {
                 // append id to list
                 let _: () = con.rpush(&runs_list_key, &run.run_id).await?;
-                let _: () = con.expire(&runs_list_key, TTL).await?;
+                let _: () = con.expire(&runs_list_key, immortal_ttl()).await?;
                 // store run separately
                 self.store_run(con, run).await?;
             }
         }
 
-        let _: () = con.expire(&base, TTL).await?;
+        let _: () = con.expire(&base, immortal_ttl()).await?;
 
         Ok(())
     }
@@ -866,7 +867,7 @@ impl History {
         // )
         // .await?;
 
-        let _: () = con.expire(&base, TTL).await?;
+        let _: () = con.expire(&base, immortal_ttl()).await?;
         Ok(())
     }
 
@@ -932,7 +933,7 @@ impl History {
 
 async fn set_blob_raw(con: &mut MultiplexedConnection, key: &str, data: &Vec<u8>) -> Result<()> {
     // let bytes = simd_json::to_string(value)?;
-    let _: () = con.set_ex(key, data, TTL as u64).await?;
+    let _: () = con.set_ex(key, data, immortal_ttl() as u64).await?;
     Ok(())
 }
 
