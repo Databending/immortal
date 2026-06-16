@@ -7,6 +7,8 @@ use bb8_redis::{
     RedisConnectionManager,
 };
 use blake3::Hasher;
+use chrono::Duration;
+use chrono::TimeDelta;
 use chrono::{DateTime, Utc};
 use const_format::formatcp;
 use immortal_lib::common::Payload;
@@ -109,6 +111,10 @@ pub struct ActivityHistory {
     pub index: usize,
     // NEED THIS FOR BLOB REF
     pub workflow_id: String,
+    pub schedule_to_start_timeout: Option<Duration>,
+    pub start_to_close_timeout: Option<Duration>,
+    pub schedule_to_close_timeout: Option<Duration>,
+    pub heartbeat_timeout: Option<Duration>,
 }
 
 impl ActivityHistory {
@@ -138,6 +144,10 @@ impl ActivityHistory {
         input: Option<Payload>,
         index: usize,
         idempotency_key: String,
+        schedule_to_start_timeout: Option<Duration>,
+        schedule_to_close_timeout: Option<Duration>,
+        start_to_close_timeout: Option<Duration>,
+        heartbeat_timeout: Option<Duration>,
     ) -> Self {
         Self {
             hash: if idempotency_key == "" {
@@ -156,6 +166,10 @@ impl ActivityHistory {
             // status: Status::Running,
             runs: Vec::new(),
             index,
+            schedule_to_close_timeout,
+            schedule_to_start_timeout,
+            start_to_close_timeout,
+            heartbeat_timeout
         }
     }
 
@@ -842,6 +856,10 @@ impl History {
             hash: activity_metadata.hash,
             activity_type: activity_metadata.activity_type,
             task_queue: activity_metadata.task_queue,
+            schedule_to_close_timeout: activity_metadata.schedule_to_close_timeout,
+            schedule_to_start_timeout: activity_metadata.schedule_to_start_timeout,
+            start_to_close_timeout: activity_metadata.start_to_close_timeout,
+            heartbeat_timeout: activity_metadata.heartbeat_timeout,
             input,
             runs,
             index: 0, // caller fills actual index based on activities list

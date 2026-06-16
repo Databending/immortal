@@ -7,7 +7,7 @@ use crate::history::{
 use crate::history::{workflow_args_key, BlobRef};
 use crate::immortal_ttl;
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use const_format::formatcp;
 use redis::aio::MultiplexedConnection;
 use redis::AsyncCommands;
@@ -467,6 +467,10 @@ pub struct ActivityHistoryMetadata {
     // NEED THIS FOR INTO
     pub workflow_id: String,
     pub start_time: DateTime<Utc>,
+    pub schedule_to_start_timeout: Option<Duration>,
+    pub start_to_close_timeout: Option<Duration>,
+    pub schedule_to_close_timeout: Option<Duration>,
+    pub heartbeat_timeout: Option<Duration>,
 }
 
 impl ActivityHistoryMetadata {
@@ -505,6 +509,18 @@ impl ActivityHistoryMetadata {
 
         let activity_type = meta.get("activity_type").cloned().unwrap_or_default();
         let task_queue = meta.get("task_queue").cloned();
+        let heartbeat_timeout = meta
+            .get("heartbeat_timeout")
+            .map(|f| serde_json::from_str(f).unwrap());
+        let schedule_to_close_timeout = meta
+            .get("schedule_to_close_timeout")
+            .map(|f| serde_json::from_str(f).unwrap());
+        let schedule_to_start_timeout = meta
+            .get("schedule_to_start_timeout")
+            .map(|f| serde_json::from_str(f).unwrap());
+        let start_to_close_timeout = meta
+            .get("start_to_close_timeout")
+            .map(|f| serde_json::from_str(f).unwrap());
         let hash = meta.get("hash").cloned().unwrap_or_default();
         let start_time: DateTime<Utc> = meta
             .get("start_time")
@@ -546,6 +562,10 @@ impl ActivityHistoryMetadata {
             hash,
             runs,
             start_time,
+            schedule_to_start_timeout,
+            schedule_to_close_timeout,
+            start_to_close_timeout,
+            heartbeat_timeout,
             input,
             index: 0, // caller fills actual index based on activities list
         }))
@@ -579,6 +599,29 @@ impl ActivityHistoryMetadata {
                 .arg(simd_json::to_string(&input.metadata)?);
         }
 
+        if let Some(input) = &self.heartbeat_timeout {
+            query
+                .arg("heartbeat_timeout")
+                .arg(serde_json::to_string(input)?);
+        }
+
+        if let Some(input) = &self.schedule_to_close_timeout {
+            query
+                .arg("schedule_to_close_timeout")
+                .arg(serde_json::to_string(input)?);
+        }
+
+        if let Some(input) = &self.schedule_to_start_timeout {
+            query
+                .arg("schedule_to_start_timeout")
+                .arg(serde_json::to_string(input)?);
+        }
+
+        if let Some(input) = &self.start_to_close_timeout {
+            query
+                .arg("start_to_close_timeout")
+                .arg(serde_json::to_string(input)?);
+        }
         let _: () = query.ignore().query_async(&mut *con).await?;
 
         if store_children {
@@ -622,6 +665,10 @@ impl Into<ActivityHistoryMetadata> for ActivityHistory {
             task_queue: self.task_queue,
             index: self.index,
             runs: self.runs.into_iter().map(|f| f.into()).collect(),
+            schedule_to_close_timeout: self.schedule_to_close_timeout,
+            schedule_to_start_timeout: self.schedule_to_start_timeout,
+            start_to_close_timeout: self.start_to_close_timeout,
+            heartbeat_timeout: self.heartbeat_timeout,
         }
     }
 }
@@ -655,6 +702,10 @@ impl From<&ActivityHistory> for ActivityHistoryMetadata {
             workflow_id: activity_history.workflow_id.clone(),
             task_queue: activity_history.task_queue.clone(),
             index: activity_history.index,
+            schedule_to_start_timeout: activity_history.schedule_to_start_timeout,
+            schedule_to_close_timeout: activity_history.schedule_to_close_timeout,
+            start_to_close_timeout: activity_history.start_to_close_timeout,
+            heartbeat_timeout: activity_history.heartbeat_timeout,
             runs,
         }
     }

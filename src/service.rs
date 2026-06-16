@@ -198,8 +198,10 @@ async fn build_retry_activity_options(
             activity_input,
             task_queue: activity.task_queue.clone().unwrap_or("".to_string()),
             // Reasonable defaults; override if you persist these in history
-            heartbeat_timeout: None,
-            schedule_to_start_timeout: None,
+            heartbeat_timeout: activity.heartbeat_timeout.map(|f| f.into()),
+            schedule_to_start_timeout: activity.schedule_to_start_timeout.map(|f| f.into()),
+            schedule_to_close_timeout: activity.schedule_to_close_timeout.map(|f| f.into()),
+            start_to_close_timeout: activity.start_to_close_timeout.map(|f| f.into()),
             ..Default::default()
         })
     } else {
@@ -291,7 +293,6 @@ impl ImmortalService {
             Some(workflow_result_v1::Status::Sleep(_x)) => {
                 workflow.status = HistoryStatus::Sleeping;
                 workflow_output = None;
-
             }
             Some(workflow_result_v1::Status::Completed(x)) => {
                 match x.result {
@@ -1728,6 +1729,10 @@ impl ImmortalService {
                         activity_options.activity_input.clone(),
                         index,
                         activity_options.idempotency_key.clone(),
+                        activity_options.schedule_to_start_timeout.map(|f| f.into()),
+                        activity_options.schedule_to_close_timeout.map(|f| f.into()),
+                        activity_options.start_to_close_timeout.map(|f| f.into()),
+                        activity_options.heartbeat_timeout.map(|f| f.into()),
                     );
 
                     let run_id = Uuid::new_v4().to_string();
