@@ -64,6 +64,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
 use tokio::sync::{broadcast, Notify, RwLock};
@@ -73,6 +74,7 @@ use tonic::transport::Server;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tracing::error;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::cron::start_watcher;
@@ -489,6 +491,29 @@ impl Immortal for ImmortalService {
                                 let _ = sender.send(running);
                             }
                         }
+                        Some(immortal_server_action_v1::Action::ActivityHeartbeatV1(hb)) => {
+                            let mut running_activities = running_activities.write().await;
+                            if let Some(running_activity) =
+                                running_activities.get_mut(&hb.activity_id)
+                            {
+                                // Ignore heartbeats from a run we've already superseded, otherwise a
+                                // straggler from a previous attempt keeps the current run alive.
+                                if running_activity.2.additional_properties.latest_run_id
+                                    == hb.activity_run_id
+                                {
+                                    running_activity.2.additional_properties.last_heartbeat =
+                                        Utc::now();
+                                    // It answered, so retract any suspicion the watchdog built up;
+                                    // otherwise attempts accumulate toward the force-kill threshold.
+                                    if matches!(
+                                        running_activity.2.kill_state,
+                                        KillState::Suspected { .. }
+                                    ) {
+                                        running_activity.2.kill_state = KillState::Healthy;
+                                    }
+                                }
+                            }
+                        }
                         Some(immortal_server_action_v1::Action::LogEvent(mut log)) => {
                             if let Some(when_dt) = DateTime::from_timestamp(log.when, 0) {
                                 let when = when_dt.to_string();
@@ -526,10 +551,16 @@ impl Immortal for ImmortalService {
                                         if let Some(running_activity) =
                                             running_activities.get_mut(activity_id)
                                         {
+                                            // Server clock, never the worker's `when`.
+                                            // The watchdog compares last_heartbeat against
+                                            // its own Utc::now(), so a worker whose clock
+                                            // drifts behind by more than heartbeat_timeout
+                                            // would have every activity time out while its
+                                            // logs were arriving perfectly.
                                             running_activity
                                                 .2
                                                 .additional_properties
-                                                .last_heartbeat = when_dt.clone();
+                                                .last_heartbeat = Utc::now();
                                         }
                                         items.push(("activity_id", activity_id));
                                     }
@@ -685,7 +716,14 @@ impl Immortal for ImmortalService {
                                         worker_id: worker_details.worker_id.clone(),
                                         worker_instance_id: worker_instance_id.clone(),
                                         max_duration: Duration::seconds(30),
-                                        heartbeat_timeout: Duration::seconds(30),
+                                        // Must be the activity's own timeout, not a flat 30s:
+                                        // an activity that legitimately runs for hours paces
+                                        // its heartbeats off the value it was dispatched with,
+                                        // so re-adopting it under 30s kills it on the first
+                                        // reconnect.
+                                        heartbeat_timeout: activity_metadata
+                                            .heartbeat_timeout
+                                            .unwrap_or(Duration::seconds(30)),
                                         timeout: activity_metadata.start_time
                                             + Duration::seconds(30),
                                         kill_state: KillState::Healthy,
@@ -778,6 +816,14 @@ impl Immortal for ImmortalService {
         // let features = self.features.clone();
 
         tokio::spawn(async move {
+            // `tx` is bounded, and this task is the only thing that removes the worker from
+            // `workers`. Awaiting a send here would block forever on a half-open connection --
+            // the receiver is still alive inside the response stream, so the send never errors --
+            // leaving a stale entry that rejects the worker's own reconnect. Never block: a worker
+            // that has not drained a single control message in this many consecutive seconds is
+            // gone, whatever the socket claims.
+            const MAX_CONSECUTIVE_FULL: u32 = 30;
+            let mut consecutive_full: u32 = 0;
             loop {
                 let action = ImmortalWorkerActionVersion {
                     version: Some(immortal_worker_action_version::Version::V1(
@@ -786,14 +832,25 @@ impl Immortal for ImmortalService {
                         },
                     )),
                 };
-                match tx.send(Ok(action)).await {
-                    Ok(_) => {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                    Err(_) => {
-                        break;
+                match tx.try_send(Ok(action)) {
+                    Ok(_) => consecutive_full = 0,
+                    Err(TrySendError::Closed(_)) => break,
+                    Err(TrySendError::Full(_)) => {
+                        consecutive_full += 1;
+                        warn!(
+                            "worker {} is not draining its control channel ({}/{})",
+                            worker_instance_id, consecutive_full, MAX_CONSECUTIVE_FULL
+                        );
+                        if consecutive_full >= MAX_CONSECUTIVE_FULL {
+                            error!(
+                                "worker {} stopped draining its control channel; treating as disconnected",
+                                worker_instance_id
+                            );
+                            break;
+                        }
                     }
                 }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
 
             {
@@ -1225,6 +1282,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Immortal Server Started");
 
     Server::builder()
+        // Without these a dead peer is never noticed: the stream stays "open" forever, the
+        // worker keeps writing into a socket nobody reads, and neither side reconnects.
+        .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
+        .tcp_keepalive(Some(std::time::Duration::from_secs(20)))
         .add_service(svc)
         // .add_service(health_service)
         .serve(addr)

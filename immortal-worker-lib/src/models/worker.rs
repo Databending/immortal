@@ -33,7 +33,8 @@ use immortal_lib::immortal::{
     WorkflowResultVersion, call_result_version, workflow_result_v1, workflow_result_version,
 };
 use immortal_lib::immortal::{
-    ActivityResultV1, ActivityResultVersion, ImmortalServerActionV1, ImmortalServerActionVersion,
+    ActivityHeartbeatV1, ActivityResultV1, ActivityResultVersion, ImmortalServerActionV1,
+    ImmortalServerActionVersion,
     Log, RegisterImmortalWorkerV1, StartWorkflowOptionsV1, activity_result_v1,
     activity_result_version, immortal_client::ImmortalClient, immortal_server_action_v1,
     immortal_server_action_version, immortal_worker_action_v1::Action,
@@ -49,7 +50,8 @@ use super::notification::{IntoNotificationFunc, NotificationFunction};
 use super::{ActivitySchema, CallSchema, NotificationSchema, WfSchema};
 use super::{
     activity::{
-        ActExitValue, ActivityError, ActivityFunction, ActivityOptions, AppData, IntoActivityFunc,
+        ActExitValue, ActivityError, ActivityFunction, ActivityHeartbeater, ActivityOptions,
+        AppData, IntoActivityFunc,
     },
     workflow::{WfExitValue, WorkflowFunction},
 };
@@ -314,14 +316,33 @@ impl Worker {
         let channel_layer = ChannelLayer {
             sender: stx2.clone(),
         };
+        // The channel layer feeds the server's log stream and refreshes activity liveness, so it
+        // gets its own filter rather than inheriting RUST_LOG: quieting console output should not
+        // be able to silence what we ship to the server. IMMORTAL_LOG tunes it independently.
+        //
+        // Note this must stay at or below the level of the workflow/activity `info_span!`s, since
+        // a span that never registers means events inside it carry no SpanData and are dropped.
+        const DEFAULT_CHANNEL_FILTER: &str = "info";
+        let channel_filter = match std::env::var("IMMORTAL_LOG") {
+            Ok(directives) if !directives.trim().is_empty() => EnvFilter::new(directives),
+            _ => EnvFilter::new(DEFAULT_CHANNEL_FILTER),
+        };
+
         let subscriber = Registry::default()
-            .with(channel_layer)
-            .with(tracing_subscriber::fmt::Layer::default())
-            .with(sentry::integrations::tracing::layer())
-            .with(EnvFilter::from_default_env());
+            .with(channel_layer.with_filter(channel_filter))
+            .with(tracing_subscriber::fmt::Layer::default().with_filter(EnvFilter::from_default_env()))
+            .with(sentry::integrations::tracing::layer().with_filter(EnvFilter::from_default_env()));
         tracing::subscriber::set_global_default(subscriber)
             .expect("Failed to set global subscriber");
-        let client = ImmortalClient::connect(config.url.clone()).await?;
+        // Keepalive matters more here than anywhere: this is one bidi stream held open for
+        // days. Without it a half-open connection is indistinguishable from an idle one, so the
+        // worker never learns the server is gone and never runs its reconnect loop.
+        let endpoint = Channel::from_shared(config.url.clone())?
+            .http2_keep_alive_interval(Duration::from_secs(20))
+            .keep_alive_timeout(Duration::from_secs(10))
+            .keep_alive_while_idle(true)
+            .tcp_keepalive(Some(Duration::from_secs(20)));
+        let client = ImmortalClient::new(endpoint.connect().await?);
         let mut worker = Worker {
             outbox_notify: Arc::new(Notify::new()),
             outbox: Arc::new(Mutex::new(VecDeque::new())),
@@ -539,7 +560,10 @@ impl Worker {
                                 .activity_input
                                 .unwrap_or(Payload::new(&None::<String>)),
                             safe_app_data,
-                            activity.workflow_epoch
+                            activity.workflow_epoch,
+                            activity
+                                .heartbeat_timeout
+                                .and_then(|d| Duration::try_from(d).ok()),
                         )
                         .await;
                     }
@@ -686,9 +710,10 @@ impl Worker {
             Ok(_) => {
                 // println!("1");
             }
-            Err(_e) => {
-
-                // println!("2 {:#?}", e);
+            // This is the only place the registration/stream error surfaces. Swallowing it is
+            // what makes a worker that can never re-register look like a silent worker.
+            Err(e) => {
+                error!("worker stream ended: {e:#}");
             }
         }
         // we can probably just move this up a level instead of spawning and canceling
@@ -1241,6 +1266,18 @@ impl Worker {
         let aid_run = activity_run_id.to_string();
         let wid = workflow_id.to_string();
 
+        let heartbeater = ActivityHeartbeater::new(
+            self.server_channel.clone(),
+            ActivityHeartbeatV1 {
+                activity_id: activity_id.to_string(),
+                activity_run_id: activity_run_id.to_string(),
+                workflow_id: workflow_id.to_string(),
+                workflow_epoch,
+                details: None,
+            },
+            self.heartbeat_throttle_interval(None),
+        );
+
         let act_handle = act.0.start_activity(
             payload,
             safe_app_data.clone(),
@@ -1248,6 +1285,7 @@ impl Worker {
             workflow_id.to_string(),
             activity_id.to_string(),
             activity_run_id.to_string(),
+            Some(heartbeater),
         );
         let handle = tokio::spawn(async move {
             let res = act_handle.await;
@@ -1339,6 +1377,25 @@ impl Worker {
         // );
     }
 
+    /// Shortest gap the worker will leave between two heartbeats sent for one activity.
+    ///
+    /// Activity code is expected to call `record_heartbeat` freely; this is what keeps that from
+    /// flooding the stream. The 0.8 factor leaves the activity a fifth of its timeout of slack to
+    /// get the next heartbeat out before the server's watchdog fires.
+    fn heartbeat_throttle_interval(&self, heartbeat_timeout: Option<Duration>) -> Duration {
+        const THROTTLE_FRACTION: f64 = 0.8;
+
+        match heartbeat_timeout {
+            Some(timeout) => timeout
+                .mul_f64(THROTTLE_FRACTION)
+                .min(self.config.max_heartbeat_throttle_interval),
+            None => self
+                .config
+                .default_heartbeat_throttle_interval
+                .min(self.config.max_heartbeat_throttle_interval),
+        }
+    }
+
     pub async fn start_activity(
         &mut self,
         workflow_id: &str,
@@ -1347,7 +1404,8 @@ impl Worker {
         activity_run_id: &str,
         payload: Payload,
         safe_app_data: &Arc<AppData>,
-        workflow_epoch: u64
+        workflow_epoch: u64,
+        heartbeat_timeout: Option<Duration>,
     ) {
         let registered_activities = Arc::clone(&self.registered_activities);
         let activity_type = activity_type.to_string();
@@ -1360,6 +1418,22 @@ impl Worker {
         let aid_run = activity_run_id.to_string();
         let wid = workflow_id.to_string();
 
+        // Handed to the activity so it can report its own progress. Nothing else may beat on its
+        // behalf: an activity wedged on a lock or a dead socket has to go quiet, or the watchdog
+        // cannot tell it apart from one that is working. Activities that log as they go are
+        // already covered -- a Log from inside the activity span refreshes the same clock.
+        let heartbeater = ActivityHeartbeater::new(
+            self.server_channel.clone(),
+            ActivityHeartbeatV1 {
+                activity_id: activity_id.to_string(),
+                activity_run_id: activity_run_id.to_string(),
+                workflow_id: workflow_id.to_string(),
+                workflow_epoch,
+                details: None,
+            },
+            self.heartbeat_throttle_interval(heartbeat_timeout),
+        );
+
         let act_handle = act.0.start_activity(
             payload,
             safe_app_data.clone(),
@@ -1367,6 +1441,7 @@ impl Worker {
             workflow_id.to_string(),
             activity_id.to_string(),
             activity_run_id.to_string(),
+            Some(heartbeater),
         );
 
         let handle = tokio::spawn(async move {
@@ -1517,6 +1592,9 @@ impl Worker {
                 Uuid::new_v4().to_string(),
                 call_id.to_string(),
                 "0".to_string(),
+                // Calls reuse the activity dispatch path but never land in the server's running
+                // activities, so a heartbeat from one would have nothing to refresh.
+                None,
             );
 
             let handle = tokio::spawn(async move {
@@ -1658,11 +1736,13 @@ pub struct WorkerConfig {
     #[builder(default = "Duration::from_secs(60)")]
     pub max_heartbeat_throttle_interval: Duration,
 
-    /// Default interval for throttling activity heartbeats in case
-    /// `ActivityOptions.heartbeat_timeout` is unset.
-    /// When the timeout *is* set in the `ActivityOptions`, throttling is set to
-    /// `heartbeat_timeout * 0.8`.
-    #[builder(default = "Duration::from_secs(30)")]
+    /// Interval for throttling activity heartbeats in case `ActivityOptions.heartbeat_timeout`
+    /// is unset. When the timeout *is* set, throttling is set to `heartbeat_timeout * 0.8`.
+    ///
+    /// The server monitors every activity, falling back to a 30s heartbeat_timeout for one that
+    /// declares none, so this has to stay under that 30s or a throttled heartbeat would land
+    /// after the watchdog had already fired.
+    #[builder(default = "Duration::from_secs(24)")]
     pub default_heartbeat_throttle_interval: Duration,
 
     /// Sets the maximum number of activities per second the task queue will dispatch, controlled
@@ -1799,4 +1879,57 @@ pub(crate) trait _WorkerClient: Sync + Send {
     // fn capabilities(&self) -> Option<Capabilities>;
     // fn workers(&self) -> Arc<SlotManager>;
     // fn is_mock(&self) -> bool;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Emit one info-level event inside a workflow span and return whatever the channel layer
+    /// forwarded, given the layer filter and the filter applied to the rest of the stack.
+    fn capture(
+        channel_filter: EnvFilter,
+        console_filter: EnvFilter,
+    ) -> Result<ImmortalServerActionV1, broadcast::error::TryRecvError> {
+        let (tx, mut rx) = broadcast::channel(16);
+        let layer = ChannelLayer { sender: tx };
+
+        let subscriber = Registry::default()
+            .with(layer.with_filter(channel_filter))
+            .with(tracing_subscriber::fmt::Layer::default().with_filter(console_filter));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("activity", workflow_id = "wf-1", activity_id = "act-1");
+            let _guard = span.enter();
+            tracing::info!("still working");
+        });
+
+        rx.try_recv()
+    }
+
+    /// The regression this guards: activity liveness rides on the channel layer, so a console log
+    /// level of `error` must not stop log events from reaching the server.
+    #[test]
+    fn channel_layer_is_not_gated_by_console_log_level() {
+        let action = capture(EnvFilter::new("info"), EnvFilter::new("error"))
+            .expect("channel layer should emit despite a quiet console filter");
+
+        match action.action {
+            Some(immortal_server_action_v1::Action::LogEvent(log)) => {
+                assert_eq!(log.workflow_id, "wf-1");
+                assert_eq!(log.activity_id.as_deref(), Some("act-1"));
+                assert_eq!(log.message, "still working");
+            }
+            other => panic!("expected a LogEvent, got {other:?}"),
+        }
+    }
+
+    /// The channel layer's own filter still applies, so IMMORTAL_LOG remains a working knob.
+    #[test]
+    fn channel_layer_honours_its_own_filter() {
+        assert!(
+            capture(EnvFilter::new("error"), EnvFilter::new("info")).is_err(),
+            "an info event should be filtered out by an error-level channel filter"
+        );
+    }
 }

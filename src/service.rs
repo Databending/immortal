@@ -1818,6 +1818,9 @@ impl ImmortalService {
                                             workflow_id: activity_options.workflow_id.clone(),
                                             activity_run_id: run_id.clone(),
                                             workflow_epoch: activity_options.workflow_epoch,
+                                            // The worker paces its heartbeats off this; it must
+                                            // match what we just wrote into RunningProperties.
+                                            heartbeat_timeout: activity_options.heartbeat_timeout,
                                         },
                                     )),
                                 },

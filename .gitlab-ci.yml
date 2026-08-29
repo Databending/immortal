@@ -6,18 +6,33 @@ stages:
   - build 
   - deploy
 
-
-deploy:
+deploy-server:
+  tags:
+    - heavy
+    - linux_amd64
   stage: deploy 
-  image:
-    name: gcr.io/kaniko-project/executor:v1.19.2-debug
-    entrypoint: [""]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+  image: quay.io/buildah/stable
+  variables:
+    # Use vfs with buildah. Docker offers overlayfs as a default, but Buildah
+    # cannot stack overlayfs on top of another overlayfs filesystem.
+    STORAGE_DRIVER: vfs
+    # Write all image metadata in the docker format, not the standard OCI format.
+    # Newer versions of docker can handle the OCI format, but older versions, like
+    # the one shipped with Fedora 30, cannot handle the format.
+    BUILDAH_FORMAT: docker
+    BUILDAH_ISOLATION: chroot
+    FQ_IMAGE_NAME: "databending/${CONTAINER_NAME}:latest"
+  before_script:
+    - buildah login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" docker.io 
   script:
+    - buildah images 
+    - buildah build --platform=linux/amd64 -t $FQ_IMAGE_NAME 
+    - buildah images 
     - |-
       if [ "$CI_COMMIT_BRANCH" = "master" ]; then
-          /kaniko/executor --context "${CI_PROJECT_DIR}" --dockerfile "${CI_PROJECT_DIR}/Dockerfile" --build-arg CI_JOB_TOKEN="${CI_JOB_TOKEN}" --build-arg GIT_TOKEN="${GIT_TOKEN}" --destination "databending/${CONTAINER_NAME}:${CI_COMMIT_TAG}" --destination "databending/${CONTAINER_NAME}:latest"
-      else
-          /kaniko/executor --context "${CI_PROJECT_DIR}" --dockerfile "${CI_PROJECT_DIR}/Dockerfile" --build-arg CI_JOB_TOKEN="${CI_JOB_TOKEN}" --build-arg GIT_TOKEN="${GIT_TOKEN}" --no-push
+          buildah push $FQ_IMAGE_NAME
       fi
 
 server:

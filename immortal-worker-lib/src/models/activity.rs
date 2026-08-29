@@ -1,5 +1,6 @@
 use immortal_lib::common::Payload;
 use immortal_lib::immortal;
+use immortal_lib::immortal::{ImmortalServerActionV1, immortal_server_action_v1};
 use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use serde::de::DeserializeOwned;
@@ -8,9 +9,13 @@ use simd_json::OwnedValue;
 use std::any::{Any, TypeId};
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
+use std::sync::Mutex;
+use std::time::Instant;
 use std::time::SystemTime;
 use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+use tracing::debug;
 use tracing::info_span;
 use tracing::Instrument;
 
@@ -111,6 +116,9 @@ impl ActivityFunction {
         workflow_id: String,
         activity_id: String,
         activity_run_id: String,
+        // `None` for callers the server does not heartbeat-monitor, such as calls, which reuse
+        // this dispatch path but are never entered into the server's running activities.
+        heartbeater: Option<ActivityHeartbeater>,
     ) -> Pin<Box<dyn Future<Output = Result<ActExitValue<OwnedValue>, ActivityError>> + Send>> {
         let span = info_span!(
             "RunActivity",
@@ -129,6 +137,7 @@ impl ActivityFunction {
                 heartbeat_details: vec![],
                 header_fields: HashMap::new(),
                 info: ActivityInfo::default(),
+                heartbeater,
             },
             payload,
         )
@@ -257,6 +266,124 @@ fn downcast_owned<T: Send + Sync + 'static>(boxed: Box<dyn Any + Send + Sync>) -
     boxed.downcast().ok().map(|boxed| *boxed)
 }
 
+/// The worker-side half of [`ActContext::record_heartbeat`].
+///
+/// Deliberately has no timer of its own driving it: a heartbeat asserts that the activity is
+/// still making progress, so only the activity body may produce one. An activity wedged on a
+/// lock or a dead socket stops heartbeating, which is exactly what the server's watchdog needs
+/// to see. (A log emitted from inside the activity's span refreshes the same server-side clock,
+/// so activities that log as they work are already covered without calling this.)
+///
+/// Sends are throttled the way Temporal's SDKs throttle them, so activity code is free to
+/// record a heartbeat inside a tight loop: at most one send per throttle interval, keeping only
+/// the most recent heartbeat recorded within a window and flushing it when the window closes.
+#[derive(Clone)]
+pub struct ActivityHeartbeater {
+    inner: Arc<Heartbeater>,
+}
+
+struct Heartbeater {
+    sender: broadcast::Sender<ImmortalServerActionV1>,
+    /// Identity of the run this beats for; `details` is filled in per send.
+    beat: immortal::ActivityHeartbeatV1,
+    throttle: Duration,
+    state: Mutex<ThrottleState>,
+}
+
+#[derive(Default)]
+struct ThrottleState {
+    last_sent: Option<Instant>,
+    /// The most recent heartbeat recorded since `last_sent`, waiting for the throttle window to
+    /// close. Only ever set by `record`, so a flush can never invent liveness the activity did
+    /// not report.
+    pending: Option<Vec<OwnedValue>>,
+    flush_scheduled: bool,
+}
+
+impl ActivityHeartbeater {
+    pub(crate) fn new(
+        sender: broadcast::Sender<ImmortalServerActionV1>,
+        beat: immortal::ActivityHeartbeatV1,
+        throttle: Duration,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Heartbeater {
+                sender,
+                beat,
+                throttle,
+                state: Mutex::new(ThrottleState::default()),
+            }),
+        }
+    }
+
+    fn send_now(&self, details: Vec<OwnedValue>) {
+        let mut beat = self.inner.beat.clone();
+        beat.details = (!details.is_empty()).then(|| Payload::new(&details));
+        if let Err(e) = self.inner.sender.send(ImmortalServerActionV1 {
+            action: Some(immortal_server_action_v1::Action::ActivityHeartbeatV1(beat)),
+        }) {
+            // No receiver means the worker is between reconnects, so the server is not listening
+            // either and there is nothing to report. Debug rather than error: this would fire on
+            // every heartbeat for the whole reconnect, and those log lines route into the same
+            // dead channel.
+            debug!(
+                "dropped activity heartbeat for {}: {e}",
+                self.inner.beat.activity_id
+            );
+        }
+    }
+
+    /// Record a heartbeat, sending it now or remembering it for the current throttle window.
+    pub fn record(&self, details: Vec<OwnedValue>) {
+        let wait = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            match state.last_sent {
+                Some(last) if last.elapsed() < self.inner.throttle => {
+                    state.pending = Some(details);
+                    if state.flush_scheduled {
+                        return;
+                    }
+                    state.flush_scheduled = true;
+                    self.inner.throttle - last.elapsed()
+                }
+                _ => {
+                    state.last_sent = Some(Instant::now());
+                    state.pending = None;
+                    drop(state);
+                    self.send_now(details);
+                    return;
+                }
+            }
+        };
+
+        let this = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            let details = {
+                let mut state = this
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.flush_scheduled = false;
+                match state.pending.take() {
+                    Some(details) => {
+                        state.last_sent = Some(Instant::now());
+                        details
+                    }
+                    None => return,
+                }
+            };
+            this.send_now(details);
+        });
+    }
+}
+
 #[derive(Clone)]
 pub struct ActContext {
     // worker: Arc<dyn Worker>,
@@ -266,6 +393,8 @@ pub struct ActContext {
     heartbeat_details: Vec<OwnedValue>,
     header_fields: HashMap<String, OwnedValue>,
     info: ActivityInfo,
+    /// `None` only where a context is built outside a dispatched run, e.g. in tests.
+    heartbeater: Option<ActivityHeartbeater>,
 }
 
 //struct ActivityHeartbeat {
@@ -407,6 +536,7 @@ impl ActContext {
                     retry_policy,
                     is_local,
                 },
+                heartbeater: None,
             },
             first_arg,
         )
@@ -435,12 +565,19 @@ impl ActContext {
         &self.heartbeat_details
     }
 
-    /// RecordHeartbeat sends heartbeat for the currently executing activity
-    pub fn record_heartbeat(&self, _details: Vec<OwnedValue>) {
-        // self.worker.record_activity_heartbeat(ActivityHeartbeat {
-        //     task_token: self.info.task_token.clone(),
-        //     details,
-        // })
+    /// Report that this activity is still making progress.
+    ///
+    /// The server times out an activity that goes `heartbeat_timeout` without a signal, so any
+    /// activity that runs longer than its timeout must either call this as it works or log from
+    /// inside its own span -- both refresh the same clock. Calling it is cheap and safe in a
+    /// tight loop: sends are throttled to at most one per `heartbeat_timeout * 0.8`.
+    ///
+    /// `details` is sent to the server but not yet persisted there, so it does not come back
+    /// through [`ActContext::get_heartbeat_details`] on a retry. Pass `vec![]` until it does.
+    pub fn record_heartbeat(&self, details: Vec<OwnedValue>) {
+        if let Some(heartbeater) = &self.heartbeater {
+            heartbeater.record(details);
+        }
     }
 
     /// Get activity info of the executing activity
@@ -521,3 +658,107 @@ fn _calculate_deadline(
 //     })
 // }
 //
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn heartbeater(
+        throttle: Duration,
+    ) -> (
+        ActivityHeartbeater,
+        broadcast::Receiver<ImmortalServerActionV1>,
+    ) {
+        let (tx, rx) = broadcast::channel(16);
+        let beat = immortal::ActivityHeartbeatV1 {
+            activity_id: "act-1".to_string(),
+            activity_run_id: "run-1".to_string(),
+            workflow_id: "wf-1".to_string(),
+            workflow_epoch: 0,
+            details: None,
+        };
+        (ActivityHeartbeater::new(tx, beat, throttle), rx)
+    }
+
+    /// The details carried by a heartbeat action, as the strings that went in.
+    fn details_of(action: ImmortalServerActionV1) -> Vec<String> {
+        match action.action {
+            Some(immortal_server_action_v1::Action::ActivityHeartbeatV1(beat)) => {
+                assert_eq!(beat.activity_id, "act-1");
+                assert_eq!(beat.activity_run_id, "run-1");
+                match beat.details {
+                    Some(mut payload) => payload.to().expect("details round-trip"),
+                    None => vec![],
+                }
+            }
+            other => panic!("expected an ActivityHeartbeatV1, got {other:?}"),
+        }
+    }
+
+    fn record(heartbeater: &ActivityHeartbeater, detail: &str) {
+        heartbeater.record(vec![OwnedValue::from(detail)]);
+    }
+
+    /// The regression that matters most. Nothing beats on the activity's behalf, so an activity
+    /// wedged on a lock or a dead socket goes silent and the server's watchdog can see it. A
+    /// heartbeat driven by a timer would keep reporting a healthy activity forever.
+    #[tokio::test]
+    async fn nothing_is_sent_unless_the_activity_records() {
+        let (_heartbeater, mut rx) = heartbeater(Duration::from_millis(10));
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a heartbeat was sent that the activity never recorded"
+        );
+    }
+
+    /// Activity code is meant to call `record_heartbeat` freely, so a burst has to collapse --
+    /// but the server must still learn the activity is alive, with the newest progress.
+    #[tokio::test]
+    async fn a_burst_collapses_to_one_send_per_window_keeping_the_latest() {
+        let throttle = Duration::from_millis(100);
+        let (heartbeater, mut rx) = heartbeater(throttle);
+
+        record(&heartbeater, "first");
+        record(&heartbeater, "second");
+        record(&heartbeater, "third");
+
+        assert_eq!(
+            details_of(rx.try_recv().expect("the first heartbeat sends at once")),
+            vec!["first".to_string()]
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the rest of the burst should be held back"
+        );
+
+        tokio::time::sleep(throttle * 2).await;
+
+        assert_eq!(
+            details_of(rx.try_recv().expect("the window flushes what it held")),
+            vec!["third".to_string()],
+            "only the most recent heartbeat in a window is worth sending"
+        );
+        assert!(rx.try_recv().is_err(), "the window flushes exactly once");
+    }
+
+    /// An activity heartbeating slower than the throttle is never delayed by it.
+    #[tokio::test]
+    async fn a_heartbeat_after_the_window_is_not_throttled() {
+        let throttle = Duration::from_millis(50);
+        let (heartbeater, mut rx) = heartbeater(throttle);
+
+        record(&heartbeater, "first");
+        rx.try_recv().expect("the first heartbeat sends at once");
+
+        tokio::time::sleep(throttle * 2).await;
+        record(&heartbeater, "second");
+
+        assert_eq!(
+            details_of(rx.try_recv().expect("a heartbeat outside the window sends at once")),
+            vec!["second".to_string()]
+        );
+    }
+}

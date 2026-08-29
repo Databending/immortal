@@ -231,6 +231,12 @@ message StartActivityOptionsV1 {
   string workflow_id = 4;
   string activity_run_id = 5;
   uint64 workflow_epoch = 6;
+  /*
+   * Forwarded from the requesting RequestStartActivityOptionsV1 so the worker knows how often it
+   * must heartbeat. The worker is expected to send ActivityHeartbeatV1 at roughly a third of this
+   * interval. Absent means the server default (30s) applies.
+   */
+  optional google.protobuf.Duration heartbeat_timeout = 7;
 }
 
 message StartCallOptionsV1 {
@@ -371,17 +377,49 @@ message Log {
   Level level = 7;
 }
 
+/*
+ * Recorded by the activity itself, via ActContext::record_heartbeat. Never emitted on a timer:
+ * a heartbeat asserts that the activity is still making progress, so anything that could keep
+ * beating while the activity body is wedged would defeat the point.
+ *
+ * This is one of two liveness signals; a Log emitted from inside the activity's span refreshes
+ * the same server-side clock. An activity that logs regularly need not heartbeat explicitly.
+ * The server's watchdog times out any activity whose last signal is older than its
+ * heartbeat_timeout.
+ *
+ * The worker throttles these: at most one per throttle interval (heartbeat_timeout * 0.8,
+ * capped by max_heartbeat_throttle_interval), keeping only the most recent one recorded within
+ * a window, so an activity may call record_heartbeat as often as it likes.
+ *
+ * activity_run_id must be the run the worker was handed. Heartbeats for a superseded run are
+ * ignored so a straggler cannot keep a newer run alive.
+ */
+message ActivityHeartbeatV1 {
+  string activity_id = 1;
+  string activity_run_id = 2;
+  string workflow_id = 3;
+  uint64 workflow_epoch = 4;
+  /*
+   * Application payload carrying activity progress. Sent by the worker; not yet persisted by
+   * the server, so ActContext::get_heartbeat_details still reports nothing on a retry.
+   */
+  optional common.Payload details = 5;
+}
+
 // the naming might be backwards lol
 message ImmortalServerActionV1 {
   oneof action {
     RegisterImmortalWorkerV1 register_worker = 1;
     int32 workflow_heartbeat = 2;
+    // Deprecated: carried no activity id, was never sent and never read. Use
+    // activity_heartbeat_v1 (field 9). Kept so the wire type of field 3 never changes.
     int32 activity_heartbeat = 3;
     Log log_event = 4;
     int32 heartbeat = 5;
     Metrics metrics = 6;
     CheckActivity check_activity = 7;
     CheckWorkflow check_workflow = 8;
+    ActivityHeartbeatV1 activity_heartbeat_v1 = 9;
   }
 }
 
