@@ -1088,6 +1088,16 @@ impl Worker {
             let mut interval = tokio::time::interval(Duration::from_millis(500));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+            // Retrying the head forever is what makes a single unacceptable result block every
+            // completion behind it, so give up eventually. Only the head is ever retried, so one
+            // counter tracks it: any success resets it, and a failure puts that same item back at
+            // the front. Attempts are consumed only while connected, since the drain is skipped
+            // entirely otherwise -- a server restart costs nothing here.
+            const MAX_ATTEMPTS: u32 = 12;
+            const BASE_BACKOFF: Duration = Duration::from_millis(500);
+            const MAX_BACKOFF: Duration = Duration::from_secs(30);
+            let mut head_attempts: u32 = 0;
+
             loop {
                 tokio::select! {
                     _ = notify.notified() => {}
@@ -1096,6 +1106,9 @@ impl Worker {
 
                 let is_connected = *connected_rx.borrow();
                 if !is_connected {
+                    // Attempts only mean anything while there is a server there to reject us.
+                    // A reconnect gap must not count toward giving up on a valid result.
+                    head_attempts = 0;
                     continue;
                 }
 
@@ -1135,6 +1148,19 @@ impl Worker {
                     };
 
                     if let Err(e) = send_res {
+                        head_attempts += 1;
+
+                        if Self::is_terminal_outbox_error(&e) || head_attempts >= MAX_ATTEMPTS {
+                            // Dropping a result is not free -- the workflow re-runs at a new
+                            // epoch -- but it is recoverable, and blocking the outbox is not.
+                            error!(
+                                "dropping outbox item after {head_attempts} attempt(s); \
+                                 last error: {e}"
+                            );
+                            head_attempts = 0;
+                            continue; // drop it and keep draining
+                        }
+
                         eprintln!("outbox send failed: {e}");
 
                         {
@@ -1142,12 +1168,38 @@ impl Worker {
                             q.push_front(item);
                         }
 
-                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        let backoff = BASE_BACKOFF
+                            .saturating_mul(1u32 << (head_attempts - 1).min(6))
+                            .min(MAX_BACKOFF);
+                        tokio::time::sleep(backoff).await;
                         break; // stop draining on failure
                     }
+
+                    head_attempts = 0;
                 }
             }
         });
+    }
+
+    /// Errors the server will keep returning no matter how many times an item is resent.
+    ///
+    /// The outbox preserves order and only ever retries its head, so treating one of these as
+    /// retryable wedges every later completion behind it forever. Capacity is restored only
+    /// through the completion paths, so a wedged outbox also ends with the worker holding slots
+    /// it will never get back.
+    pub fn is_terminal_outbox_error(e: &tonic::Status) -> bool {
+        use tonic::Code;
+        matches!(
+            e.code(),
+            Code::InvalidArgument
+                | Code::NotFound
+                | Code::AlreadyExists
+                | Code::PermissionDenied
+                | Code::Unauthenticated
+                | Code::FailedPrecondition
+                | Code::OutOfRange
+                | Code::Unimplemented
+        )
     }
 
     pub fn is_retryable_rpc_error(e: &tonic::Status) -> bool {

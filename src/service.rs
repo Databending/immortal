@@ -18,7 +18,7 @@ use immortal_lib::common::{Payload, Payloads};
 use immortal_lib::failure;
 use immortal_lib::immortal::RequestStartActivityOptionsV1;
 use immortal_lib::immortal::{
-    self, call_result_version, call_version, client_start_workflow_options_version,
+    self, call_result_v1, call_result_version, call_version, client_start_workflow_options_version,
     immortal_worker_action_version, ActivityResultV1, CallResultV1, CallResultVersion, CallVersion,
     ClientStartWorkflowOptionsV1, ClientStartWorkflowOptionsVersion, ImmortalWorkerActionV1,
     ImmortalWorkerActionVersion, StartWorkflowOptionsV1,
@@ -114,6 +114,10 @@ pub struct ImmortalService {
                         String,
                         CallOptions,
                         Option<tokio::sync::mpsc::Sender<CallResultV1>>,
+                        // when it was enqueued; the dispatcher reaps entries older than
+                        // CALL_QUEUE_TIMEOUT so a caller cannot block on a call that no worker
+                        // will ever pick up
+                        DateTime<Utc>,
                     )>,
                 >,
             >,
@@ -186,8 +190,17 @@ async fn build_retry_activity_options(
     {
         let mut activity_input = None;
         if let Some(blob_ref) = &activity.input {
+            // The blob carries its own TTL and is not refreshed when the metadata around it is,
+            // so it can be gone while `activity.input` still points at it. This runs inside the
+            // watchdog via `completed_activity_inner`, where a panic would end activity timeouts,
+            // call timeouts and orphan recovery for the rest of the process.
+            let data = get_blob_raw::<Vec<u8>>(&mut con, &blob_ref.path)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("activity input blob missing at {}", blob_ref.path)
+                })?;
             activity_input = Some(Payload {
-                data: get_blob_raw(&mut con, &blob_ref.path).await?.unwrap(),
+                data,
                 metadata: blob_ref.metadata.clone().unwrap_or_default(),
             });
         }
@@ -230,7 +243,13 @@ impl ImmortalService {
         &self,
         workflow_result: WorkflowResultV1,
     ) -> Result<(), Status> {
-        let mut con = self.history.get_con().await.unwrap();
+        // A panic here reaches the worker as a reset stream, which its outbox reads as a
+        // retryable transport error and resends forever, blocking every completion behind it.
+        // Report Redis trouble as a status the worker can retry cleanly instead.
+        let mut con = self.history.get_con().await.map_err(|e| {
+            error!("Failed to fetch redis connection: {:?}", e);
+            Status::internal("Failed to fetch redis connection")
+        })?;
 
         let workflow_metadata =
             WorkflowHistoryMetadata::get_opt(&mut con, &workflow_result.workflow_id, true)
@@ -432,10 +451,14 @@ impl ImmortalService {
             }
         }
 
-        let _ = self.notification_tx.send(Notification::WorkflowCompleted(
-            Uuid::parse_str(&workflow_id).unwrap(),
-            workflow.clone(),
-        ));
+        // `workflow_id` is client-supplied and only defaulted to a UUID when absent, so this must
+        // not assume one. Panicking here failed the RPC, which the worker's outbox then retried
+        // forever -- one workflow started with a non-UUID id wedged that worker's whole outbox.
+        if let Ok(uuid) = Uuid::parse_str(&workflow_id) {
+            let _ = self
+                .notification_tx
+                .send(Notification::WorkflowCompleted(uuid, workflow.clone()));
+        }
         workflow.store(&mut con, false).await.map_err(|e| {
             println!("Failed to store workflow metadata history: {:?}", e);
             Status::internal("Failed to get workflow history")
@@ -1251,9 +1274,72 @@ impl ImmortalService {
         let workers = Arc::clone(&self.workers);
         let notify = self.call_notify.clone();
         tokio::spawn(async move {
+            // The watchdog only times out calls that already reached a worker, so without this a
+            // call queued for a task queue with no eligible worker sits here forever and its
+            // caller blocks on `rx.recv()` for just as long. Reaping needs its own tick: nothing
+            // is obliged to notify once the queue has stopped moving.
+            const REAP_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+            let mut pending = false;
+
             loop {
-                notify.notified().await;
+                if pending {
+                    tokio::select! {
+                        _ = notify.notified() => {}
+                        _ = tokio::time::sleep(REAP_TICK) => {}
+                    }
+                } else {
+                    notify.notified().await;
+                }
+
                 println!("running call queue");
+
+                // ---- reap calls that have waited too long ----
+                let expired = {
+                    let call_queue_timeout = Duration::seconds(30);
+                    let now = Utc::now();
+                    let mut call_queues = call_queue.lock().await;
+                    let mut expired = Vec::new();
+
+                    for queue in call_queues.values_mut() {
+                        let mut kept = VecDeque::with_capacity(queue.len());
+                        while let Some(item) = queue.pop_front() {
+                            if now - item.3 > call_queue_timeout {
+                                expired.push(item);
+                            } else {
+                                kept.push_back(item);
+                            }
+                        }
+                        *queue = kept;
+                    }
+                    call_queues.retain(|_, q| !q.is_empty());
+                    expired
+                };
+
+                for item in expired {
+                    let (call_id, call_options, sender, _) = *item;
+                    error!(
+                        "call {} ({}) timed out waiting for a worker on {}",
+                        call_id, call_options.call_type, call_options.task_queue
+                    );
+                    if let Some(sender) = sender {
+                        let _ = sender
+                            .send(CallResultV1 {
+                                call_id: call_id.clone(),
+                                call_run_id: "0".to_string(),
+                                status: Some(call_result_v1::Status::Failed(immortal::Failure {
+                                    failure: Some(failure::Failure {
+                                        message: format!(
+                                            "no worker available on task queue {}",
+                                            call_options.task_queue
+                                        ),
+                                        ..Default::default()
+                                    }),
+                                })),
+                            })
+                            .await;
+                    }
+                }
+
                 // Lock once and take a snapshot of queues
                 let queues_snapshot: HashMap<String, _> = {
                     let call_queues = call_queue.lock().await;
@@ -1276,24 +1362,25 @@ impl ImmortalService {
 
                     // Try to assign one call from this queue
                     for (_index, queued_item) in queue.into_iter().enumerate() {
-                        let (call_id, call_options, sender) = *queued_item;
+                        let (call_id, call_options, sender, _enqueued) = *queued_item;
                         //println!("executing {call_id}");
                         // Find eligible workers
 
-                        if let Some(sender) = &sender {
-                            if sender.is_closed() {
-                                let mut call_queues = call_queue.lock().await;
-                                if let Some(queue_vec) = call_queues.get_mut(&queue_name) {
-                                    if let Some(pos) =
-                                        queue_vec.iter().position(|x| (**x).0 == call_id)
-                                    {
-                                        queue_vec.remove(pos);
-                                    }
-                                    if queue_vec.is_empty() {
-                                        call_queues.remove(&queue_name);
-                                    }
+                        if sender.as_ref().is_some_and(|s| s.is_closed()) {
+                            // The caller is gone. Drop it here -- without the `continue` this
+                            // fell through and dispatched the call anyway, then registered a
+                            // running call whose result had nowhere to go.
+                            let mut call_queues = call_queue.lock().await;
+                            if let Some(queue_vec) = call_queues.get_mut(&queue_name) {
+                                if let Some(pos) = queue_vec.iter().position(|x| (**x).0 == call_id)
+                                {
+                                    queue_vec.remove(pos);
+                                }
+                                if queue_vec.is_empty() {
+                                    call_queues.remove(&queue_name);
                                 }
                             }
+                            continue;
                         }
 
                         let available_workers: Vec<_>;
@@ -1405,6 +1492,11 @@ impl ImmortalService {
                         }
                     }
                 }
+
+                // Anything still queued needs the reap tick, otherwise it waits on a notify that
+                // may never come.
+                pending = call_queue.lock().await.values().any(|q| !q.is_empty());
+
                 println!("finished running loop");
             }
         });
@@ -1420,8 +1512,25 @@ impl ImmortalService {
         let notify = self.activity_notify.clone();
 
         tokio::spawn(async move {
+            // Requeueing an item and going back around the drain loop just re-pops what was
+            // pushed back, so an activity that cannot be placed spins the loop -- and every turn
+            // takes a pool connection and hits Redis, which is enough to exhaust the pool and
+            // stall the rest of the server. Stop draining instead, and retry on a tick as well as
+            // on notify: nothing is obliged to notify afterwards, since the worker that would
+            // free capacity may already be gone and a Redis error has no waker at all.
+            const REQUEUE_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+            let mut requeued = false;
+
             loop {
-                notify.notified().await;
+                if requeued {
+                    tokio::select! {
+                        _ = notify.notified() => {}
+                        _ = tokio::time::sleep(REQUEUE_RETRY) => {}
+                    }
+                } else {
+                    notify.notified().await;
+                }
+                requeued = false;
 
                 // Drain until no more items (so one notify can process many)
                 loop {
@@ -1472,7 +1581,28 @@ impl ImmortalService {
                     //     activity_options.idempotency_key.clone()
                     // };
 
-                    let mut con = history.get_con().await.unwrap();
+                    // This task is spawned once and never restarted, so unwinding here would end
+                    // all activity dispatch for the lifetime of the process while the server went
+                    // on looking healthy. Redis being briefly unreachable has to requeue.
+                    let mut con = match history.get_con().await {
+                        Ok(con) => con,
+                        Err(e) => {
+                            error!("Failed to get redis connection for dispatch: {:?}", e);
+                            let mut activity_queues = activity_queue.lock().await;
+                            activity_queues
+                                .entry(queue_name.clone())
+                                .or_insert_with(VecDeque::new)
+                                .push_front(Box::new((
+                                    activity_options,
+                                    txs,
+                                    scheduled,
+                                    index,
+                                    activity_id_opt,
+                                )));
+                            requeued = true;
+                            break;
+                        }
+                    };
 
                     // if activity_id is present that means it was scheduled for a retry
                     // let mut existing_by_hash = None;
@@ -1481,13 +1611,31 @@ impl ImmortalService {
                     } else {
                         activity_options.idempotency_key.clone()
                     };
-                    let existing = ActivityHistoryMetadata::get_opt(
+                    let existing = match ActivityHistoryMetadata::get_opt(
                         &mut con,
                         &activity_options.workflow_id,
                         &activity_id,
                     )
                     .await
-                    .unwrap();
+                    {
+                        Ok(existing) => existing,
+                        Err(e) => {
+                            error!("Failed to read activity history for {activity_id}: {:?}", e);
+                            let mut activity_queues = activity_queue.lock().await;
+                            activity_queues
+                                .entry(queue_name.clone())
+                                .or_insert_with(VecDeque::new)
+                                .push_front(Box::new((
+                                    activity_options,
+                                    txs,
+                                    scheduled,
+                                    index,
+                                    activity_id_opt,
+                                )));
+                            requeued = true;
+                            break;
+                        }
+                    };
 
                     // ---------------------------
                     // 1) ATTACH / EARLY RETURN PATHS
@@ -1499,7 +1647,29 @@ impl ImmortalService {
                                     HistoryStatus::Completed => {
                                         let payload = match &latest_run.output {
                                             Some(blob_ref) => {
-                                                Some(blob_ref.to_payload(&mut con).await.unwrap())
+                                                match blob_ref.to_payload(&mut con).await {
+                                                    Ok(payload) => Some(payload),
+                                                    Err(e) => {
+                                                        error!(
+                                                            "Failed to load cached output for {activity_id}: {:?}",
+                                                            e
+                                                        );
+                                                        let mut activity_queues =
+                                                            activity_queue.lock().await;
+                                                        activity_queues
+                                                            .entry(queue_name.clone())
+                                                            .or_insert_with(VecDeque::new)
+                                                            .push_front(Box::new((
+                                                                activity_options,
+                                                                txs,
+                                                                scheduled,
+                                                                index,
+                                                                activity_id_opt,
+                                                            )));
+                                                        requeued = true;
+                                                        break;
+                                                    }
+                                                }
                                             }
                                             None => None,
                                         };
@@ -1523,7 +1693,29 @@ impl ImmortalService {
                                     HistoryStatus::Failed => {
                                         let payload = match &latest_run.output {
                                             Some(blob_ref) => {
-                                                Some(blob_ref.to_payload(&mut con).await.unwrap())
+                                                match blob_ref.to_payload(&mut con).await {
+                                                    Ok(payload) => Some(payload),
+                                                    Err(e) => {
+                                                        error!(
+                                                            "Failed to load cached failure for {activity_id}: {:?}",
+                                                            e
+                                                        );
+                                                        let mut activity_queues =
+                                                            activity_queue.lock().await;
+                                                        activity_queues
+                                                            .entry(queue_name.clone())
+                                                            .or_insert_with(VecDeque::new)
+                                                            .push_front(Box::new((
+                                                                activity_options,
+                                                                txs,
+                                                                scheduled,
+                                                                index,
+                                                                activity_id_opt,
+                                                            )));
+                                                        requeued = true;
+                                                        break;
+                                                    }
+                                                }
                                             }
                                             None => None,
                                         };
@@ -1629,8 +1821,8 @@ impl ImmortalService {
                                         }
 
                                         // Don't spin; wait for watchdog/rehydration/worker
-                                        // (optional) notify.notify_one();
-                                        continue;
+                                        requeued = true;
+                                        break;
                                     }
                                     _ => {}
                                 }
@@ -1710,8 +1902,10 @@ impl ImmortalService {
                                     activity_id_opt,
                                 )));
                         }
-                        // Don't hot loop; rely on worker registration / capacity frees to notify
-                        continue;
+                        // Don't hot loop; rely on worker registration / capacity frees to notify,
+                        // and on the retry tick if neither ever comes.
+                        requeued = true;
+                        break;
                     }
 
                     let random_index = rand::rng().random_range(0..available_workers.len());
@@ -1845,8 +2039,10 @@ impl ImmortalService {
                                     Some(activity_id),
                                 )));
                         }
-                        notify.notify_one();
-                        continue;
+                        // Notifying here would just re-pop this item and hit the same dead worker
+                        // until its outbound task gets round to removing it from `workers`.
+                        requeued = true;
+                        break;
                     }
 
                     Self::adjust_capacity(
@@ -1889,8 +2085,22 @@ impl ImmortalService {
         let notify = self.workflow_notify.clone();
 
         tokio::spawn(async move {
+            // Same retry tick as the activity dispatcher: this loop already stops draining when
+            // it requeues, but nothing guarantees a notify follows, so a requeued workflow would
+            // otherwise sit in the queue until unrelated traffic happened to wake the loop.
+            const REQUEUE_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+            let mut requeued = false;
+
             loop {
-                notify.notified().await;
+                if requeued {
+                    tokio::select! {
+                        _ = notify.notified() => {}
+                        _ = tokio::time::sleep(REQUEUE_RETRY) => {}
+                    }
+                } else {
+                    notify.notified().await;
+                }
+                requeued = false;
 
                 loop {
                     // ---- pop one workflow item under lock ----
@@ -1933,13 +2143,31 @@ impl ImmortalService {
                     };
 
                     // ---- compute epoch (no workflow_queue lock held) ----
+                    // Spawned once and never restarted: unwinding here would end workflow
+                    // dispatch for the rest of the process. A Redis error requeues instead.
                     let epoch = {
-                        let mut con = pool.get().await.unwrap();
-                        let wf_history =
-                            WorkflowHistoryMetadata::get_opt(&mut con, &workflow_id, false)
-                                .await
-                                .unwrap();
-                        wf_history.map(|m| m.epoch + 1).unwrap_or(0)
+                        let lookup = async {
+                            let mut con = history.get_con().await?;
+                            WorkflowHistoryMetadata::get_opt(&mut con, &workflow_id, false).await
+                        }
+                        .await;
+
+                        match lookup {
+                            Ok(wf_history) => wf_history.map(|m| m.epoch + 1).unwrap_or(0),
+                            Err(e) => {
+                                error!(
+                                    "Failed to read workflow history for {workflow_id}: {:?}",
+                                    e
+                                );
+                                let mut queues = workflow_queue.lock().await;
+                                queues
+                                    .entry(queue_name.clone())
+                                    .or_insert_with(VecDeque::new)
+                                    .push_front(Box::new((workflow_id, client_opts, sender)));
+                                requeued = true;
+                                break;
+                            }
+                        }
                     };
 
                     let workflow_options = StartWorkflowOptionsV1 {
@@ -1975,6 +2203,7 @@ impl ImmortalService {
                                 .or_insert_with(VecDeque::new)
                                 .push_front(Box::new((workflow_id, client_opts, sender)));
                         }
+                        requeued = true;
                         break;
                     }
 
@@ -1987,17 +2216,24 @@ impl ImmortalService {
                         let now = Utc::now();
                         let timeout = now + Duration::seconds(30);
 
-                        let mut con = pool.get().await.unwrap();
-                        let _ = WorkflowTimelineEntryV1::new(
-                            &workflow_id,
-                            epoch,
-                            WorkflowTimelineEventV1::WorkflowStarted {
-                                workflow_type: client_opts.workflow_type.clone(),
-                                task_queue: client_opts.task_queue.clone(),
-                            },
-                        )
-                        .append(&mut con)
-                        .await;
+                        // Best-effort: a timeline entry is not worth taking dispatch down for.
+                        match pool.get().await {
+                            Ok(mut con) => {
+                                let _ = WorkflowTimelineEntryV1::new(
+                                    &workflow_id,
+                                    epoch,
+                                    WorkflowTimelineEventV1::WorkflowStarted {
+                                        workflow_type: client_opts.workflow_type.clone(),
+                                        task_queue: client_opts.task_queue.clone(),
+                                    },
+                                )
+                                .append(&mut con)
+                                .await;
+                            }
+                            Err(e) => {
+                                error!("Failed to append workflow timeline entry: {:?}", e)
+                            }
+                        }
 
                         running.insert(
                             workflow_id.clone(),
@@ -2073,7 +2309,9 @@ impl ImmortalService {
                                 )));
                         }
 
-                        notify.notify_one();
+                        // Notifying here would just re-pop this item and hit the same dead worker
+                        // until its outbound task gets round to removing it from `workers`.
+                        requeued = true;
                         break;
                     }
 
@@ -2117,6 +2355,7 @@ impl ImmortalService {
                                     task_queue: call.task_queue.clone(),
                                 },
                                 Some(tx),
+                                Utc::now(),
                             )));
                         }
                         None => {
@@ -2129,6 +2368,7 @@ impl ImmortalService {
                                     task_queue: call.task_queue.clone(),
                                 },
                                 Some(tx),
+                                Utc::now(),
                             )));
                             queue.insert(call.call_type.clone(), queue2);
                         }
@@ -2150,8 +2390,16 @@ impl ImmortalService {
     pub fn resurrect(self: Arc<Self>) {
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            let mut con = self.redis_pool.get().await.unwrap();
-            let history_running_workflows = WorkflowHistoryMetadata::get_all(
+            // Resurrection runs once. Unwinding here loses it silently for the whole process,
+            // so every step reports and gives up rather than panicking.
+            let mut con = match self.redis_pool.get().await {
+                Ok(con) => con,
+                Err(e) => {
+                    error!("resurrect: failed to get redis connection: {:?}", e);
+                    return;
+                }
+            };
+            let history_running_workflows = match WorkflowHistoryMetadata::get_all(
                 &mut con,
                 None,
                 None,
@@ -2162,7 +2410,13 @@ impl ImmortalService {
                 false,
             )
             .await
-            .unwrap();
+            {
+                Ok(workflows) => workflows,
+                Err(e) => {
+                    error!("resurrect: failed to list running workflows: {:?}", e);
+                    return;
+                }
+            };
             let running_workflows = self.running_workflows.read().await;
             for history_running_workflow in history_running_workflows {
                 if running_workflows
@@ -2172,11 +2426,26 @@ impl ImmortalService {
                     // need to ask worker if it's up and running
 
                     let mut payloads = vec![];
+                    let mut args_ok = true;
                     for blob_ref in history_running_workflow.args {
-                        payloads.push(blob_ref.to_payload(&mut con).await.unwrap());
+                        match blob_ref.to_payload(&mut con).await {
+                            Ok(payload) => payloads.push(payload),
+                            Err(e) => {
+                                error!(
+                                    "resurrect: failed to load args for {}: {:?}",
+                                    history_running_workflow.workflow_id, e
+                                );
+                                args_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !args_ok {
+                        continue;
                     }
 
-                    self.start_workflow_internal(
+                    if let Err(e) = self
+                        .start_workflow_internal(
                         ClientStartWorkflowOptionsVersion {
                             version: Some(client_start_workflow_options_version::Version::V1(
                                 ClientStartWorkflowOptionsV1 {
@@ -2195,7 +2464,12 @@ impl ImmortalService {
                         None,
                     )
                     .await
-                    .unwrap();
+                    {
+                        error!(
+                            "resurrect: failed to requeue {}: {:?}",
+                            history_running_workflow.workflow_id, e
+                        );
+                    }
                 }
             }
         });

@@ -268,6 +268,7 @@ impl Immortal for ImmortalService {
                                 Uuid::new_v4().to_string(),
                                 call_options,
                                 None,
+                                Utc::now(),
                             )));
                         }
                         None => {
@@ -280,6 +281,7 @@ impl Immortal for ImmortalService {
                                     task_queue: call.task_queue.clone(),
                                 },
                                 None,
+                                Utc::now(),
                             )));
                             queue.insert(call.call_type.clone(), queue2);
                         }
@@ -332,6 +334,7 @@ impl Immortal for ImmortalService {
                                 Uuid::new_v4().to_string(),
                                 call_options,
                                 Some(tx),
+                                Utc::now(),
                             )));
                             rx
                         }
@@ -346,6 +349,7 @@ impl Immortal for ImmortalService {
                                     task_queue: call.task_queue.clone(),
                                 },
                                 Some(tx),
+                                Utc::now(),
                             )));
                             queue.insert(call.call_type.clone(), queue2);
                             rx
@@ -573,29 +577,44 @@ impl Immortal for ImmortalService {
                                     None => {}
                                 }
 
-                                match redis_pool.get().await {
-                                    Ok(mut con) => {
-                                        let key = format!("immortal:logs:{}", log.workflow_id);
-                                        if let Err(e) = con
-                                            .xadd_maxlen::<_, &str, &str, _, ()>(
-                                                &key,
-                                                StreamMaxlen::Approx(1000),
-                                                "*",
-                                                &items,
-                                            )
-                                            .await
-                                        {
-                                            error!("Error appending to logs: {}", e);
+                                const LOG_PERSIST_TIMEOUT: std::time::Duration =
+                                    std::time::Duration::from_secs(5);
+                                let persist_result =
+                                    tokio::time::timeout(LOG_PERSIST_TIMEOUT, async {
+                                        match redis_pool.get().await {
+                                            Ok(mut con) => {
+                                                let key =
+                                                    format!("immortal:logs:{}", log.workflow_id);
+                                                if let Err(e) = con
+                                                    .xadd_maxlen::<_, &str, &str, _, ()>(
+                                                        &key,
+                                                        StreamMaxlen::Approx(1000),
+                                                        "*",
+                                                        &items,
+                                                    )
+                                                    .await
+                                                {
+                                                    error!("Error appending to logs: {}", e);
+                                                }
+                                                if let Err(e) = con
+                                                    .expire::<&str, ()>(&key, immortal_ttl())
+                                                    .await
+                                                {
+                                                    error!("Error setting exp for logs: {}", e);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                error!("Error getting Redis connection: {}", e);
+                                            }
                                         }
-                                        // TODO: don't ignore this
-                                        if let Err(e) = con.expire::<&str, ()>(&key, immortal_ttl()).await
-                                        {
-                                            error!("Error setting exp for logs: {}", e);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("Error getting Redis connection: {}", e);
-                                    }
+                                    })
+                                    .await;
+
+                                if persist_result.is_err() {
+                                    error!(
+                                        "Timed out persisting worker log after {:?}",
+                                        LOG_PERSIST_TIMEOUT
+                                    );
                                 }
                             }
                         }

@@ -423,8 +423,15 @@ impl History {
                 .await?;
         }
 
-        // Optional TTL on top-level workflow metadata key
-        let _: () = con.expire(&wf_meta, immortal_ttl()).await?;
+        // Metadata and the blobs it points at have to expire together -- see `refresh_ttl`.
+        refresh_ttl(
+            &mut con,
+            std::iter::once(wf_meta.clone())
+                .chain(std::iter::once(workflow_activities_list_key(&wf_id)))
+                .chain((0..workflow.args.len()).map(|i| workflow_args_key(&wf_id, i)))
+                .chain(std::iter::once(workflow_output_key(&wf_id))),
+        )
+        .await?;
 
         // println!("WRITING TO REDIS (add workflow)");
         Ok(())
@@ -802,7 +809,16 @@ impl History {
             }
         }
 
-        let _: () = con.expire(&base, immortal_ttl()).await?;
+        // Metadata and the blobs it points at have to expire together -- see `refresh_ttl`.
+        refresh_ttl(
+            con,
+            [
+                base.clone(),
+                activity_runs_list_key(workflow_id, activity_id),
+                activity_input_key(workflow_id, activity_id),
+            ],
+        )
+        .await?;
 
         Ok(())
     }
@@ -885,7 +901,14 @@ impl History {
         // )
         // .await?;
 
-        let _: () = con.expire(&base, immortal_ttl()).await?;
+        refresh_ttl(
+            con,
+            std::iter::once(base.clone())
+                .chain(run.output.iter().map(|_| {
+                    run_output_blob_key(&run.workflow_id, &run.activity_id, &run.run_id)
+                })),
+        )
+        .await?;
         Ok(())
     }
 
@@ -952,6 +975,31 @@ impl History {
 async fn set_blob_raw(con: &mut MultiplexedConnection, key: &str, data: &Vec<u8>) -> Result<()> {
     // let bytes = simd_json::to_string(value)?;
     let _: () = con.set_ex(key, data, immortal_ttl() as u64).await?;
+    Ok(())
+}
+
+/// Push a set of keys out to the standard TTL window in one round trip.
+///
+/// A blob is written once with its own `SET ... EX` and never touched again, while the metadata
+/// pointing at it gets a fresh `EXPIRE` on every store. Refreshing only the metadata lets the
+/// blob expire out from under it: `to_payload` then quietly yields an empty payload for a run
+/// history still marked `Completed`, and a retry cannot find its input at all. So every site that
+/// extends a metadata key's life has to extend its blobs' too.
+///
+/// `EXPIRE` on a missing key is a no-op, so callers may pass paths that were never written.
+pub async fn refresh_ttl<I>(con: &mut MultiplexedConnection, keys: I) -> Result<()>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut pipe = redis::pipe();
+    let mut any = false;
+    for key in keys {
+        pipe.cmd("EXPIRE").arg(key).arg(immortal_ttl()).ignore();
+        any = true;
+    }
+    if any {
+        let _: () = pipe.query_async(con).await?;
+    }
     Ok(())
 }
 

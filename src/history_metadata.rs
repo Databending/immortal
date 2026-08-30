@@ -4,7 +4,7 @@ use crate::history::{
     ActivityHistory, ActivityRun, Status, WorkflowHistory,
 };
 
-use crate::history::{workflow_args_key, BlobRef};
+use crate::history::{refresh_ttl, workflow_args_key, BlobRef};
 use crate::immortal_ttl;
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
@@ -235,8 +235,16 @@ impl WorkflowHistoryMetadata {
             }
         }
 
-        // Optional TTL on top-level workflow metadata key
-        let _: () = con.expire(&wf_meta, immortal_ttl()).await?;
+        // Optional TTL on top-level workflow metadata key, plus the blobs it points at -- see
+        // `refresh_ttl`. Args and output carry their own key in `BlobRef::path`.
+        refresh_ttl(
+            con,
+            std::iter::once(wf_meta.clone())
+                .chain(std::iter::once(workflow_activities_list_key(&wf_id)))
+                .chain(self.args.iter().map(|a| a.path.clone()))
+                .chain(self.output.iter().map(|o| o.path.clone())),
+        )
+        .await?;
 
         // println!("WRITING TO REDIS (store workflow metadata)");
         Ok(())
@@ -640,7 +648,19 @@ impl ActivityHistoryMetadata {
             }
         }
 
-        let _: () = con.expire(&base, immortal_ttl()).await?;
+        // The runs list is refreshed above only when children are stored, so refresh it here too:
+        // an activity whose metadata outlives its runs list reads back with no runs at all, which
+        // is what the re-attach path in `register_worker` indexes into.
+        refresh_ttl(
+            con,
+            std::iter::once(base.clone())
+                .chain(std::iter::once(activity_runs_list_key(
+                    workflow_id,
+                    &self.activity_id,
+                )))
+                .chain(self.input.iter().map(|i| i.path.clone())),
+        )
+        .await?;
 
         Ok(())
     }
@@ -818,7 +838,14 @@ impl ActivityRunHistoryMetadata {
 
         let _: () = query.ignore().query_async(&mut *con).await?;
 
-        let _: () = con.expire(&base, immortal_ttl()).await?;
+        // A run's output blob is the cached activity result: if it expires first, the run still
+        // reads back `Completed` and the workflow gets an empty payload for it.
+        refresh_ttl(
+            con,
+            std::iter::once(base.clone())
+                .chain(self.output.iter().map(|o| o.path.clone())),
+        )
+        .await?;
         Ok(())
     }
 }
