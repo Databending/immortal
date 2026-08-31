@@ -842,8 +842,7 @@ impl ActivityRunHistoryMetadata {
         // reads back `Completed` and the workflow gets an empty payload for it.
         refresh_ttl(
             con,
-            std::iter::once(base.clone())
-                .chain(self.output.iter().map(|o| o.path.clone())),
+            std::iter::once(base.clone()).chain(self.output.iter().map(|o| o.path.clone())),
         )
         .await?;
         Ok(())

@@ -59,6 +59,8 @@ paste = "1.0.15"
 rmp-serde = "1.3.0"
 sentry = { version = "0.46.0", features = ["tracing"] }
 blake3 = "1.8.2"
+rust-s3 = "0.37.2"
+flate2 = "1.1.5"
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = {version = "0.6", features = ["profiling"]}
 
@@ -71,7 +73,7 @@ path = "src/server.rs"
 [[bin]]
 name = "worker"
 path = "src/worker.rs"
-#
+
 # [[bin]]
 # name = "client"
 # path = "src/client.rs"

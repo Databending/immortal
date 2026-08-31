@@ -169,7 +169,7 @@ impl ActivityHistory {
             schedule_to_close_timeout,
             schedule_to_start_timeout,
             start_to_close_timeout,
-            heartbeat_timeout
+            heartbeat_timeout,
         }
     }
 
@@ -903,10 +903,11 @@ impl History {
 
         refresh_ttl(
             con,
-            std::iter::once(base.clone())
-                .chain(run.output.iter().map(|_| {
-                    run_output_blob_key(&run.workflow_id, &run.activity_id, &run.run_id)
-                })),
+            std::iter::once(base.clone()).chain(
+                run.output
+                    .iter()
+                    .map(|_| run_output_blob_key(&run.workflow_id, &run.activity_id, &run.run_id)),
+            ),
         )
         .await?;
         Ok(())
@@ -1273,6 +1274,10 @@ mod tests {
             Some(Payload::new(&"input")),
             0,
             "".to_string(),
+            None,
+            None,
+            None,
+            None,
         );
 
         assert_eq!(activity.activity_id, "act_id_1");

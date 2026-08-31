@@ -261,7 +261,13 @@ async fn start_log_producer(
     let room_name = room(&fetch_logs.to_room_id_hashed(), "logs");
     let producer_name = fetch_logs.to_room_id_hashed();
     let handle;
-    let con = pool.get().await.unwrap().clone();
+    let con = match pool.get().await {
+        Ok(connection) => connection.clone(),
+        Err(error) => {
+            tracing::warn!("unable to start log subscription: {error}");
+            return;
+        }
+    };
     {
         let room_name = room_name.clone();
         let mut con = con.clone();
@@ -276,15 +282,16 @@ async fn start_log_producer(
                                     _ = cancel_child.cancelled() => break,
                                     _ = tokio::time::sleep(Duration::from_millis(400)) => {
                                         // Fetch new lines and broadcast to room
-                fetch_logs_from_redis(
+                if let Err(error) = fetch_logs_from_redis(
                     &mut last_ids,
                     &mut last_id,
                     &fetch_logs,
                     &mut con,
                     &Some(room_name.clone()),
                     &io,
-                    &immortal_service)
-                    .await
+                    &immortal_service).await {
+                        tracing::warn!("log subscription Redis read failed: {error}");
+                    }
                                         }
                                                 }
             }
@@ -339,7 +346,7 @@ async fn fetch_logs_from_redis(
     room_name: &Option<String>,
     io: &SocketRef,
     immortal_service: &Arc<ImmortalService>,
-) {
+) -> anyhow::Result<()> {
     // println!("LAST ID: {last_id}");
     let opts = StreamReadOptions::default().block(500);
     match fetch_logs {
@@ -350,8 +357,7 @@ async fn fetch_logs_from_redis(
                     &[last_id.as_str()],
                     &opts,
                 )
-                .await
-                .expect("read");
+                .await?;
             for StreamKey { key: _, ids } in srr.keys {
                 for StreamId { id, map } in ids {
                     *last_id = id.clone();
@@ -401,8 +407,7 @@ async fn fetch_logs_from_redis(
             let workflows = immortal_service
                 .history
                 .get_workflows(Some(1000), Some(0), None, Some(worker_ids.to_vec()), None)
-                .await
-                .unwrap();
+                .await?;
             let workflow_ids = workflows
                 .iter()
                 .map(|f| match f {
@@ -419,8 +424,7 @@ async fn fetch_logs_from_redis(
                     &sort_last_ids(&last_ids, &workflow_ids),
                     &opts,
                 )
-                .await
-                .expect("read");
+                .await?;
             for StreamKey { key, ids } in srr.keys {
                 for StreamId { id, map } in ids {
                     let key_id = key.split("immortal:logs:").collect::<Vec<_>>();
@@ -432,14 +436,13 @@ async fn fetch_logs_from_redis(
                     let mut parsed_map = simd_json::json!({
                         "id": id.clone()
                     });
-                    read_and_send_log(&room_name, &mut parsed_map, &map, &io)
-                        .await
-                        .unwrap();
+                    read_and_send_log(&room_name, &mut parsed_map, &map, &io).await?;
                 }
             }
         }
         FetchLogs::TaskQueue(ref _task_queues) => {}
     }
+    Ok(())
 }
 
 pub async fn on_connect(

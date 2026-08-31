@@ -1,8 +1,8 @@
+use futures::future::BoxFuture;
+use futures::future::FutureExt;
 use immortal_lib::common::Payload;
 use immortal_lib::immortal;
 use immortal_lib::immortal::{ImmortalServerActionV1, immortal_server_action_v1};
-use futures::future::BoxFuture;
-use futures::future::FutureExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use simd_json::OwnedValue;
@@ -13,11 +13,12 @@ use std::sync::Mutex;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
-use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use tracing::debug;
 use tracing::info_span;
-use tracing::Instrument;
+
+use super::outbound::WorkerOutboundSender;
 
 #[derive(Default, Debug)]
 pub struct ActivityOptions {
@@ -94,7 +95,10 @@ impl<T: Serialize> From<T> for ActExitValue<T> {
 }
 
 type BoxActFn = Arc<
-    dyn Fn(ActContext, Payload) -> BoxFuture<'static, Result<ActExitValue<OwnedValue>, ActivityError>>
+    dyn Fn(
+            ActContext,
+            Payload,
+        ) -> BoxFuture<'static, Result<ActExitValue<OwnedValue>, ActivityError>>
         + Send
         + Sync,
 >;
@@ -212,10 +216,12 @@ where
                             let exit_val: ActExitValue<O> = r.into();
                             match exit_val {
                                 // ActExitValue::WillCompleteAsync => Ok(ActExitValue::WillCompleteAsync),
-                                ActExitValue::Normal(x) => match simd_json::serde::to_owned_value(x) {
-                                    Ok(v) => Ok(ActExitValue::Normal(v)),
-                                    Err(e) => Err(ActivityError::NonRetryable(e.into())),
-                                },
+                                ActExitValue::Normal(x) => {
+                                    match simd_json::serde::to_owned_value(x) {
+                                        Ok(v) => Ok(ActExitValue::Normal(v)),
+                                        Err(e) => Err(ActivityError::NonRetryable(e.into())),
+                                    }
+                                }
                             }
                         })
                     })
@@ -223,7 +229,7 @@ where
                 Err(e) => {
                     println!("FAILED DESERIALIZING INPUT ARGS: {}", e.to_string());
                     async move { Err(ActivityError::NonRetryable(e.into())) }.boxed()
-                },
+                }
             }
 
             // Some minor gymnastics are required to avoid needing to clone the function
@@ -283,7 +289,7 @@ pub struct ActivityHeartbeater {
 }
 
 struct Heartbeater {
-    sender: broadcast::Sender<ImmortalServerActionV1>,
+    sender: WorkerOutboundSender,
     /// Identity of the run this beats for; `details` is filled in per send.
     beat: immortal::ActivityHeartbeatV1,
     throttle: Duration,
@@ -302,7 +308,7 @@ struct ThrottleState {
 
 impl ActivityHeartbeater {
     pub(crate) fn new(
-        sender: broadcast::Sender<ImmortalServerActionV1>,
+        sender: WorkerOutboundSender,
         beat: immortal::ActivityHeartbeatV1,
         throttle: Duration,
     ) -> Self {
@@ -661,15 +667,23 @@ fn _calculate_deadline(
 
 #[cfg(test)]
 mod tests {
+    use super::super::outbound::{OutboundLimits, WorkerOutboundReceiver, outbound_channel};
     use super::*;
 
-    fn heartbeater(
-        throttle: Duration,
-    ) -> (
-        ActivityHeartbeater,
-        broadcast::Receiver<ImmortalServerActionV1>,
-    ) {
-        let (tx, rx) = broadcast::channel(16);
+    fn heartbeater(throttle: Duration) -> (ActivityHeartbeater, WorkerOutboundReceiver) {
+        let (tx, rx) = outbound_channel(
+            OutboundLimits {
+                log_records: 16,
+                log_bytes: 64 * 1024,
+                max_record_bytes: 16 * 1024,
+                activity_records: 4,
+                activity_fallback_bytes: 16 * 1024,
+                control_records: 4,
+                log_batch_records: 4,
+            }
+            .validate()
+            .unwrap(),
+        );
         let beat = immortal::ActivityHeartbeatV1 {
             activity_id: "act-1".to_string(),
             activity_run_id: "run-1".to_string(),
@@ -677,6 +691,7 @@ mod tests {
             workflow_epoch: 0,
             details: None,
         };
+        assert!(tx.start_activity("act-1", "run-1", "wf-1", 1));
         (ActivityHeartbeater::new(tx, beat, throttle), rx)
     }
 
@@ -704,12 +719,12 @@ mod tests {
     /// heartbeat driven by a timer would keep reporting a healthy activity forever.
     #[tokio::test]
     async fn nothing_is_sent_unless_the_activity_records() {
-        let (_heartbeater, mut rx) = heartbeater(Duration::from_millis(10));
+        let (_heartbeater, rx) = heartbeater(Duration::from_millis(10));
 
         tokio::time::sleep(Duration::from_millis(60)).await;
 
         assert!(
-            rx.try_recv().is_err(),
+            rx.try_recv().is_none(),
             "a heartbeat was sent that the activity never recorded"
         );
     }
@@ -719,7 +734,7 @@ mod tests {
     #[tokio::test]
     async fn a_burst_collapses_to_one_send_per_window_keeping_the_latest() {
         let throttle = Duration::from_millis(100);
-        let (heartbeater, mut rx) = heartbeater(throttle);
+        let (heartbeater, rx) = heartbeater(throttle);
 
         record(&heartbeater, "first");
         record(&heartbeater, "second");
@@ -730,7 +745,7 @@ mod tests {
             vec!["first".to_string()]
         );
         assert!(
-            rx.try_recv().is_err(),
+            rx.try_recv().is_none(),
             "the rest of the burst should be held back"
         );
 
@@ -741,14 +756,14 @@ mod tests {
             vec!["third".to_string()],
             "only the most recent heartbeat in a window is worth sending"
         );
-        assert!(rx.try_recv().is_err(), "the window flushes exactly once");
+        assert!(rx.try_recv().is_none(), "the window flushes exactly once");
     }
 
     /// An activity heartbeating slower than the throttle is never delayed by it.
     #[tokio::test]
     async fn a_heartbeat_after_the_window_is_not_throttled() {
         let throttle = Duration::from_millis(50);
-        let (heartbeater, mut rx) = heartbeater(throttle);
+        let (heartbeater, rx) = heartbeater(throttle);
 
         record(&heartbeater, "first");
         rx.try_recv().expect("the first heartbeat sends at once");
@@ -757,7 +772,10 @@ mod tests {
         record(&heartbeater, "second");
 
         assert_eq!(
-            details_of(rx.try_recv().expect("a heartbeat outside the window sends at once")),
+            details_of(
+                rx.try_recv()
+                    .expect("a heartbeat outside the window sends at once")
+            ),
             vec!["second".to_string()]
         );
     }

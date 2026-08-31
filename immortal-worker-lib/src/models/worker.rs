@@ -1,53 +1,62 @@
-use anyhow::{Error, anyhow};
+use anyhow::{anyhow, Error};
 use async_stream::stream;
-use schemars::Schema;
+use prost::Message;
 use schemars::schema_for;
-use simd_json::{OwnedValue, json};
+use schemars::Schema;
+use simd_json::{json, OwnedValue};
 use std::collections::VecDeque;
 use std::fmt::{Debug, Write};
-use std::{collections::HashMap, sync::Arc, time::Duration};
-use tokio::sync::Notify;
-use tokio::sync::broadcast::Receiver;
-use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::{
-    Mutex, broadcast,
-    mpsc::{self, UnboundedReceiver, UnboundedSender},
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
-use tokio::sync::{RwLock, watch};
+use tokio::sync::Notify;
+use tokio::sync::{
+    broadcast,
+    mpsc::{self, UnboundedReceiver, UnboundedSender},
+    Mutex,
+};
+use tokio::sync::{watch, RwLock};
 use tonic::transport::Channel;
-use tracing::error;
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id};
+use tracing::{error, warn};
 use tracing::{Event, Subscriber};
+use tracing_subscriber::{layer::Context, layer::SubscriberExt, Layer};
 use tracing_subscriber::{EnvFilter, Registry};
-use tracing_subscriber::{Layer, layer::Context, layer::SubscriberExt};
 use uuid::Uuid;
 
 use immortal_lib::common::{Payload, Payloads};
-use immortal_lib::failure::Failure;
 use immortal_lib::failure::failure::FailureInfo;
+use immortal_lib::failure::Failure;
 use immortal_lib::immortal::{
-    self, CallResultV1, CallResultVersion, Failure as ImmortalFailure, RegisteredActivity,
-    RegisteredCall, RegisteredNotification, RegisteredWorkflow, RequestStartActivityOptionsV1,
+    self, call_result_version, workflow_result_v1, workflow_result_version, CallResultV1,
+    CallResultVersion, Failure as ImmortalFailure, RegisteredActivity, RegisteredCall,
+    RegisteredNotification, RegisteredWorkflow, RequestStartActivityOptionsV1,
     RequestStartActivityOptionsVersion, Success as ImmortalSuccess, WorkflowResultV1,
-    WorkflowResultVersion, call_result_version, workflow_result_v1, workflow_result_version,
+    WorkflowResultVersion,
 };
 use immortal_lib::immortal::{
-    ActivityHeartbeatV1, ActivityResultV1, ActivityResultVersion, ImmortalServerActionV1,
-    ImmortalServerActionVersion,
-    Log, RegisterImmortalWorkerV1, StartWorkflowOptionsV1, activity_result_v1,
-    activity_result_version, immortal_client::ImmortalClient, immortal_server_action_v1,
-    immortal_server_action_version, immortal_worker_action_v1::Action,
-    immortal_worker_action_version, request_start_activity_options_version,
+    activity_result_v1, activity_result_version, immortal_client::ImmortalClient,
+    immortal_server_action_v1, immortal_server_action_version, immortal_worker_action_v1::Action,
+    immortal_worker_action_version, request_start_activity_options_version, ActivityHeartbeatV1,
+    ActivityResultV1, ActivityResultVersion, ImmortalServerActionV1, ImmortalServerActionVersion,
+    Log, RegisterImmortalWorkerV1, StartWorkflowOptionsV1,
 };
 use tokio::task::JoinHandle;
 
-use crate::metrics::{Metrics, sampler};
+use crate::metrics::{sampler, Metrics};
 
 use super::call::{CallError, CallExitValue, CallFunction, IntoCallFunc};
 use super::notification::{IntoNotificationFunc, NotificationFunction};
+use super::outbound::{
+    outbound_channel, OutboundLimits, WorkerOutboundReceiver, WorkerOutboundSender,
+};
 // use super::serverless;
-use super::{ActivitySchema, CallSchema, NotificationSchema, WfSchema};
 use super::{
     activity::{
         ActExitValue, ActivityError, ActivityFunction, ActivityHeartbeater, ActivityOptions,
@@ -55,6 +64,7 @@ use super::{
     },
     workflow::{WfExitValue, WorkflowFunction},
 };
+use super::{ActivitySchema, CallSchema, NotificationSchema, WfSchema};
 
 pub struct RunningWorkflow {
     pub workflow_id: String,
@@ -75,7 +85,7 @@ pub struct RunningActivity {
     pub activity_id: String,
     pub run_id: String,
     pub join_handle: JoinHandle<()>,
-    pub workflow_epoch: u64
+    pub workflow_epoch: u64,
 }
 
 pub struct RunningCall {
@@ -90,24 +100,106 @@ enum OutboxItem {
     Call(Arc<CallResultV1>),
 }
 
+impl OutboxItem {
+    fn encoded_len(&self) -> usize {
+        match self {
+            Self::Workflow(value) => value.encoded_len(),
+            Self::Activity(value) => value.encoded_len(),
+            Self::Call(value) => value.encoded_len(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct CompletionOutbox {
+    items: VecDeque<OutboxItem>,
+    /// Capacity remains occupied while the head item is being sent. This prevents a failed RPC
+    /// from requeueing on top of capacity that a producer claimed while the request was in flight.
+    records: usize,
+    bytes: usize,
+}
+
+async fn enqueue_completion(
+    outbox: &Arc<Mutex<CompletionOutbox>>,
+    item_notify: &Arc<Notify>,
+    space_notify: &Arc<Notify>,
+    item: OutboxItem,
+    max_records: usize,
+    max_bytes: usize,
+) {
+    let item_bytes = item.encoded_len();
+    if item_bytes > max_bytes {
+        error!(
+            "dropping completion result of {item_bytes} bytes because it exceeds the configured \
+             completion outbox byte limit of {max_bytes} bytes"
+        );
+        return;
+    }
+    let mut item = Some(item);
+    loop {
+        // Register before checking capacity so a pop between the check and await cannot strand us.
+        let notified = space_notify.notified();
+        {
+            let mut queue = outbox.lock().await;
+            if queue.has_capacity(item_bytes, max_records, max_bytes) {
+                queue.push_back(item.take().expect("completion is enqueued once"));
+                item_notify.notify_one();
+                return;
+            }
+        }
+        notified.await;
+    }
+}
+
+impl CompletionOutbox {
+    fn has_capacity(&self, item_bytes: usize, max_records: usize, max_bytes: usize) -> bool {
+        self.records < max_records && self.bytes.saturating_add(item_bytes) <= max_bytes
+    }
+
+    fn push_back(&mut self, item: OutboxItem) {
+        self.records = self.records.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(item.encoded_len());
+        self.items.push_back(item);
+    }
+
+    /// Return a failed in-flight item without claiming its capacity a second time.
+    fn requeue_front(&mut self, item: OutboxItem) {
+        self.items.push_front(item);
+    }
+
+    /// Remove the next item for delivery while retaining its record and byte ownership.
+    fn begin_send(&mut self) -> Option<OutboxItem> {
+        self.items.pop_front()
+    }
+
+    /// Release capacity only after successful delivery or a terminal rejection.
+    fn finish_send(&mut self, item_bytes: usize) {
+        debug_assert!(self.records > 0, "finishing an unaccounted outbox item");
+        debug_assert!(self.bytes >= item_bytes, "outbox byte accounting underflow");
+        self.records = self.records.saturating_sub(1);
+        self.bytes = self.bytes.saturating_sub(item_bytes);
+    }
+}
+
 // #[derive(Debug)]
 pub struct Worker {
     pub instance_id: Uuid,
     pub task_queue: String,
     pub client: ImmortalClient<Channel>,
     pub config: WorkerConfig,
-    pub server_channel: tokio::sync::broadcast::Sender<ImmortalServerActionV1>,
+    pub server_channel: WorkerOutboundSender,
     pub workflow_sender: UnboundedSender<(String, Result<WfExitValue<OwnedValue>, Error>, u64)>,
     pub activity_sender: UnboundedSender<(
         String,
         String,
         String,
         Result<ActExitValue<OwnedValue>, ActivityError>,
-        u64
+        u64,
     )>,
 
-    outbox: Arc<Mutex<VecDeque<OutboxItem>>>,
+    outbox: Arc<Mutex<CompletionOutbox>>,
     outbox_notify: Arc<Notify>,
+    outbox_space_notify: Arc<Notify>,
     connected_tx: tokio::sync::watch::Sender<bool>,
     connected_rx: tokio::sync::watch::Receiver<bool>,
     pub call_sender:
@@ -129,7 +221,9 @@ pub struct Worker {
 }
 
 struct ChannelLayer {
-    sender: broadcast::Sender<ImmortalServerActionV1>, // Define the type of data to be sent through the channel
+    sender: WorkerOutboundSender,
+    worker_instance_id: Uuid,
+    event_sequence: Arc<AtomicU64>,
 }
 
 // impl Into<immortal::Event> for Event<'_> {
@@ -252,6 +346,11 @@ where
                 if let Some(data) = span.extensions().get::<SpanData>() {
                     let _ = self.sender.send(ImmortalServerActionV1 {
                         action: Some(immortal_server_action_v1::Action::LogEvent(Log {
+                            event_id: Some(format!(
+                                "{}:{}",
+                                self.worker_instance_id,
+                                self.event_sequence.fetch_add(1, Ordering::Relaxed),
+                            )),
                             activity_run_id: data.activity_run_id.clone(),
                             message: visitor.message.unwrap_or("".to_string()),
                             metadata: Some(
@@ -302,19 +401,38 @@ impl Worker {
         }
         // If sender is dropped, the worker is shutting down.
     }
-    pub async fn new(
-        config: WorkerConfig,
-    ) -> anyhow::Result<(Self, Receiver<ImmortalServerActionV1>)> {
+    pub async fn new(config: WorkerConfig) -> anyhow::Result<(Self, WorkerOutboundReceiver)> {
+        anyhow::ensure!(
+            config.completion_outbox_max_records > 0,
+            "worker completion outbox record limit must be greater than zero"
+        );
+        anyhow::ensure!(
+            config.completion_outbox_max_bytes > 0,
+            "worker completion outbox byte limit must be greater than zero"
+        );
         let (tx, rx) = mpsc::unbounded_channel();
         let (atx, arx) = mpsc::unbounded_channel();
         let (ctx, crx) = mpsc::unbounded_channel();
         let (connected_tx, connected_rx) = tokio::sync::watch::channel(false);
 
-        let (stx, srx) = broadcast::channel(100);
+        let lane_limits = OutboundLimits {
+            log_records: config.log_queue_max_records,
+            log_bytes: config.log_queue_max_bytes,
+            max_record_bytes: config.log_max_record_bytes,
+            activity_records: usize::try_from(config.activity_capacity.max(1)).unwrap_or(1),
+            activity_fallback_bytes: config.activity_log_fallback_max_bytes,
+            control_records: config.control_queue_max_records,
+            log_batch_records: config.log_batch_max_records,
+        }
+        .validate()?;
+        let (stx, srx) = outbound_channel(lane_limits);
+        let instance_id = Uuid::new_v4();
         let stx2 = stx.clone();
         // let make_writer = move || ChannelWriter(stx2.clone())
         let channel_layer = ChannelLayer {
             sender: stx2.clone(),
+            worker_instance_id: instance_id,
+            event_sequence: Arc::new(AtomicU64::new(0)),
         };
         // The channel layer feeds the server's log stream and refreshes activity liveness, so it
         // gets its own filter rather than inheriting RUST_LOG: quieting console output should not
@@ -330,8 +448,13 @@ impl Worker {
 
         let subscriber = Registry::default()
             .with(channel_layer.with_filter(channel_filter))
-            .with(tracing_subscriber::fmt::Layer::default().with_filter(EnvFilter::from_default_env()))
-            .with(sentry::integrations::tracing::layer().with_filter(EnvFilter::from_default_env()));
+            .with(
+                tracing_subscriber::fmt::Layer::default()
+                    .with_filter(EnvFilter::from_default_env()),
+            )
+            .with(
+                sentry::integrations::tracing::layer().with_filter(EnvFilter::from_default_env()),
+            );
         tracing::subscriber::set_global_default(subscriber)
             .expect("Failed to set global subscriber");
         // Keepalive matters more here than anywhere: this is one bidi stream held open for
@@ -345,8 +468,9 @@ impl Worker {
         let client = ImmortalClient::new(endpoint.connect().await?);
         let mut worker = Worker {
             outbox_notify: Arc::new(Notify::new()),
-            outbox: Arc::new(Mutex::new(VecDeque::new())),
-            instance_id: Uuid::new_v4(),
+            outbox_space_notify: Arc::new(Notify::new()),
+            outbox: Arc::new(Mutex::new(CompletionOutbox::default())),
+            instance_id,
             server_channel: stx,
             client,
             config: config.clone(),
@@ -484,7 +608,7 @@ impl Worker {
 
     async fn main_thread2(
         &mut self,
-        mut rx: Receiver<ImmortalServerActionV1>,
+        rx: WorkerOutboundReceiver,
         register_immortal_worker: RegisterImmortalWorkerV1,
         safe_app_data: &Arc<AppData>,
     ) -> anyhow::Result<()> {
@@ -499,22 +623,10 @@ impl Worker {
                 };
                 loop {
                     let y = rx.recv().await;
-                    match y {
-                        Ok(y) => {
-                            yield ImmortalServerActionVersion {
-                                version: Some(immortal_server_action_version::Version::V1(y))
-                            }
-                        },
-                        Err(e) => {
-                            match e {
-                                RecvError::Closed => break,
-                                _ => println!("Error: {:?}", e)
-
-                            }
-                        }
+                    yield ImmortalServerActionVersion {
+                        version: Some(immortal_server_action_version::Version::V1(y))
                     }
                 }
-                println!("worker Stream ended");
             })
             .await?
             .into_inner();
@@ -599,12 +711,11 @@ impl Worker {
 
     async fn main_thread3(
         &mut self,
-        rx: &broadcast::Receiver<ImmortalServerActionV1>,
+        rx: &WorkerOutboundReceiver,
         stream_tx: &broadcast::Sender<Metrics>,
     ) -> anyhow::Result<()> {
         let mut sub = stream_tx.subscribe();
-        // let (tx, mut rx) = broadcast::channel(100);
-        let rx = rx.resubscribe();
+        let rx = rx.clone();
 
         let running_workflows = {
             let guard = self.running_workflows.lock().await;
@@ -643,7 +754,7 @@ impl Worker {
                 .iter()
                 .map(|x| RegisteredNotification {
                     notification_type: x.0.clone(),
-                    args: simd_json::to_vec(&x.1.1.args.clone()).unwrap(),
+                    args: simd_json::to_vec(&x.1 .1.args.clone()).unwrap(),
                 })
                 .collect(),
             registered_calls: self
@@ -653,8 +764,8 @@ impl Worker {
                 .iter()
                 .map(|x| RegisteredCall {
                     call_type: x.0.clone(),
-                    args: simd_json::to_vec(&x.1.1.args.clone()).unwrap(),
-                    output: simd_json::to_vec(&x.1.1.output.clone()).unwrap(),
+                    args: simd_json::to_vec(&x.1 .1.args.clone()).unwrap(),
+                    output: simd_json::to_vec(&x.1 .1.output.clone()).unwrap(),
                 })
                 .collect(),
             registered_activities: self
@@ -664,8 +775,8 @@ impl Worker {
                 .iter()
                 .map(|x| RegisteredActivity {
                     activity_type: x.0.clone(),
-                    args: simd_json::to_vec(&x.1.1.args.clone()).unwrap(),
-                    output: simd_json::to_vec(&x.1.1.output.clone()).unwrap(),
+                    args: simd_json::to_vec(&x.1 .1.args.clone()).unwrap(),
+                    output: simd_json::to_vec(&x.1 .1.output.clone()).unwrap(),
                 })
                 .collect(),
             registered_workflows: self
@@ -675,8 +786,8 @@ impl Worker {
                 .iter()
                 .map(|x| RegisteredWorkflow {
                     workflow_type: x.0.clone(),
-                    args: simd_json::to_vec(&x.1.1.args.clone()).unwrap(),
-                    output: simd_json::to_vec(&x.1.1.output.clone()).unwrap(),
+                    args: simd_json::to_vec(&x.1 .1.args.clone()).unwrap(),
+                    output: simd_json::to_vec(&x.1 .1.output.clone()).unwrap(),
                 })
                 .collect(),
         };
@@ -732,10 +843,7 @@ impl Worker {
         Ok(())
     }
 
-    pub async fn main_thread(
-        mut self,
-        rx: broadcast::Receiver<ImmortalServerActionV1>,
-    ) -> anyhow::Result<()> {
+    pub async fn main_thread(mut self, rx: WorkerOutboundReceiver) -> anyhow::Result<()> {
         let serverless_mode = std::env::var("SERVERLESS_MODE").unwrap_or_default();
         if serverless_mode == "true" {
             println!("Starting serverless mode");
@@ -747,6 +855,20 @@ impl Worker {
             // );
             // let _ = serverless::main(self, safe_app_data).await;
         } else {
+            let outbound = self.server_channel.clone();
+            tokio::spawn(async move {
+                let mut previous = outbound.stats();
+                let mut interval = tokio::time::interval(Duration::from_secs(30));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    interval.tick().await;
+                    let current = outbound.stats();
+                    if current != previous {
+                        warn!(?current, "worker outbound lane statistics changed");
+                        previous = current;
+                    }
+                }
+            });
             let (latest_tx, _latest_rx) = watch::channel(Metrics {
                 // ts_ms: 0,
                 cpu_pct: 0.0,
@@ -862,6 +984,9 @@ impl Worker {
         let instance_id = self.instance_id.clone();
         let worker_key = self.workery_key.clone();
         let outbox_notify = self.outbox_notify.clone();
+        let outbox_space_notify = self.outbox_space_notify.clone();
+        let max_records = self.config.completion_outbox_max_records;
+        let max_bytes = self.config.completion_outbox_max_bytes;
         tokio::spawn(async move {
             while let Some(result) = rx.recv().await {
                 // NEW BUG. THIS UNWRAPS WHEN RUNNING WORKFLOW IS NO LONGER IN RUNNING
@@ -899,13 +1024,15 @@ impl Worker {
                         })),
                     },
                 };
-                {
-                    outbox
-                        .lock()
-                        .await
-                        .push_back(OutboxItem::Workflow(Arc::new(res)));
-                    outbox_notify.notify_one();
-                }
+                enqueue_completion(
+                    &outbox,
+                    &outbox_notify,
+                    &outbox_space_notify,
+                    OutboxItem::Workflow(Arc::new(res)),
+                    max_records,
+                    max_bytes,
+                )
+                .await;
 
                 let mut running_workflows = running_workflows_arc.lock().await;
                 // let running_workflow = running_workflows.get("test").unwrap();
@@ -926,8 +1053,12 @@ impl Worker {
         )>,
     ) {
         let running_activities_arc = Arc::clone(&self.running_activities);
+        let server_channel = self.server_channel.clone();
 
         let outbox_notify = self.outbox_notify.clone();
+        let outbox_space_notify = self.outbox_space_notify.clone();
+        let max_records = self.config.completion_outbox_max_records;
+        let max_bytes = self.config.completion_outbox_max_bytes;
         let outbox = self.outbox.clone();
         tokio::spawn(async move {
             while let Some(result) = rx.recv().await {
@@ -988,16 +1119,21 @@ impl Worker {
                         ),
                     },
                 };
-                {
-                    outbox
-                        .lock()
-                        .await
-                        .push_back(OutboxItem::Activity(Arc::new(res)));
-                    outbox_notify.notify_one();
-                }
+                // Deactivate liveness identity as soon as execution settles. Completion delivery
+                // may backpressure during a long disconnect, but detached tasks must not keep a
+                // finished activity alive by logging while the result waits for queue capacity.
+                server_channel.finish_activity(&result.1, &result.2);
+                running_activities_arc.lock().await.remove(&result.1);
 
-                let mut running_activities = running_activities_arc.lock().await;
-                running_activities.remove(&result.1);
+                enqueue_completion(
+                    &outbox,
+                    &outbox_notify,
+                    &outbox_space_notify,
+                    OutboxItem::Activity(Arc::new(res)),
+                    max_records,
+                    max_bytes,
+                )
+                .await;
             }
         });
     }
@@ -1009,6 +1145,9 @@ impl Worker {
         let running_calls_arc = Arc::clone(&self.running_calls);
 
         let outbox_notify = self.outbox_notify.clone();
+        let outbox_space_notify = self.outbox_space_notify.clone();
+        let max_records = self.config.completion_outbox_max_records;
+        let max_bytes = self.config.completion_outbox_max_bytes;
         let outbox = self.outbox.clone();
         tokio::spawn(async move {
             while let Some(result) = rx.recv().await {
@@ -1053,14 +1192,15 @@ impl Worker {
                         ),
                     },
                 };
-                {
-                    outbox
-                        .lock()
-                        .await
-                        .push_back(OutboxItem::Call(Arc::new(res)));
-
-                    outbox_notify.notify_one();
-                }
+                enqueue_completion(
+                    &outbox,
+                    &outbox_notify,
+                    &outbox_space_notify,
+                    OutboxItem::Call(Arc::new(res)),
+                    max_records,
+                    max_bytes,
+                )
+                .await;
 
                 let mut running_calls = running_calls_arc.lock().await;
                 // let running_activity = running_activities.get("test").unwrap();
@@ -1081,6 +1221,7 @@ impl Worker {
     pub fn outbox_thread(&mut self) {
         let outbox = self.outbox.clone();
         let notify = self.outbox_notify.clone();
+        let space_notify = self.outbox_space_notify.clone();
         let mut client = self.client.clone();
 
         let connected_rx = self.connected_rx.clone();
@@ -1115,10 +1256,11 @@ impl Worker {
                 loop {
                     let item = {
                         let mut q = outbox.lock().await;
-                        q.pop_front()
+                        q.begin_send()
                     };
 
                     let Some(item) = item else { break };
+                    let item_bytes = item.encoded_len();
 
                     let send_res = match &item {
                         OutboxItem::Call(res) => {
@@ -1157,6 +1299,8 @@ impl Worker {
                                 "dropping outbox item after {head_attempts} attempt(s); \
                                  last error: {e}"
                             );
+                            outbox.lock().await.finish_send(item_bytes);
+                            space_notify.notify_waiters();
                             head_attempts = 0;
                             continue; // drop it and keep draining
                         }
@@ -1165,7 +1309,7 @@ impl Worker {
 
                         {
                             let mut q = outbox.lock().await;
-                            q.push_front(item);
+                            q.requeue_front(item);
                         }
 
                         let backoff = BASE_BACKOFF
@@ -1175,6 +1319,8 @@ impl Worker {
                         break; // stop draining on failure
                     }
 
+                    outbox.lock().await.finish_send(item_bytes);
+                    space_notify.notify_waiters();
                     head_attempts = 0;
                 }
             }
@@ -1318,6 +1464,19 @@ impl Worker {
         let aid_run = activity_run_id.to_string();
         let wid = workflow_id.to_string();
 
+        if !self.server_channel.start_activity(
+            activity_id,
+            activity_run_id,
+            workflow_id,
+            workflow_epoch,
+        ) {
+            return Err(anyhow!(
+                "activity lane capacity exhausted before starting activity {} run {}",
+                activity_id,
+                activity_run_id
+            ));
+        }
+
         let heartbeater = ActivityHeartbeater::new(
             self.server_channel.clone(),
             ActivityHeartbeatV1 {
@@ -1351,7 +1510,7 @@ impl Worker {
             activity_id: activity_id.to_string(),
             run_id: activity_run_id.to_string(),
             join_handle: handle,
-            workflow_epoch
+            workflow_epoch,
         };
         self.running_activities
             .lock()
@@ -1418,7 +1577,8 @@ impl Worker {
                 let mut running_activities = running_activities_arc.lock().await;
                 // let running_activity = running_activities.get("test").unwrap();
                 // running_activity.join_handle.abort();
-                running_activities.remove(&result.0);
+                running_activities.remove(&result.1);
+                self.server_channel.finish_activity(&result.1, &result.2);
                 return Ok(res);
             }
         }
@@ -1470,6 +1630,29 @@ impl Worker {
         let aid_run = activity_run_id.to_string();
         let wid = workflow_id.to_string();
 
+        if !self.server_channel.start_activity(
+            activity_id,
+            activity_run_id,
+            workflow_id,
+            workflow_epoch,
+        ) {
+            error!(
+                "activity lane capacity exhausted before starting activity {} run {}",
+                activity_id, activity_run_id
+            );
+            let _ = sender.send((
+                workflow_id.to_owned(),
+                activity_id.to_owned(),
+                activity_run_id.to_owned(),
+                Err(ActivityError::Retryable {
+                    source: anyhow!("worker activity lane capacity exhausted"),
+                    explicit_delay: Some(Duration::from_secs(1)),
+                }),
+                workflow_epoch,
+            ));
+            return;
+        }
+
         // Handed to the activity so it can report its own progress. Nothing else may beat on its
         // behalf: an activity wedged on a lock or a dead socket has to go quiet, or the watchdog
         // cannot tell it apart from one that is working. Activities that log as they go are
@@ -1508,7 +1691,7 @@ impl Worker {
             activity_id: activity_id.to_string(),
             run_id: activity_run_id.to_string(),
             join_handle: handle,
-            workflow_epoch
+            workflow_epoch,
         };
         self.running_activities
             .lock()
@@ -1564,7 +1747,7 @@ impl Worker {
                     }),
                     false => Err(ActivityError::Cancelled { details: None }),
                 },
-                running_activity.workflow_epoch
+                running_activity.workflow_epoch,
             )) {
                 println!("ERROR SENDING KILL ACTIVITY: {:#?}", e);
                 error!("ERROR SENDING KILL ACTIVITY: {:#?}", e);
@@ -1743,6 +1926,41 @@ pub struct WorkerConfig {
 
     #[builder(default = "1")]
     pub activity_capacity: i32,
+
+    /// Maximum number of full log records retained in the general outbound lane.
+    #[builder(default = "4096")]
+    pub log_queue_max_records: usize,
+
+    /// Maximum encoded bytes retained in the general outbound log lane.
+    #[builder(default = "32 * 1024 * 1024")]
+    pub log_queue_max_bytes: usize,
+
+    /// Maximum encoded size of one outbound log or heartbeat record.
+    #[builder(default = "256 * 1024")]
+    pub log_max_record_bytes: usize,
+
+    /// Maximum encoded bytes retained by the latest-log-per-activity fallback lane.
+    #[builder(default = "4 * 1024 * 1024")]
+    pub activity_log_fallback_max_bytes: usize,
+
+    /// Maximum number of miscellaneous control responses waiting for the worker stream.
+    #[builder(default = "256")]
+    pub control_queue_max_records: usize,
+
+    /// Maximum number of completion results retained while the server is unavailable. Producers
+    /// backpressure at this boundary; completion results are never silently discarded to make
+    /// room for newer ones.
+    #[builder(default = "4096")]
+    pub completion_outbox_max_records: usize,
+
+    /// Maximum encoded bytes retained in the completion outbox.
+    #[builder(default = "32 * 1024 * 1024")]
+    pub completion_outbox_max_bytes: usize,
+
+    /// Maximum general logs scheduled before a pending latest metrics sample is emitted.
+    #[builder(default = "256")]
+    pub log_batch_max_records: usize,
+
     /// A human-readable string that can identify this worker. Using something like sdk version
     /// and host name is a good default. If set, overrides the identity set (if any) on the client
     /// used by this worker.
@@ -1942,9 +2160,25 @@ mod tests {
     fn capture(
         channel_filter: EnvFilter,
         console_filter: EnvFilter,
-    ) -> Result<ImmortalServerActionV1, broadcast::error::TryRecvError> {
-        let (tx, mut rx) = broadcast::channel(16);
-        let layer = ChannelLayer { sender: tx };
+    ) -> Option<ImmortalServerActionV1> {
+        let (tx, rx) = outbound_channel(
+            OutboundLimits {
+                log_records: 16,
+                log_bytes: 64 * 1024,
+                max_record_bytes: 16 * 1024,
+                activity_records: 4,
+                activity_fallback_bytes: 16 * 1024,
+                control_records: 4,
+                log_batch_records: 4,
+            }
+            .validate()
+            .unwrap(),
+        );
+        let layer = ChannelLayer {
+            sender: tx,
+            worker_instance_id: Uuid::nil(),
+            event_sequence: Arc::new(AtomicU64::new(0)),
+        };
 
         let subscriber = Registry::default()
             .with(layer.with_filter(channel_filter))
@@ -1980,8 +2214,98 @@ mod tests {
     #[test]
     fn channel_layer_honours_its_own_filter() {
         assert!(
-            capture(EnvFilter::new("error"), EnvFilter::new("info")).is_err(),
+            capture(EnvFilter::new("error"), EnvFilter::new("info")).is_none(),
             "an info event should be filtered out by an error-level channel filter"
         );
+    }
+
+    fn call_completion(id: &str) -> OutboxItem {
+        OutboxItem::Call(Arc::new(CallResultV1::ok(
+            id.to_owned(),
+            "run".to_owned(),
+            None,
+        )))
+    }
+
+    #[tokio::test]
+    async fn completion_outbox_backpressures_at_record_limit() {
+        let outbox = Arc::new(Mutex::new(CompletionOutbox::default()));
+        let item_notify = Arc::new(Notify::new());
+        let space_notify = Arc::new(Notify::new());
+        enqueue_completion(
+            &outbox,
+            &item_notify,
+            &space_notify,
+            call_completion("first"),
+            1,
+            1024,
+        )
+        .await;
+
+        let task = tokio::spawn({
+            let outbox = Arc::clone(&outbox);
+            let item_notify = Arc::clone(&item_notify);
+            let space_notify = Arc::clone(&space_notify);
+            async move {
+                enqueue_completion(
+                    &outbox,
+                    &item_notify,
+                    &space_notify,
+                    call_completion("second"),
+                    1,
+                    1024,
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !task.is_finished(),
+            "producer must wait instead of growing the queue"
+        );
+        assert_eq!(outbox.lock().await.items.len(), 1);
+
+        let in_flight = outbox.lock().await.begin_send().unwrap();
+        // Even a spurious wakeup cannot let a producer steal capacity owned by an in-flight item.
+        space_notify.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !task.is_finished(),
+            "in-flight delivery must retain capacity"
+        );
+
+        let in_flight_bytes = in_flight.encoded_len();
+        outbox.lock().await.requeue_front(in_flight);
+        assert_eq!(outbox.lock().await.records, 1);
+        assert_eq!(outbox.lock().await.items.len(), 1);
+
+        let delivered = outbox.lock().await.begin_send().unwrap();
+        assert_eq!(delivered.encoded_len(), in_flight_bytes);
+        outbox.lock().await.finish_send(in_flight_bytes);
+        space_notify.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("producer wakes when capacity returns")
+            .unwrap();
+        assert_eq!(outbox.lock().await.items.len(), 1);
+    }
+
+    #[test]
+    fn completion_outbox_accounts_encoded_bytes() {
+        let mut outbox = CompletionOutbox::default();
+        let item = call_completion("call");
+        let bytes = item.encoded_len();
+        assert!(outbox.has_capacity(bytes, 1, bytes));
+        outbox.push_back(item);
+        assert_eq!(outbox.records, 1);
+        assert_eq!(outbox.bytes, bytes);
+        assert!(!outbox.has_capacity(1, 1, bytes));
+        let item = outbox.begin_send().unwrap();
+        assert_eq!(outbox.records, 1);
+        assert_eq!(outbox.bytes, bytes);
+        assert!(!outbox.has_capacity(1, 1, bytes));
+        outbox.finish_send(item.encoded_len());
+        assert_eq!(outbox.records, 0);
+        assert_eq!(outbox.bytes, 0);
     }
 }

@@ -1,6 +1,8 @@
 pub mod activity;
 pub mod call;
 pub mod notification;
+mod outbound;
+pub use outbound::{OutboundStatsSnapshot, WorkerOutboundReceiver, WorkerOutboundSender};
 pub mod worker;
 pub mod workflow;
 
@@ -29,4 +31,3 @@ pub struct CallSchema {
 pub struct NotificationSchema {
     pub args: Schema,
 }
-

@@ -2,7 +2,11 @@ use crate::error::AppError;
 use crate::history::{get_blob_raw, Status as Status2};
 use crate::history_metadata::{WorkflowHistoryMetadata, WorkflowHistoryMetadataVersion};
 use crate::state::AppState;
-use crate::utils::log::fetch_log_history_from_redis;
+use crate::utils::log::{
+    delete_workflow_logs_from_s3, fetch_log_history_from_redis, fetch_workflow_logs_from_s3,
+    ARCHIVE_DELETE_PENDING_KEY,
+};
+use redis::AsyncCommands;
 use crate::ws::FetchLogs;
 use crate::{ActivitySchema, WfSchema};
 use axum::extract::Path;
@@ -15,6 +19,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 // use serde_json::Value;
+use simd_json::prelude::{ValueAsScalar, ValueObjectAccess};
 use simd_json::OwnedValue;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -52,13 +57,36 @@ pub async fn delete_history(
     State(state): State<AppState>,
     Path(workflow_id): Path<Uuid>,
 ) -> impl IntoResponse {
+    if let Ok(mut connection) = state.redis.get().await {
+        if let Err(error) = connection
+            .hset::<_, _, _, ()>(
+                ARCHIVE_DELETE_PENDING_KEY,
+                workflow_id.to_string(),
+                Utc::now().to_rfc3339(),
+            )
+            .await
+        {
+            tracing::error!("unable to record durable archive deletion request: {error}");
+        }
+    }
     match state
         .immortal_service
         .history
         .delete_history(&workflow_id)
         .await
     {
-        Ok(_history) => Json(()),
+        Ok(_history) => {
+            if let Err(e) = delete_workflow_logs_from_s3(&workflow_id.to_string()).await {
+                tracing::error!(
+                    "workflow history was deleted from Redis but archive deletion failed: {e:#}"
+                );
+            } else if let Ok(mut connection) = state.redis.get().await {
+                let _ = connection
+                    .hdel::<_, _, ()>(ARCHIVE_DELETE_PENDING_KEY, workflow_id.to_string())
+                    .await;
+            }
+            Json(())
+        }
         Err(e) => {
             println!("{:#?}", e);
             Json(())
@@ -224,6 +252,126 @@ pub struct LogFilter {
     limit: Option<i32>,
     // task_queues: Option<String>,
 }
+
+#[derive(Serialize, Deserialize)]
+struct LogCursor {
+    emitted_at: String,
+    event_id: String,
+}
+
+#[derive(Serialize)]
+pub struct TieredLogPage {
+    logs: Vec<OwnedValue>,
+    next_cursor: Option<String>,
+}
+
+fn log_field(log: &OwnedValue, field: &str) -> Option<String> {
+    log.get(field)
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+}
+
+fn log_order(log: &OwnedValue) -> (String, String) {
+    (
+        log_field(log, "emitted_at")
+            .or_else(|| log_field(log, "when"))
+            .unwrap_or_default(),
+        log_field(log, "event_id").unwrap_or_default(),
+    )
+}
+
+fn matches_log_filter(log: &OwnedValue, workflow: &crate::ws::FetchWorkflowLogs) -> bool {
+    workflow
+        .activity_id
+        .as_ref()
+        .is_none_or(|id| log_field(log, "activity_id").as_deref() == Some(id))
+        && workflow
+            .run_id
+            .as_ref()
+            .is_none_or(|id| log_field(log, "activity_run_id").as_deref() == Some(id))
+}
+
+fn merge_tiered_page(
+    mut logs: Vec<OwnedValue>,
+    workflow: &crate::ws::FetchWorkflowLogs,
+    cursor: Option<&LogCursor>,
+    limit: usize,
+) -> TieredLogPage {
+    let mut seen = std::collections::HashSet::new();
+    logs.retain(|log| {
+        seen.insert(log_field(log, "event_id").unwrap_or_else(|| format!("legacy:{:?}", log)))
+            && matches_log_filter(log, workflow)
+    });
+    logs.sort_by_key(log_order);
+    let mut logs: Vec<_> = logs
+        .into_iter()
+        .filter(|log| {
+            cursor.is_none_or(|cursor| {
+                log_order(log) > (cursor.emitted_at.clone(), cursor.event_id.clone())
+            })
+        })
+        .take(limit + 1)
+        .collect();
+    let has_more = logs.len() > limit;
+    logs.truncate(limit);
+    let next_cursor = has_more.then(|| logs.last()).flatten().map(|log| {
+        let (emitted_at, event_id) = log_order(log);
+        serde_json::to_string(&LogCursor {
+            emitted_at,
+            event_id,
+        })
+        .expect("cursor serializes")
+    });
+    TieredLogPage { logs, next_cursor }
+}
+
+pub async fn get_logs_v2(
+    State(state): State<AppState>,
+    Json(payload): Json<LogFilter>,
+) -> Result<Json<TieredLogPage>, AppError> {
+    let FetchLogs::Workflow(workflow) = &payload.fetch_type else {
+        return Ok(Json(TieredLogPage {
+            logs: vec![],
+            next_cursor: None,
+        }));
+    };
+    let limit = payload.limit.unwrap_or(100).clamp(1, 1_000) as usize;
+    let cursor = payload
+        .cursor
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<LogCursor>(value).ok());
+    let mut connection = state.redis.get().await?;
+    // Redis stream IDs are an implementation detail; fetch a bounded working range then apply
+    // the permanent cross-tier ordering cursor below.
+    let mut hot =
+        fetch_log_history_from_redis(&payload.fetch_type, &mut connection, &Some(1_000), &None)
+            .await?;
+    let cursor_order = cursor
+        .as_ref()
+        .map(|cursor| (cursor.emitted_at.as_str(), cursor.event_id.as_str()));
+    let cold = match fetch_workflow_logs_from_s3(
+        &workflow.workflow_id,
+        limit + 1,
+        cursor_order,
+        workflow.activity_id.as_deref(),
+        workflow.run_id.as_deref(),
+    )
+    .await
+    {
+        Ok(logs) => logs,
+        Err(error) => {
+            tracing::warn!("S3 archive read failed; returning available hot logs: {error:#}");
+            vec![]
+        }
+    };
+    hot.extend(cold);
+    Ok(Json(merge_tiered_page(
+        hot,
+        workflow,
+        cursor.as_ref(),
+        limit,
+    )))
+}
 pub async fn get_logs(
     State(state): State<AppState>,
     Json(payload): Json<LogFilter>, // this argument tells axum to parse the request body
@@ -269,6 +417,10 @@ pub async fn get_workers(
     // this will be converted into a JSON response
     // with a status code of `201 Created`
     Json(registered_workers)
+}
+
+pub async fn get_logging_metrics() -> Json<crate::LoggingMetricsSnapshot> {
+    Json(crate::logging_metrics_snapshot())
 }
 
 pub async fn get_task_queues(
@@ -372,6 +524,43 @@ pub async fn get_registered_activities(
 //     // with a status code of `201 Created`
 //     Json(activity_types)
 // }
+
+#[cfg(test)]
+mod tiered_log_tests {
+    use super::*;
+
+    fn log(event_id: &str, emitted_at: &str, activity_id: &str) -> OwnedValue {
+        simd_json::json!({
+            "event_id": event_id,
+            "emitted_at": emitted_at,
+            "activity_id": activity_id,
+            "activity_run_id": "run-1",
+        })
+    }
+
+    #[test]
+    fn tiered_page_deduplicates_filters_orders_and_advances_cursor() {
+        let workflow = crate::ws::FetchWorkflowLogs {
+            workflow_id: "workflow".into(),
+            activity_id: Some("activity".into()),
+            run_id: Some("run-1".into()),
+        };
+        let input = vec![
+            log("event-3", "2025-01-01T00:00:03Z", "activity"),
+            log("event-1", "2025-01-01T00:00:01Z", "activity"),
+            log("event-1", "2025-01-01T00:00:01Z", "activity"),
+            log("event-2", "2025-01-01T00:00:02Z", "other"),
+        ];
+        let first = merge_tiered_page(input.clone(), &workflow, None, 1);
+        assert_eq!(log_field(&first.logs[0], "event_id").as_deref(), Some("event-1"));
+        let cursor: LogCursor = serde_json::from_str(first.next_cursor.as_deref().unwrap()).unwrap();
+
+        let second = merge_tiered_page(input, &workflow, Some(&cursor), 2);
+        assert_eq!(second.logs.len(), 1);
+        assert_eq!(log_field(&second.logs[0], "event_id").as_deref(), Some("event-3"));
+        assert!(second.next_cursor.is_none());
+    }
+}
 
 //pub async fn get_workflow_queue(
 //    State(state): State<ImmortalService>,

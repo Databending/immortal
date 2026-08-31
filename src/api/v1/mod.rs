@@ -22,6 +22,8 @@ pub fn router() -> Router<AppState> {
         .route("/history/blob", get(server::get_blob_ref))
         .route("/history/blob/download", get(server::download_blob_ref))
         .route("/logs", post(server::get_logs))
+        .route("/logs/v2", post(server::get_logs_v2))
+        .route("/logging/metrics", get(server::get_logging_metrics))
         .route("/history/{id}", delete(server::delete_history))
         .route("/history/{id}", get(server::get_wf_history))
         .route("/workers", get(server::get_workers))

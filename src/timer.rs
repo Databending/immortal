@@ -1,4 +1,4 @@
-use redis::{AsyncCommands, Script, aio::MultiplexedConnection};
+use redis::{aio::MultiplexedConnection, AsyncCommands, Script};
 
 static CLAIM_DUE_TIMERS_LUA: &str = r#"
 local zkey = KEYS[1]
@@ -30,7 +30,6 @@ async fn claim_due_timers(
         .invoke_async(con)
         .await
 }
-
 
 async fn schedule_timer(
     con: &mut redis::aio::MultiplexedConnection,

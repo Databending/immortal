@@ -375,6 +375,9 @@ message Log {
   optional string activity_run_id = 5;
   optional bytes metadata = 6;
   Level level = 7;
+  // Stable worker-generated identifier used to deduplicate archive retries. Older workers
+  // leave this unset; servers generate a compatibility identifier at ingestion.
+  optional string event_id = 8;
 }
 
 /*

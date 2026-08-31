@@ -2446,24 +2446,28 @@ impl ImmortalService {
 
                     if let Err(e) = self
                         .start_workflow_internal(
-                        ClientStartWorkflowOptionsVersion {
-                            version: Some(client_start_workflow_options_version::Version::V1(
-                                ClientStartWorkflowOptionsV1 {
-                                    workflow_type: history_running_workflow.workflow_type.clone(),
-                                    workflow_id: Some(history_running_workflow.workflow_id.clone()),
-                                    workflow_version: "V1".to_string(),
-                                    task_queue: history_running_workflow.task_queue.clone(),
-                                    input: if payloads.len() == 0 {
-                                        None
-                                    } else {
-                                        Some(Payloads { payloads })
+                            ClientStartWorkflowOptionsVersion {
+                                version: Some(client_start_workflow_options_version::Version::V1(
+                                    ClientStartWorkflowOptionsV1 {
+                                        workflow_type: history_running_workflow
+                                            .workflow_type
+                                            .clone(),
+                                        workflow_id: Some(
+                                            history_running_workflow.workflow_id.clone(),
+                                        ),
+                                        workflow_version: "V1".to_string(),
+                                        task_queue: history_running_workflow.task_queue.clone(),
+                                        input: if payloads.len() == 0 {
+                                            None
+                                        } else {
+                                            Some(Payloads { payloads })
+                                        },
                                     },
-                                },
-                            )),
-                        },
-                        None,
-                    )
-                    .await
+                                )),
+                            },
+                            None,
+                        )
+                        .await
                     {
                         error!(
                             "resurrect: failed to requeue {}: {:?}",
